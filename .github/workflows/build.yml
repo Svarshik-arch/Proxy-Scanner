@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ env.TARGET }}
+          rustup default stable
+          rustc -Vv
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --locked --target ${{ env.TARGET }}
+
+      # +crt-static задан в .cargo/config.toml
+      - name: Build
+        run: cargo build --release --locked --target ${{ env.TARGET }}
+
+      - name: Verify the executable is self-contained
+        shell: pwsh
+        run: |
+          $exe = "target/${{ env.TARGET }}/release/proxy-scanner.exe"
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          if ($text -match '(?i)vcruntime\d+\.dll|msvcp\d+\.dll|api-ms-win-crt') {
+            Write-Error "CRT linked dynamically: $($Matches[0])"
+            exit 1
+          }
+          "{0}: {1:N1} MB, CRT linked statically" -f $exe, ((Get-Item $exe).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxy-scanner-windows-x64
+          path: target/${{ env.TARGET }}/release/proxy-scanner.exe
+          if-no-files-found: error
