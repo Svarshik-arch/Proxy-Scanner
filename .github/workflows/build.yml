@@ -48,3 +48,57 @@ jobs:
           name: proxy-scanner-windows-x64
           path: target/${{ env.TARGET }}/release/proxy-scanner.exe
           if-no-files-found: error
+
+  # masscan64.exe из официальных исходников (github.com/robertdavidgraham/masscan).
+  # Npcap (wpcap.dll) masscan подгружает во время работы, для сборки он не нужен.
+  masscan:
+    runs-on: windows-latest
+    env:
+      MASSCAN_TAG: "1.3.2"
+      MASSCAN_COMMIT: 06902c40d1494881c17b7968ef530e1d6bbd320c
+    steps:
+      - name: Checkout masscan
+        uses: actions/checkout@v4
+        with:
+          repository: robertdavidgraham/masscan
+          ref: ${{ env.MASSCAN_TAG }}
+          path: masscan
+
+      - name: Verify source revision
+        shell: pwsh
+        run: |
+          $sha = git -C masscan rev-parse HEAD
+          if ($sha -ne $env:MASSCAN_COMMIT) {
+            Write-Error "Tag $env:MASSCAN_TAG points to $sha, expected $env:MASSCAN_COMMIT"
+            exit 1
+          }
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # /MT — статический CRT: masscan64.exe не требует VC++ Redistributable.
+      - name: Build
+        shell: cmd
+        working-directory: masscan
+        run: >-
+          cl /nologo /O2 /MT /W1
+          /DWIN32 /DNDEBUG /D_CONSOLE /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS
+          src\*.c /Fe:masscan64.exe
+          /link advapi32.lib setargv.obj
+
+      - name: Smoke test
+        shell: pwsh
+        working-directory: masscan
+        run: |
+          $out = & .\masscan64.exe --version 2>&1 | Out-String
+          $out
+          if ($out -notmatch "Masscan version") { Write-Error "unexpected --version output"; exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: masscan64-windows-x64
+          path: |
+            masscan/masscan64.exe
+            masscan/LICENSE
+          if-no-files-found: error
