@@ -1157,9 +1157,13 @@ impl App {
                         }
                         self.settings.targets = t;
                         self.settings.ports = p;
-                        self.status = format!(
-                            "Из PAC добавлено адресов: {added_t}, портов: {added_p}. Нажмите «Сканировать» или «Дополнить»."
-                        );
+                        self.status = if added_t + added_p == 0 {
+                            "Все прокси из PAC уже есть в целях и портах сканирования.".to_string()
+                        } else {
+                            format!(
+                                "Из PAC добавлено адресов: {added_t}, портов: {added_p}. Нажмите «Сканировать» или «Дополнить»."
+                            )
+                        };
                     }
                 }
                 AppEvent::ListenerStarted(ok, errors) => {
