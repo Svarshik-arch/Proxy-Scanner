@@ -7,11 +7,15 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod columns;
 mod export;
+mod filters;
+mod graph;
 mod model;
 mod netdetect;
 mod probe;
 mod scan;
+mod session;
 mod targets;
 mod util;
 
@@ -22,7 +26,7 @@ fn run(renderer: Renderer) -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Proxy Scanner — инвентаризация прокси-серверов")
             .with_inner_size([1360.0, 800.0])
-            .with_min_inner_size([900.0, 520.0]),
+            .with_min_inner_size([480.0, 360.0]),
         renderer,
         ..Default::default()
     };

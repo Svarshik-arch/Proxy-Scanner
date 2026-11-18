@@ -8,63 +8,102 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::columns::{self, Col};
 use crate::export;
+use crate::filters::{self, Choice, Filters, Preset};
+use crate::graph::{GraphSettings, GraphView};
 use crate::model::{
-    AppEvent, CertInfo, ProbeResult, ProxyKind, ProxyRow, RowState, ScanMode, Settings,
-    SslInspection,
+    AppEvent, CertInfo, Checkpoint, ProbeResult, ProxyKind, ProxyRow, RowState, ScanMode,
+    Settings, SslInspection,
 };
 use crate::netdetect::{self, IfaceEntry};
 use crate::probe::{self, ProbeConfig, Url};
 use crate::scan::{self, MasscanConfig, TcpScanConfig, Tx};
+use crate::session::{self, ScanState, Session};
 use crate::targets::{self, TCP_SCAN_MAX_HOSTS};
 use crate::util;
 
 const SETTINGS_KEY: &str = "settings";
+const VIEW_KEY: &str = "view";
 const MAX_LOG_LINES: usize = 2000;
+/// Как часто сохранять сессию во время сканирования.
+const AUTOSAVE_EVERY: Duration = Duration::from_secs(15);
 
 const GREEN: Color32 = Color32::from_rgb(60, 170, 90);
 const RED: Color32 = Color32::from_rgb(220, 70, 70);
 const AMBER: Color32 = Color32::from_rgb(215, 160, 40);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortCol {
-    Ip,
-    Port,
-    Kind,
-    Auth,
-    Server,
-    Connect,
-    Ssl,
-    Issuer,
-    Policy,
-    Rtt,
-    State,
+/// Ширина окна, ниже которой интерфейс переходит на вкладки.
+const COMPACT_WIDTH: f32 = 900.0;
+/// Ширина окна, ниже которой сокращаются подписи в шапке.
+const NARROW_WIDTH: f32 = 640.0;
+/// Минимальная ширина таблицы, при которой подробности показываются справа.
+const DETAILS_SIDE_MIN_TABLE: f32 = 620.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum ThemeChoice {
+    #[default]
+    System,
+    Dark,
+    Light,
 }
 
-const COLUMNS: &[(SortCol, &str, f32)] = &[
-    (SortCol::Ip, "IP-адрес", 110.0),
-    (SortCol::Port, "Порт", 50.0),
-    (SortCol::Kind, "Тип", 95.0),
-    (SortCol::Auth, "Аутентификация", 120.0),
-    (SortCol::Connect, "CONNECT", 75.0),
-    (SortCol::Ssl, "SSL-инспекция", 105.0),
-    (SortCol::Issuer, "Издатель сертификата", 200.0),
-    (SortCol::Policy, "Политики", 70.0),
-    (SortCol::Server, "Сервер / Via", 180.0),
-    (SortCol::Rtt, "мс", 45.0),
-    (SortCol::State, "Состояние", 80.0),
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum ResultsView {
+    #[default]
+    Table,
+    Graph,
+}
 
-#[derive(Default)]
-struct Filter {
-    text: String,
-    only_proxy: bool,
-    only_ssl: bool,
-    only_violations: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactTab {
+    Settings,
+    Results,
+}
+
+/// Настройки внешнего вида (сохраняются между запусками).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ViewPrefs {
+    /// Подбирать столбцы по ширине окна.
+    auto_columns: bool,
+    /// Столбцы, выбранные вручную.
+    columns: Vec<Col>,
+    zoom: f32,
+    theme: ThemeChoice,
+    settings_open: bool,
+    filters_open: bool,
+    results_view: ResultsView,
+    graph: GraphSettings,
+}
+
+impl Default for ViewPrefs {
+    fn default() -> Self {
+        Self {
+            auto_columns: true,
+            columns: columns::default_visible(),
+            zoom: 1.0,
+            theme: ThemeChoice::System,
+            settings_open: true,
+            filters_open: false,
+            results_view: ResultsView::Table,
+            graph: GraphSettings::default(),
+        }
+    }
+}
+
+/// Действие из контекстного меню строки таблицы.
+enum RowAction {
+    OnlyPort(u16),
+    OnlySubnet(String),
+    OnlyKind(ProxyKind),
+    Search(String),
+    Copy(String),
 }
 
 /// Контекст диагностики, общий для всех проверок одной задачи.
@@ -82,6 +121,8 @@ struct Job {
     waiting_reference: bool,
     queue: Vec<(Ipv4Addr, u16)>,
     pending_probes: usize,
+    /// Задача без обнаружения портов — только повторная диагностика.
+    probe_only: Option<()>,
 }
 
 pub struct App {
@@ -101,11 +142,31 @@ pub struct App {
     status: String,
     error: Option<String>,
     reference: Option<CertInfo>,
-    sort: (SortCol, bool),
-    filter: Filter,
+    sort: (Col, bool),
+    filters: Filters,
+    filter_errors: Vec<String>,
+    view: ViewPrefs,
+    graph: GraphView,
+    compact_tab: CompactTab,
+    last_compact: Option<bool>,
     selected: Option<(Ipv4Addr, u16)>,
     is_admin: bool,
     npcap: bool,
+    /// Состояние текущего или последнего сканирования (для продолжения).
+    scan_state: Option<ScanState>,
+    session_path: std::path::PathBuf,
+    /// Сведения о восстановленной сессии для баннера.
+    restored: Option<RestoredInfo>,
+    last_autosave: Instant,
+    /// Изменились ли данные с последнего сохранения сессии.
+    dirty: bool,
+}
+
+/// Описание сессии, загруженной при запуске или из файла.
+struct RestoredInfo {
+    computer: String,
+    saved_at: u64,
+    other_computer: bool,
 }
 
 impl App {
@@ -114,6 +175,12 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
             .unwrap_or_default();
+        let view: ViewPrefs = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, VIEW_KEY))
+            .unwrap_or_default();
+        apply_view(&cc.egui_ctx, &view);
+        let session_path = session::default_path();
         let (tx, rx) = channel();
         let mut app = Self {
             rt,
@@ -132,15 +199,166 @@ impl App {
             status: "Готово к работе".into(),
             error: None,
             reference: None,
-            sort: (SortCol::Ip, true),
-            filter: Filter::default(),
+            sort: (Col::Ip, true),
+            filters: Filters::default(),
+            filter_errors: Vec::new(),
+            view,
+            graph: GraphView::default(),
+            compact_tab: CompactTab::Settings,
+            last_compact: None,
             selected: None,
             is_admin: util::is_admin(),
             npcap: util::npcap_installed(),
+            scan_state: None,
+            session_path,
+            restored: None,
+            last_autosave: Instant::now(),
+            dirty: false,
         };
+        // Незавершённая сессия рядом с программой (в том числе перенесённая с другого ПК).
+        if app.session_path.is_file() {
+            match session::load(&app.session_path) {
+                Ok(s) => app.restore_session(s),
+                Err(e) => app.push_log(format!("сессия: {e}")),
+            }
+        }
         // Автоопределение сетевых параметров при старте.
         app.start_detect(&cc.egui_ctx, false);
         app
+    }
+
+    // -----------------------------------------------------------------------
+    // Сессия: сохранение и восстановление
+    // -----------------------------------------------------------------------
+
+    fn restore_session(&mut self, s: Session) {
+        let other = !s.is_from_this_computer();
+        let mut settings = s.settings;
+        if other {
+            // Сетевые параметры относятся к конкретному ПК — определим их заново.
+            settings.source_ip.clear();
+            settings.router_ip.clear();
+            settings.router_mac.clear();
+            settings.adapter.clear();
+            settings.masscan_path = self.settings.masscan_path.clone();
+        }
+        settings.proxy_pass = std::mem::take(&mut self.settings.proxy_pass);
+        self.settings = settings;
+        self.rows = s.rows;
+        self.index = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| ((r.ip, r.port), i))
+            .collect();
+        self.scan_state = s.scan;
+        self.selected = None;
+        self.restored = Some(RestoredInfo {
+            computer: s.computer.clone(),
+            saved_at: s.saved_at,
+            other_computer: other,
+        });
+        if !self.rows.is_empty() || self.scan_state.is_some() {
+            self.compact_tab = CompactTab::Results;
+        }
+        let progress = self
+            .scan_state
+            .as_ref()
+            .map(|st| format!(", обнаружение выполнено на {:.1}%", st.fraction() * 100.0))
+            .unwrap_or_default();
+        self.push_log(format!(
+            "сессия: загружена ({}, ПК {}): узлов — {}{progress}",
+            session::format_time(s.saved_at),
+            s.computer,
+            self.rows.len()
+        ));
+    }
+
+    fn session_snapshot(&self) -> Session {
+        let mut rows = self.rows.clone();
+        // Незавершённые проверки при продолжении выполнятся заново.
+        for r in &mut rows {
+            if r.state == RowState::Probing {
+                r.state = RowState::Found;
+            }
+        }
+        Session::new(&self.settings, self.scan_state.clone(), rows)
+    }
+
+    fn save_session_to(&mut self, path: &std::path::Path) -> Result<(), String> {
+        session::save(path, &self.session_snapshot())
+    }
+
+    fn autosave(&mut self) {
+        if self.rows.is_empty() && self.scan_state.is_none() {
+            return;
+        }
+        let path = self.session_path.clone();
+        match self.save_session_to(&path) {
+            Ok(()) => self.dirty = false,
+            Err(e) => self.push_log(format!("сессия: не удалось сохранить — {e}")),
+        }
+        self.last_autosave = Instant::now();
+    }
+
+    fn save_session_as(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Сохранить сессию")
+            .set_file_name(session::FILE_NAME)
+            .add_filter("Сессия Proxy Scanner", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        match self.save_session_to(&path) {
+            Ok(()) => self.status = format!("Сессия сохранена: {}", path.display()),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn open_session(&mut self) {
+        if self.busy() {
+            self.error = Some("Сначала остановите текущее сканирование".into());
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Открыть сессию")
+            .add_filter("Сессия Proxy Scanner", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        match session::load(&path) {
+            Ok(s) => {
+                self.restore_session(s);
+                self.dirty = true;
+                self.status = format!("Сессия открыта: {}", path.display());
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn new_session(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.rows.clear();
+        self.index.clear();
+        self.selected = None;
+        self.scan_state = None;
+        self.restored = None;
+        self.progress = 0.0;
+        self.status = "Новая сессия".into();
+        let _ = std::fs::remove_file(&self.session_path);
+    }
+
+    /// Можно ли продолжить последнее сканирование с текущими настройками.
+    fn can_resume(&self) -> bool {
+        !self.busy()
+            && self
+                .scan_state
+                .as_ref()
+                .is_some_and(|st| st.has_progress() && st.resumable_with(&self.settings))
     }
 
     fn tx(&self, ctx: &egui::Context) -> Tx {
@@ -273,6 +491,7 @@ impl App {
             probe,
             queue: Vec::new(),
             pending_probes: 0,
+            probe_only: None,
         })
     }
 
@@ -298,18 +517,34 @@ impl App {
         }
     }
 
-    fn start_scan(&mut self, ctx: &egui::Context) {
+    fn start_scan(&mut self, ctx: &egui::Context, resume: bool) {
         self.error = None;
-        if let Err(e) = self.try_start_scan(ctx) {
+        if let Err(e) = self.try_start_scan(ctx, resume) {
             self.error = Some(e);
         }
     }
 
-    fn try_start_scan(&mut self, ctx: &egui::Context) -> Result<(), String> {
+    fn try_start_scan(&mut self, ctx: &egui::Context, resume: bool) -> Result<(), String> {
         let s = self.settings.clone();
         let target_set = targets::parse_targets(&s.targets).map_err(|e| format!("Цели: {e}"))?;
         let ports = targets::parse_ports(&s.ports).map_err(|e| format!("Порты: {e}"))?;
         let hosts = target_set.total_hosts();
+
+        let state = match (&self.scan_state, resume) {
+            (Some(st), true) if st.resumable_with(&s) => st.clone(),
+            (_, true) => {
+                return Err("Продолжить нельзя: цели, порты или режим изменились после остановки".into())
+            }
+            _ => {
+                // Новое зерно — новый псевдослучайный порядок обхода masscan.
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(1)
+                    | 1;
+                ScanState::new(&s, hosts, ports.len() as u64, seed)
+            }
+        };
 
         enum Plan {
             Tcp(TcpScanConfig),
@@ -328,6 +563,7 @@ impl App {
                     ports,
                     concurrency: s.tcp_concurrency.clamp(1, 4000),
                     timeout: Duration::from_millis(s.tcp_timeout_ms.clamp(50, 30_000)),
+                    skip_hosts: state.tcp_hosts_done,
                 })
             }
             ScanMode::Masscan => {
@@ -351,6 +587,8 @@ impl App {
                     router_ip: s.router_ip.clone(),
                     router_mac: s.router_mac.clone(),
                     extra_args: s.extra_args.clone(),
+                    seed: state.masscan_seed,
+                    resume_index: state.masscan_index,
                 })
             }
         };
@@ -360,20 +598,45 @@ impl App {
         let reference = job.probe.as_ref().map(|p| self.reference_future(&p.cfg));
         let tx = self.tx(ctx);
 
-        self.rows.clear();
-        self.index.clear();
-        self.selected = None;
-        self.progress = 0.0;
-        self.status = "Запуск…".into();
-        self.job = Some(job);
+        let unfinished: Vec<(Ipv4Addr, u16)> = if resume {
+            self.rows
+                .iter()
+                .filter(|r| matches!(r.state, RowState::Found | RowState::Probing))
+                .map(|r| (r.ip, r.port))
+                .collect()
+        } else {
+            self.rows.clear();
+            self.index.clear();
+            self.selected = None;
+            Vec::new()
+        };
+        self.compact_tab = CompactTab::Results;
+        self.progress = state.fraction();
+        self.status = if resume { "Продолжение…" } else { "Запуск…" }.into();
         self.push_log(format!(
-            "— новая задача: {} адресов, режим {} —",
+            "— {}: {} адресов, режим {} —",
+            if resume {
+                format!("продолжение с {:.1}%", state.fraction() * 100.0)
+            } else {
+                "новая задача".to_string()
+            },
             hosts,
             match s.mode {
                 ScanMode::Masscan => "masscan",
                 ScanMode::TcpConnect => "TCP-connect",
             }
         ));
+        self.scan_state = Some(state);
+        self.restored = None;
+        self.dirty = true;
+        self.job = Some(job);
+        // Узлы, проверка которых не успела завершиться, проверяем снова.
+        for key in unfinished {
+            if let Some(&i) = self.index.get(&key) {
+                self.rows[i].state = RowState::Found;
+            }
+            self.spawn_probe(ctx, key);
+        }
 
         self.rt.spawn(async move {
             if let Some(fut) = reference {
@@ -398,6 +661,7 @@ impl App {
                 return;
             }
         };
+        job.probe_only = Some(());
         job.queue = match only {
             Some(k) => vec![k],
             None => self.rows.iter().map(|r| (r.ip, r.port)).collect(),
@@ -479,7 +743,21 @@ impl App {
                     if !self.index.contains_key(&(ip, port)) {
                         self.index.insert((ip, port), self.rows.len());
                         self.rows.push(ProxyRow::new(ip, port, source));
+                        self.dirty = true;
                         self.spawn_probe(ctx, (ip, port));
+                    }
+                }
+                AppEvent::Checkpoint(c) => {
+                    if let Some(st) = &mut self.scan_state {
+                        match c {
+                            Checkpoint::TcpHostsDone(n) => {
+                                st.tcp_hosts_done = st.tcp_hosts_done.max(n)
+                            }
+                            Checkpoint::MasscanIndex(i) => {
+                                st.masscan_index = st.masscan_index.max(i)
+                            }
+                        }
+                        self.dirty = true;
                     }
                 }
                 AppEvent::Progress(p, text) => {
@@ -533,6 +811,7 @@ impl App {
                         row.ssl = result.ssl.unwrap_or(SslInspection::Unknown);
                         row.probe = *result;
                     }
+                    self.dirty = true;
                     if let Some(job) = &mut self.job {
                         job.pending_probes = job.pending_probes.saturating_sub(1);
                     }
@@ -549,7 +828,12 @@ impl App {
                     }
                     if let Some(job) = &mut self.job {
                         job.discovery_done = true;
+                        let completed = r.is_ok() && !job.cancel.is_cancelled() && job.probe_only.is_none();
+                        if completed && let Some(st) = &mut self.scan_state {
+                            st.finished = true;
+                        }
                     }
+                    self.dirty = true;
                 }
             }
         }
@@ -572,9 +856,19 @@ impl App {
                 if job.cancel.is_cancelled() { "Остановлено" } else { "Готово" },
                 self.rows.len(),
             );
+            if job.cancel.is_cancelled()
+                && let Some(st) = &self.scan_state
+                && !st.finished
+            {
+                self.status.push_str(&format!(
+                    " · можно продолжить с {:.1}%",
+                    st.fraction() * 100.0
+                ));
+            }
             self.push_log(self.status.clone());
             self.progress = 1.0;
             self.job = None;
+            self.autosave();
         } else {
             let total = self.rows.len().max(1);
             let done = total.saturating_sub(job.pending_probes);
@@ -587,40 +881,11 @@ impl App {
     // Таблица: фильтрация и сортировка
     // -----------------------------------------------------------------------
 
-    fn visible_rows(&self) -> Vec<usize> {
-        let needle = self.filter.text.trim().to_lowercase();
+    fn visible_rows(&mut self) -> Vec<usize> {
+        let (compiled, errors) = self.filters.compile();
+        self.filter_errors = errors;
         let mut idx: Vec<usize> = (0..self.rows.len())
-            .filter(|&i| {
-                let r = &self.rows[i];
-                if self.filter.only_proxy && !r.kind.is_proxy() {
-                    return false;
-                }
-                if self.filter.only_ssl && r.ssl != SslInspection::Yes {
-                    return false;
-                }
-                if self.filter.only_violations {
-                    let (ok, total) = r.policy_counts();
-                    if ok == total {
-                        return false;
-                    }
-                }
-                if needle.is_empty() {
-                    return true;
-                }
-                let hay = format!(
-                    "{}:{} {} {} {} {} {} {}",
-                    r.ip,
-                    r.port,
-                    r.kind.label(),
-                    r.auth_label(),
-                    r.server_label(),
-                    r.issuer_label(),
-                    r.ssl.label(),
-                    r.state.label()
-                )
-                .to_lowercase();
-                needle.split_whitespace().all(|w| hay.contains(w))
-            })
+            .filter(|&i| compiled.matches(&self.rows[i]))
             .collect();
 
         let (col, asc) = self.sort;
@@ -628,21 +893,23 @@ impl App {
         idx.sort_by(|&a, &b| {
             let (x, y) = (&rows[a], &rows[b]);
             let ord = match col {
-                SortCol::Ip => x.ip.cmp(&y.ip),
-                SortCol::Port => x.port.cmp(&y.port),
-                SortCol::Kind => x.kind.cmp(&y.kind),
-                SortCol::Auth => x.auth_label().cmp(&y.auth_label()),
-                SortCol::Server => x.server_label().cmp(&y.server_label()),
-                SortCol::Connect => x.probe.connect_status.cmp(&y.probe.connect_status),
-                SortCol::Ssl => x.ssl.cmp(&y.ssl),
-                SortCol::Issuer => x.issuer_label().cmp(y.issuer_label()),
-                SortCol::Policy => {
+                Col::Ip => x.ip.cmp(&y.ip),
+                Col::Port => x.port.cmp(&y.port),
+                Col::Kind => x.kind.cmp(&y.kind),
+                Col::Auth => x.auth_label().cmp(&y.auth_label()),
+                Col::Server => x.server_label().cmp(&y.server_label()),
+                Col::Connect => x.probe.connect_status.cmp(&y.probe.connect_status),
+                Col::Ssl => x.ssl.cmp(&y.ssl),
+                Col::Issuer => x.issuer_label().cmp(y.issuer_label()),
+                Col::Policy => {
                     let (xo, xt) = x.policy_counts();
                     let (yo, yt) = y.policy_counts();
                     (xt - xo).cmp(&(yt - yo))
                 }
-                SortCol::Rtt => x.probe.rtt_ms.cmp(&y.probe.rtt_ms),
-                SortCol::State => (x.state as u8).cmp(&(y.state as u8)),
+                Col::Rtt => x.probe.rtt_ms.cmp(&y.probe.rtt_ms),
+                Col::State => (x.state as u8).cmp(&(y.state as u8)),
+                Col::Source => x.source.cmp(&y.source),
+                Col::Http => x.probe.http_status.cmp(&y.probe.http_status),
             }
             .then_with(|| x.ip.cmp(&y.ip))
             .then_with(|| x.port.cmp(&y.port));
@@ -672,43 +939,157 @@ impl App {
     // Отрисовка
     // -----------------------------------------------------------------------
 
-    fn ui_top(&mut self, ui: &mut egui::Ui) {
+    fn ui_top(&mut self, ui: &mut egui::Ui, compact: bool, narrow: bool) {
         ui.horizontal_wrapped(|ui| {
-            ui.heading("Proxy Scanner");
+            if !compact {
+                ui.toggle_value(&mut self.view.settings_open, "☰")
+                    .on_hover_text("Показать или скрыть панель параметров");
+            }
+            if narrow {
+                ui.strong("Proxy Scanner");
+            } else {
+                ui.heading("Proxy Scanner");
+            }
             ui.separator();
-            ui.label("Режим обнаружения:");
+            if compact {
+                ui.selectable_value(&mut self.compact_tab, CompactTab::Settings, "Параметры");
+                ui.selectable_value(
+                    &mut self.compact_tab,
+                    CompactTab::Results,
+                    format!("Результаты ({})", self.rows.len()),
+                );
+                ui.separator();
+            }
+            if !narrow {
+                ui.label("Режим:");
+            }
             let busy = self.busy();
             ui.add_enabled_ui(!busy, |ui| {
-                ui.radio_value(&mut self.settings.mode, ScanMode::Masscan, "masscan (быстрый)")
-                    .on_hover_text(
-                        "Внешний masscan64.exe. Требуются установленный Npcap и права администратора.",
-                    );
-                ui.radio_value(&mut self.settings.mode, ScanMode::TcpConnect, "TCP-connect (встроенный)")
-                    .on_hover_text(
-                        "Встроенный асинхронный сканер. Не требует драйверов и прав администратора; \
-                         подсети до /16.",
-                    );
+                let (m, t) = if narrow {
+                    ("masscan", "TCP")
+                } else {
+                    ("masscan (быстрый)", "TCP-connect (встроенный)")
+                };
+                ui.radio_value(&mut self.settings.mode, ScanMode::Masscan, m).on_hover_text(
+                    "Внешний masscan64.exe. Требуются установленный Npcap и права администратора.",
+                );
+                ui.radio_value(&mut self.settings.mode, ScanMode::TcpConnect, t).on_hover_text(
+                    "Встроенный асинхронный сканер. Не требует драйверов и прав администратора; \
+                     подсети до /16.",
+                );
             });
             ui.separator();
+            let badge = |ui: &mut egui::Ui, ok: bool, full: &str, hint: &str| {
+                let color = if ok { GREEN } else { AMBER };
+                let text = if narrow { "●".to_string() } else { format!("● {full}") };
+                ui.add(egui::Label::new(RichText::new(text).color(color)).extend())
+                    .on_hover_text(hint);
+            };
             if self.is_admin {
-                ui.colored_label(GREEN, "● администратор");
+                badge(ui, true, "администратор", "Программа запущена от имени администратора");
             } else {
-                ui.colored_label(AMBER, "● обычный пользователь");
+                badge(ui, false, "обычный пользователь", "Для режима masscan нужны права администратора");
                 if cfg!(windows)
                     && ui
-                        .small_button("Перезапустить от имени администратора")
+                        .small_button(if narrow { "⛨" } else { "Перезапустить от имени администратора" })
+                        .on_hover_text("Перезапустить программу с правами администратора")
                         .clicked()
                 {
+                    self.autosave();
                     match util::relaunch_as_admin() {
                         Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
                         Err(e) => self.error = Some(e),
                     }
                 }
             }
-            if self.npcap {
-                ui.colored_label(GREEN, "● Npcap");
-            } else {
-                ui.colored_label(AMBER, "● Npcap не найден");
+            badge(
+                ui,
+                self.npcap,
+                if self.npcap { "Npcap" } else { "Npcap не найден" },
+                if self.npcap { "Npcap установлен" } else { "Npcap не найден: режим masscan недоступен" },
+            );
+            ui.separator();
+            self.menu_session(ui);
+            self.menu_view(ui);
+        });
+    }
+
+    fn menu_session(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Сессия", |ui| {
+            if ui
+                .button("Сохранить сейчас")
+                .on_hover_text("Записать сессию в файл рядом с программой")
+                .clicked()
+            {
+                self.autosave();
+                self.status = format!("Сессия сохранена: {}", self.session_path.display());
+                ui.close();
+            }
+            if ui.button("Сохранить как…").clicked() {
+                ui.close();
+                self.save_session_as();
+            }
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Открыть…"))
+                .on_hover_text("Загрузить сессию, в том числе сохранённую на другом ПК")
+                .clicked()
+            {
+                ui.close();
+                self.open_session();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Новая сессия"))
+                .on_hover_text("Очистить результаты и удалить файл сессии")
+                .clicked()
+            {
+                self.new_session();
+                ui.close();
+            }
+            ui.separator();
+            ui.weak("Файл сессии:");
+            ui.add(egui::Label::new(RichText::new(self.session_path.display().to_string()).small()).wrap());
+            ui.weak("Сохраняется при закрытии программы, остановке и каждые 15 с во время сканирования.");
+        });
+    }
+
+    fn menu_view(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Вид", |ui| {
+            ui.label("Масштаб интерфейса");
+            let mut zoom = ui.ctx().zoom_factor();
+            ui.horizontal(|ui| {
+                for z in [0.8f32, 1.0, 1.25, 1.5, 2.0] {
+                    if ui
+                        .selectable_label((zoom - z).abs() < 0.01, format!("{:.0}%", z * 100.0))
+                        .clicked()
+                    {
+                        zoom = z;
+                    }
+                }
+            });
+            if ui
+                .add(egui::Slider::new(&mut zoom, 0.6..=2.5).show_value(false))
+                .on_hover_text("Также Ctrl + «+» / Ctrl + «−» / Ctrl + 0")
+                .changed()
+                || (zoom - ui.ctx().zoom_factor()).abs() > 1e-3
+            {
+                self.view.zoom = zoom;
+                ui.ctx().set_zoom_factor(zoom);
+            }
+            ui.separator();
+            ui.label("Тема");
+            let before = self.view.theme;
+            ui.radio_value(&mut self.view.theme, ThemeChoice::System, "как в системе");
+            ui.radio_value(&mut self.view.theme, ThemeChoice::Dark, "тёмная");
+            ui.radio_value(&mut self.view.theme, ThemeChoice::Light, "светлая");
+            if before != self.view.theme {
+                apply_view(ui.ctx(), &self.view);
+            }
+            ui.separator();
+            if ui.button("Сбросить вид").clicked() {
+                self.view = ViewPrefs::default();
+                apply_view(ui.ctx(), &self.view);
+                ui.close();
             }
         });
     }
@@ -942,7 +1323,7 @@ impl App {
             });
 
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if busy {
                 if ui
                     .add(egui::Button::new(RichText::new("■ Остановить").strong()).min_size([130.0, 28.0].into()))
@@ -951,12 +1332,31 @@ impl App {
                     self.stop();
                 }
                 ui.spinner();
+            } else if self.can_resume() {
+                let pct = self.scan_state.as_ref().map(|s| s.fraction() * 100.0).unwrap_or(0.0);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(format!("⏵ Продолжить ({pct:.0}%)")).strong())
+                            .min_size([130.0, 28.0].into()),
+                    )
+                    .on_hover_text("Продолжить обнаружение с места остановки")
+                    .clicked()
+                {
+                    self.start_scan(&ctx, true);
+                }
+                if ui
+                    .button("▶ Заново")
+                    .on_hover_text("Начать сканирование с начала (текущие результаты будут очищены)")
+                    .clicked()
+                {
+                    self.start_scan(&ctx, false);
+                }
             } else {
                 if ui
                     .add(egui::Button::new(RichText::new("▶ Сканировать").strong()).min_size([130.0, 28.0].into()))
                     .clicked()
                 {
-                    self.start_scan(&ctx);
+                    self.start_scan(&ctx, false);
                 }
                 if ui
                     .add_enabled(!self.rows.is_empty(), egui::Button::new("Перепроверить все"))
@@ -982,13 +1382,15 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.toggle_value(&mut self.show_log, "Журнал");
+            let w = (ui.available_width() * 0.25).clamp(80.0, 220.0);
             ui.add(
                 egui::ProgressBar::new(self.progress)
-                    .desired_width(220.0)
+                    .desired_width(w)
                     .show_percentage()
                     .animate(self.busy()),
             );
-            ui.label(&self.status);
+            ui.add(egui::Label::new(&self.status).truncate())
+                .on_hover_text(&self.status);
         });
         if self.show_log {
             ui.separator();
@@ -1014,17 +1416,15 @@ impl App {
         let mut close = false;
         let mut reprobe = false;
         let row = &self.rows[i];
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.heading(format!("{}:{}", row.ip, row.port));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                close = ui.button("✖").clicked();
-                reprobe = ui
-                    .add_enabled(!self.busy(), egui::Button::new("Перепроверить"))
-                    .clicked();
-                if ui.button("Копировать").on_hover_text("Скопировать адрес").clicked() {
-                    ctx.copy_text(format!("{}:{}", row.ip, row.port));
-                }
-            });
+            if ui.button("Копировать").on_hover_text("Скопировать адрес").clicked() {
+                ctx.copy_text(format!("{}:{}", row.ip, row.port));
+            }
+            reprobe = ui
+                .add_enabled(!self.busy(), egui::Button::new("Перепроверить"))
+                .clicked();
+            close = ui.button("✖").on_hover_text("Закрыть").clicked();
         });
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -1123,24 +1523,168 @@ impl App {
         }
     }
 
-    fn ui_table(&mut self, ui: &mut egui::Ui) {
+    /// Баннер о незавершённом сканировании / восстановленной сессии.
+    fn ui_banner(&mut self, ui: &mut egui::Ui) {
+        let resumable = self.can_resume();
+        let restored = self
+            .restored
+            .as_ref()
+            .map(|r| (r.computer.clone(), r.saved_at, r.other_computer));
+        if !resumable && restored.is_none() {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let mut dismiss = false;
+        let mut resume = false;
+        let fraction = self.scan_state.as_ref().map(|s| s.fraction()).unwrap_or(0.0);
+        let blocked = !resumable
+            && self
+                .scan_state
+                .as_ref()
+                .is_some_and(|st| !st.finished && st.has_progress());
+        let nrows = self.rows.len();
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    if resumable {
+                        ui.strong(format!(
+                            "Незавершённое сканирование: выполнено {:.1}%, найдено узлов — {nrows}.",
+                            fraction * 100.0
+                        ));
+                    } else {
+                        ui.strong(format!("Загружена сессия: узлов — {nrows}."));
+                    }
+                    if let Some((computer, saved_at, other)) = &restored {
+                        ui.label(format!(
+                            "Сохранена {} на ПК «{computer}».",
+                            session::format_time(*saved_at)
+                        ));
+                        if *other {
+                            ui.colored_label(AMBER, "Сетевые параметры определены заново для этого ПК.");
+                        }
+                    }
+                    if resumable {
+                        resume = ui.button(RichText::new("⏵ Продолжить").strong()).clicked();
+                    } else if blocked {
+                        ui.colored_label(
+                            AMBER,
+                            "Цели, порты или режим отличаются от сохранённых — продолжить нельзя.",
+                        );
+                    }
+                    if !resumable {
+                        dismiss = ui.small_button("✖").on_hover_text("Скрыть").clicked();
+                    }
+                });
+            });
+        if resume {
+            self.start_scan(&ctx, true);
+        }
+        if dismiss {
+            self.restored = None;
+        }
+        ui.add_space(4.0);
+    }
+
+    fn ui_filters_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let right = ui.max_rect().right();
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label("Тип:");
+                for &k in filters::KINDS {
+                    let on = self.filters.kinds.contains(&k);
+                    if ui.selectable_label(on, k.label()).clicked() {
+                        self.filters.toggle_kind(k);
+                    }
+                }
+                ui.end_row();
+                choice_combo(ui, right, "f_auth", "Аутентификация:", &mut self.filters.auth);
+                choice_combo(ui, right, "f_connect", "CONNECT:", &mut self.filters.connect);
+                choice_combo(ui, right, "f_ssl", "SSL-инспекция:", &mut self.filters.ssl);
+                choice_combo(ui, right, "f_policy", "Политики:", &mut self.filters.policy);
+                choice_combo(ui, right, "f_state", "Состояние:", &mut self.filters.state);
+                choice_combo(ui, right, "f_source", "Обнаружен:", &mut self.filters.source);
+                flow(ui, right, "f_ports", |ui| {
+                    ui.label("Порты:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filters.ports)
+                            .desired_width(110.0)
+                            .hint_text("3128,8080-8090"),
+                    );
+                });
+                flow(ui, right, "f_subnet", |ui| {
+                    ui.label("Адреса:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filters.subnet)
+                            .desired_width(150.0)
+                            .hint_text("10.0.0.0/24"),
+                    );
+                });
+                flow(ui, right, "f_rtt", |ui| {
+                    let mut on = self.filters.max_rtt_ms.is_some();
+                    if ui.checkbox(&mut on, "Отклик не более").changed() {
+                        self.filters.max_rtt_ms = on.then_some(100);
+                    }
+                    if let Some(v) = &mut self.filters.max_rtt_ms {
+                        ui.add(egui::DragValue::new(v).range(1..=60_000).suffix(" мс"));
+                    }
+                });
+                if ui
+                    .add_enabled(!self.filters.is_empty(), egui::Button::new("Сбросить всё"))
+                    .clicked()
+                {
+                    self.filters = Filters::default();
+                }
+            });
+            for e in &self.filter_errors {
+                ui.colored_label(RED, e);
+            }
+        });
+    }
+
+    fn ui_results(&mut self, ui: &mut egui::Ui) {
+        self.ui_banner(ui);
         let visible = self.visible_rows();
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("Фильтр:");
+            let w = (ui.available_width() * 0.3).clamp(120.0, 280.0);
             ui.add(
-                egui::TextEdit::singleline(&mut self.filter.text)
-                    .desired_width(200.0)
-                    .hint_text("IP, порт, тип, издатель…"),
+                egui::TextEdit::singleline(&mut self.filters.text)
+                    .desired_width(w)
+                    .hint_text("🔍 IP, порт, тип, издатель…"),
             );
-            if ui.small_button("✖").on_hover_text("Сбросить фильтр").clicked() {
-                self.filter = Filter::default();
+            let n = self.filters.active_count();
+            let label = if n > 0 { format!("Фильтры ({n})") } else { "Фильтры".to_string() };
+            ui.toggle_value(&mut self.view.filters_open, label)
+                .on_hover_text("Показать панель фильтров");
+            ui.menu_button("Быстрые", |ui| {
+                for &p in Preset::ALL {
+                    if ui.button(p.label()).on_hover_text(p.hint()).clicked() {
+                        self.filters.apply_preset(p);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Сбросить все фильтры").clicked() {
+                    self.filters = Filters::default();
+                    ui.close();
+                }
+            });
+            if !self.filters.is_empty() && ui.small_button("✖").on_hover_text("Сбросить фильтры").clicked() {
+                self.filters = Filters::default();
             }
-            ui.checkbox(&mut self.filter.only_proxy, "только прокси");
-            ui.checkbox(&mut self.filter.only_ssl, "SSL-инспекция");
-            ui.checkbox(&mut self.filter.only_violations, "нарушения политик");
             ui.separator();
-            ui.label(format!("Показано {} из {}", visible.len(), self.rows.len()));
+            ui.selectable_value(&mut self.view.results_view, ResultsView::Table, "☰ Таблица");
+            ui.selectable_value(&mut self.view.results_view, ResultsView::Graph, "◎ Граф")
+                .on_hover_text("Граф подсетей, узлов и издателей сертификатов");
+            if self.view.results_view == ResultsView::Table {
+                self.menu_columns(ui);
+            }
+            ui.separator();
+            ui.add(egui::Label::new(format!("{} из {}", visible.len(), self.rows.len())).extend());
             if ui
                 .add_enabled(!visible.is_empty(), egui::Button::new("Экспорт…"))
                 .on_hover_text("Сохранить показанные строки в CSV или JSON")
@@ -1149,46 +1693,134 @@ impl App {
                 self.export(&visible);
             }
         });
+        if self.view.filters_open {
+            ui.add_space(2.0);
+            self.ui_filters_panel(ui);
+        } else if !self.filter_errors.is_empty() {
+            for e in &self.filter_errors {
+                ui.colored_label(RED, e);
+            }
+        }
         ui.separator();
 
         if self.rows.is_empty() {
             ui.add_space(30.0);
             ui.vertical_centered(|ui| {
-                ui.weak("Нет данных. Укажите цели и порты слева и нажмите «Сканировать».");
+                ui.weak("Нет данных. Укажите цели и порты и нажмите «Сканировать».");
+            });
+            return;
+        }
+        if visible.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.weak("Нет узлов, подходящих под фильтры.");
+                if ui.button("Сбросить фильтры").clicked() {
+                    self.filters = Filters::default();
+                }
             });
             return;
         }
 
+        match self.view.results_view {
+            ResultsView::Table => self.ui_table(ui, &visible),
+            ResultsView::Graph => {
+                let refs: Vec<&ProxyRow> = visible.iter().map(|&i| &self.rows[i]).collect();
+                let out = self.graph.ui(ui, &refs, self.selected, &mut self.view.graph);
+                if let Some(k) = out.select {
+                    self.selected = Some(k);
+                }
+                if let Some(net) = out.filter_subnet {
+                    self.filters.subnet = net;
+                    self.view.filters_open = true;
+                }
+                if let Some(t) = out.filter_text {
+                    self.filters.text = t;
+                }
+            }
+        }
+    }
+
+    fn menu_columns(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Столбцы", |ui| {
+            ui.checkbox(&mut self.view.auto_columns, "Подбирать по ширине окна")
+                .on_hover_text("Менее важные столбцы скрываются, когда окно узкое");
+            ui.separator();
+            ui.add_enabled_ui(!self.view.auto_columns, |ui| {
+                for d in columns::COLS {
+                    let mut on = self.view.columns.contains(&d.col);
+                    if ui.checkbox(&mut on, d.title).changed() {
+                        if on {
+                            self.view.columns.push(d.col);
+                        } else if self.view.columns.len() > 1 {
+                            self.view.columns.retain(|c| *c != d.col);
+                        }
+                    }
+                }
+                if ui.button("По умолчанию").clicked() {
+                    self.view.columns = columns::default_visible();
+                }
+            });
+        });
+    }
+
+    fn ui_table(&mut self, ui: &mut egui::Ui, visible: &[usize]) {
+        let auto = self.view.auto_columns;
+        let cols: Vec<Col> = if auto {
+            columns::auto_layout(ui.available_width().min(ui.clip_rect().right() - ui.cursor().min.x))
+        } else {
+            columns::COLS
+                .iter()
+                .map(|d| d.col)
+                .filter(|c| self.view.columns.contains(c))
+                .collect()
+        };
         let mut clicked: Option<(Ipv4Addr, u16)> = None;
+        let mut action: Option<RowAction> = None;
         let mut sort = self.sort;
         let selected = self.selected;
         let rows = &self.rows;
+        let salt = (auto, cols.iter().map(|c| *c as u8).collect::<Vec<_>>());
 
-        egui::ScrollArea::horizontal().show(ui, |ui| {
+        // В авто-режиме ширины подгоняются под окно: исходные, если помещаются, иначе минимальные.
+        let avail = ui.available_width().min(ui.clip_rect().right() - ui.cursor().min.x);
+        let natural: f32 = cols.iter().map(|c| columns::def(*c).width + 10.0).sum();
+        let fit_natural = natural <= avail;
+        let mut show = |ui: &mut egui::Ui| {
             let mut table = TableBuilder::new(ui)
+                .id_salt(("results_table", salt.clone(), fit_natural))
                 .striped(true)
                 .resizable(true)
                 .sense(egui::Sense::click())
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .min_scrolled_height(0.0);
-            for (_, _, width) in COLUMNS {
-                table = table.column(Column::initial(*width).at_least(36.0).clip(true));
+            for (i, c) in cols.iter().enumerate() {
+                let d = columns::def(*c);
+                let column = if auto && i + 1 == cols.len() {
+                    Column::remainder().at_least(d.min.min(60.0))
+                } else if auto && !fit_natural {
+                    Column::initial(d.min).at_least(36.0)
+                } else {
+                    Column::initial(d.width).at_least(36.0)
+                };
+                table = table.column(column.clip(true));
             }
             table
                 .header(24.0, |mut header| {
-                    for (col, title, _) in COLUMNS {
+                    for c in &cols {
                         header.col(|ui| {
-                            let arrow = if sort.0 == *col {
+                            let d = columns::def(*c);
+                            let arrow = if sort.0 == *c {
                                 if sort.1 { " ⏶" } else { " ⏷" }
                             } else {
                                 ""
                             };
                             let resp = ui.add(
-                                egui::Button::new(RichText::new(format!("{title}{arrow}")).strong())
-                                    .frame(false),
+                                egui::Button::new(RichText::new(format!("{}{arrow}", d.title)).strong())
+                                    .frame(false)
+                                    .truncate(),
                             );
-                            if resp.clicked() {
-                                sort = if sort.0 == *col { (*col, !sort.1) } else { (*col, true) };
+                            if resp.on_hover_text(d.title).clicked() {
+                                sort = if sort.0 == *c { (*c, !sort.1) } else { (*c, true) };
                             }
                         });
                     }
@@ -1197,21 +1829,121 @@ impl App {
                     body.rows(22.0, visible.len(), |mut row| {
                         let r = &rows[visible[row.index()]];
                         row.set_selected(selected == Some((r.ip, r.port)));
-                        for (col, _, _) in COLUMNS {
-                            row.col(|ui| cell(ui, r, *col));
+                        for c in &cols {
+                            row.col(|ui| cell(ui, r, *c));
                         }
-                        if row.response().clicked() {
+                        let resp = row.response();
+                        if resp.clicked() {
                             clicked = Some((r.ip, r.port));
                         }
+                        resp.context_menu(|ui| {
+                            row_menu(ui, r, &mut action);
+                        });
                     });
                 });
-        });
+        };
+        if auto {
+            show(ui);
+        } else {
+            egui::ScrollArea::horizontal().show(ui, show);
+        }
 
         self.sort = sort;
         if let Some(k) = clicked {
             self.selected = if self.selected == Some(k) { None } else { Some(k) };
         }
+        match action {
+            Some(RowAction::OnlyPort(p)) => {
+                self.filters.ports = p.to_string();
+                self.view.filters_open = true;
+            }
+            Some(RowAction::OnlySubnet(n)) => {
+                self.filters.subnet = n;
+                self.view.filters_open = true;
+            }
+            Some(RowAction::OnlyKind(k)) => {
+                self.filters.kinds = vec![k];
+                self.view.filters_open = true;
+            }
+            Some(RowAction::Search(t)) => self.filters.text = t,
+            Some(RowAction::Copy(t)) => ui.ctx().copy_text(t),
+            None => {}
+        }
     }
+}
+
+/// Контекстное меню строки: быстрые фильтры по значению.
+fn row_menu(ui: &mut egui::Ui, r: &ProxyRow, action: &mut Option<RowAction>) {
+    let mut pick = |ui: &mut egui::Ui, text: String, a: RowAction| {
+        if ui.button(text).clicked() {
+            *action = Some(a);
+            ui.close();
+        }
+    };
+    pick(ui, format!("Копировать {}:{}", r.ip, r.port), RowAction::Copy(format!("{}:{}", r.ip, r.port)));
+    ui.separator();
+    pick(ui, format!("Только порт {}", r.port), RowAction::OnlyPort(r.port));
+    let net = filters::subnet_24(r.ip);
+    pick(ui, format!("Только подсеть {net}"), RowAction::OnlySubnet(net));
+    pick(ui, format!("Только тип «{}»", r.kind.label()), RowAction::OnlyKind(r.kind));
+    if let Some(c) = &r.probe.cert
+        && !c.issuer.is_empty()
+    {
+        let cn = c
+            .issuer
+            .split(',')
+            .map(str::trim)
+            .find_map(|p| p.strip_prefix("CN="))
+            .unwrap_or(&c.issuer)
+            .to_string();
+        pick(ui, format!("Найти издателя «{}»", truncate(&cn, 40)), RowAction::Search(cn));
+    }
+}
+
+/// Группа элементов в `horizontal_wrapped`, которая переносится целиком.
+/// egui не знает размер группы до отрисовки, поэтому ширина берётся с прошлого
+/// кадра; если группа не помещается до правого края `right`, она начинается
+/// с новой строки.
+fn flow(ui: &mut egui::Ui, right: f32, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let key = ui.scope_id().with(("flow_group", id));
+    let last: Option<f32> = ui.data(|d| d.get_temp(key));
+    let x = ui.cursor().min.x;
+    let at_line_start = x <= ui.max_rect().min.x + 1.0;
+    let spacing = ui.spacing().item_spacing.x;
+    if let Some(w) = last
+        && !at_line_start
+        && x + spacing + w > right
+    {
+        ui.end_row();
+    }
+    let width = ui.horizontal(add).response.rect.width();
+    ui.data_mut(|d| d.insert_temp(key, width));
+}
+
+fn choice_combo<T: Choice>(ui: &mut egui::Ui, right: f32, id: &str, label: &str, value: &mut T) {
+    flow(ui, right, id, |ui| {
+        if value.is_any() {
+            ui.label(label);
+        } else {
+            ui.label(RichText::new(label).strong().color(ui.visuals().selection.stroke.color));
+        }
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(value.label())
+            .show_ui(ui, |ui| {
+                for &c in T::ALL {
+                    ui.selectable_value(value, c, c.label());
+                }
+            });
+    });
+}
+
+fn apply_view(ctx: &egui::Context, view: &ViewPrefs) {
+    ctx.set_zoom_factor(view.zoom.clamp(0.5, 3.0));
+    ctx.set_theme(match view.theme {
+        ThemeChoice::System => egui::ThemePreference::System,
+        ThemeChoice::Dark => egui::ThemePreference::Dark,
+        ThemeChoice::Light => egui::ThemePreference::Light,
+    });
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1223,31 +1955,31 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn cell(ui: &mut egui::Ui, r: &ProxyRow, col: SortCol) {
+fn cell(ui: &mut egui::Ui, r: &ProxyRow, col: Col) {
     match col {
-        SortCol::Ip => {
+        Col::Ip => {
             ui.label(RichText::new(r.ip.to_string()).monospace());
         }
-        SortCol::Port => {
+        Col::Port => {
             ui.label(RichText::new(r.port.to_string()).monospace());
         }
-        SortCol::Kind => {
+        Col::Kind => {
             if r.kind.is_proxy() {
                 ui.label(RichText::new(r.kind.label()).strong());
             } else {
                 ui.weak(r.kind.label());
             }
         }
-        SortCol::Auth => {
+        Col::Auth => {
             ui.label(r.auth_label());
         }
-        SortCol::Server => {
+        Col::Server => {
             ui.label(r.server_label());
         }
-        SortCol::Connect => {
+        Col::Connect => {
             ui.label(r.connect_label());
         }
-        SortCol::Ssl => match r.ssl {
+        Col::Ssl => match r.ssl {
             SslInspection::Yes => {
                 ui.colored_label(RED, RichText::new(r.ssl.label()).strong());
             }
@@ -1261,21 +1993,21 @@ fn cell(ui: &mut egui::Ui, r: &ProxyRow, col: SortCol) {
                 ui.weak(r.ssl.label());
             }
         },
-        SortCol::Issuer => {
+        Col::Issuer => {
             ui.label(r.issuer_label());
         }
-        SortCol::Policy => {
+        Col::Policy => {
             let (ok, total) = r.policy_counts();
             if total > 0 {
                 ui.colored_label(if ok == total { GREEN } else { RED }, r.policy_label());
             }
         }
-        SortCol::Rtt => {
+        Col::Rtt => {
             if let Some(v) = r.probe.rtt_ms {
                 ui.label(v.to_string());
             }
         }
-        SortCol::State => match r.state {
+        Col::State => match r.state {
             RowState::Error => {
                 ui.colored_label(RED, r.state.label())
                     .on_hover_text(r.probe.error.clone().unwrap_or_default());
@@ -1287,42 +2019,115 @@ fn cell(ui: &mut egui::Ui, r: &ProxyRow, col: SortCol) {
                 ui.weak(r.state.label());
             }
         },
+        Col::Source => {
+            ui.weak(&r.source);
+        }
+        Col::Http => {
+            if let Some(v) = r.probe.http_status {
+                ui.label(v.to_string());
+            }
+        }
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
+        self.view.zoom = ctx.zoom_factor();
+        if self.busy() && self.dirty && self.last_autosave.elapsed() >= AUTOSAVE_EVERY {
+            self.autosave();
+        }
+        if self.busy() {
+            // Таймер автосохранения не должен зависеть от активности пользователя.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("top")
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                self.ui_top(ui);
-                ui.add_space(4.0);
-            });
-        egui::Panel::bottom("bottom").show(ui, |ui| self.ui_bottom(ui));
-        egui::Panel::left("settings")
-            .resizable(true)
-            .default_size(350.0)
-            .min_size(280.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.ui_settings(ui));
-            });
-        if let Some(key) = self.selected {
-            egui::Panel::right("details")
-                .resizable(true)
-                .default_size(400.0)
-                .min_size(260.0)
-                .show(ui, |ui| self.ui_details(ui, key));
+        let full = ui.max_rect();
+        let compact = full.width() < COMPACT_WIDTH;
+        let narrow = full.width() < NARROW_WIDTH;
+        if self.last_compact != Some(compact) {
+            if compact {
+                self.compact_tab = if self.rows.is_empty() && !self.busy() {
+                    CompactTab::Settings
+                } else {
+                    CompactTab::Results
+                };
+            }
+            self.last_compact = Some(compact);
         }
-        egui::CentralPanel::default().show(ui, |ui| self.ui_table(ui));
+
+        egui::Panel::top("top").show(ui, |ui| {
+            ui.add_space(4.0);
+            self.ui_top(ui, compact, narrow);
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("bottom").show(ui, |ui| self.ui_bottom(ui));
+
+        let settings_scroll = |app: &mut App, ui: &mut egui::Ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| app.ui_settings(ui));
+        };
+
+        if compact {
+            match self.compact_tab {
+                CompactTab::Settings => {
+                    egui::CentralPanel::default().show(ui, |ui| settings_scroll(self, ui));
+                }
+                CompactTab::Results => {
+                    if let Some(key) = self.selected {
+                        egui::Panel::bottom("details_bottom")
+                            .resizable(true)
+                            .default_size(full.height() * 0.42)
+                            .min_size(120.0)
+                            .max_size(full.height() * 0.75)
+                            .show(ui, |ui| self.ui_details(ui, key));
+                    }
+                    egui::CentralPanel::default().show(ui, |ui| self.ui_results(ui));
+                }
+            }
+            return;
+        }
+
+        let mut settings_w = 0.0;
+        if self.view.settings_open {
+            let r = egui::Panel::left("settings")
+                .resizable(true)
+                .default_size(340.0)
+                .min_size(270.0)
+                .max_size((full.width() * 0.45).max(280.0))
+                .show(ui, |ui| settings_scroll(self, ui));
+            settings_w = r.response.rect.width();
+        }
+        if let Some(key) = self.selected {
+            let details_w = 380.0;
+            if full.width() - settings_w - details_w >= DETAILS_SIDE_MIN_TABLE {
+                egui::Panel::right("details_side")
+                    .resizable(true)
+                    .default_size(details_w)
+                    .min_size(260.0)
+                    .max_size((full.width() * 0.5).max(300.0))
+                    .show(ui, |ui| self.ui_details(ui, key));
+            } else {
+                egui::Panel::bottom("details_bottom")
+                    .resizable(true)
+                    .default_size(full.height() * 0.38)
+                    .min_size(120.0)
+                    .max_size(full.height() * 0.7)
+                    .show(ui, |ui| self.ui_details(ui, key));
+            }
+        }
+        egui::CentralPanel::default().show(ui, |ui| self.ui_results(ui));
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
+        eframe::set_value(storage, VIEW_KEY, &self.view);
+        // Вызывается при закрытии программы и периодически.
+        if self.dirty {
+            self.autosave();
+        }
     }
 }

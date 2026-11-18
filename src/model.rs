@@ -80,7 +80,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ProxyKind {
     Unknown,
     /// Порт открыт, но ни на HTTP, ни на SOCKS не отвечает.
@@ -112,7 +112,7 @@ impl ProxyKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SslInspection {
     /// Проверка не выполнялась / невозможна.
     Unknown,
@@ -135,7 +135,7 @@ impl SslInspection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RowState {
     Found,
     Probing,
@@ -154,7 +154,7 @@ impl RowState {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CertInfo {
     pub subject: String,
     pub issuer: String,
@@ -165,7 +165,7 @@ pub struct CertInfo {
     pub self_signed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyVerdict {
     Allowed,
     Blocked,
@@ -184,7 +184,7 @@ impl PolicyVerdict {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyResult {
     pub url: String,
     /// Ожидается ли, что доступ разрешён.
@@ -195,7 +195,7 @@ pub struct PolicyResult {
 }
 
 /// Результат диагностики одного узла.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeResult {
     pub kind: Option<ProxyKind>,
     pub rtt_ms: Option<u32>,
@@ -215,7 +215,7 @@ pub struct ProbeResult {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRow {
     pub ip: Ipv4Addr,
     pub port: u16,
@@ -305,6 +305,17 @@ pub enum AppEvent {
     ProbeDone(Ipv4Addr, u16, Box<ProbeResult>),
     /// Эталонный сертификат тестового узла (прямое подключение).
     Reference(Result<CertInfo, String>),
+    /// Контрольная точка для продолжения прерванного сканирования.
+    Checkpoint(Checkpoint),
     /// Этап обнаружения завершён.
     DiscoveryFinished(Result<String, String>),
+}
+
+/// Место, с которого можно продолжить обнаружение.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpoint {
+    /// TCP-connect: столько первых адресов проверены по всем портам.
+    TcpHostsDone(u64),
+    /// masscan: индекс в псевдослучайной последовательности (`--resume-index`).
+    MasscanIndex(u64),
 }

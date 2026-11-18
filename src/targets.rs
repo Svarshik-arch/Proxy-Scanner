@@ -45,6 +45,11 @@ impl TargetSet {
         self.ranges.first().map(|r| r.first())
     }
 
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        let v = u32::from(ip);
+        self.ranges.iter().any(|r| (r.start..=r.end).contains(&v))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = Ipv4Addr> + '_ {
         self.ranges
             .iter()
@@ -214,6 +219,14 @@ mod tests {
         assert_eq!(ports_to_masscan(&p), "80,3128,8000-8002,8080");
         assert!(parse_ports("0").is_err());
         assert!(parse_ports("abc").is_err());
+    }
+
+    #[test]
+    fn contains() {
+        let t = parse_targets("10.0.0.0/24, 192.168.1.5").unwrap();
+        assert!(t.contains(Ipv4Addr::new(10, 0, 0, 200)));
+        assert!(t.contains(Ipv4Addr::new(192, 168, 1, 5)));
+        assert!(!t.contains(Ipv4Addr::new(10, 0, 1, 0)));
     }
 
     #[test]
