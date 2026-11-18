@@ -43,6 +43,19 @@ jobs:
           }
           "{0}: {1:N1} MB, CRT linked statically" -f $exe, ((Get-Item $exe).Length / 1MB)
 
+      # Скрипт запуска в режиме проверки под Windows PowerShell 5.1
+      # (программа не запускается, проверяется разбор аргументов и проверки окружения).
+      - name: Launcher script (check mode)
+        shell: powershell
+        run: |
+          $dir = "target/$env:TARGET/release"
+          Copy-Item release/proxy-scanner.ps1, release/proxy-scanner.cmd $dir
+          $out = & "$dir/proxy-scanner.cmd" -CheckOnly -NoInstall --renderer glow 2>&1 | Out-String
+          $out
+          if ($LASTEXITCODE -ne 0) { throw "launcher exited with $LASTEXITCODE" }
+          if ($out -notmatch '\[--renderer\] \[glow\]') { throw 'arguments were not passed through' }
+          if ($out -notmatch 'CheckOnly') { throw 'check mode did not finish' }
+
       - uses: actions/upload-artifact@v4
         with:
           name: proxy-scanner-windows-x64
