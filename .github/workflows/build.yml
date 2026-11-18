@@ -80,12 +80,12 @@ jobs:
         shell: pwsh
         working-directory: masscan
         run: |
-          $f = "src/string_s.h"
+          $f = Join-Path $PWD "src/string_s.h"
           $old = '(_MSC_VER == 1900)'
-          $text = Get-Content -Raw $f
+          $text = [IO.File]::ReadAllText($f)
           if (-not $text.Contains($old)) { Write-Error "pattern not found in $f"; exit 1 }
-          Set-Content -NoNewline $f $text.Replace($old, '(_MSC_VER >= 1900)')
-          git diff --stat
+          [IO.File]::WriteAllText($f, $text.Replace($old, '(_MSC_VER >= 1900)'))
+          git diff
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
