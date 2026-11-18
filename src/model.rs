@@ -53,6 +53,12 @@ pub struct Settings {
     pub inspect_quality: bool,
     /// Узлы с заведомо плохими сертификатами (по одному в строке, host[:port]).
     pub badcert_hosts: String,
+    // Проверка обхода прокси
+    pub egress_target: String,
+    pub egress_ports: String,
+    pub egress_dns: String,
+    pub egress_domain: String,
+    pub egress_timeout_ms: u64,
     pub proxy_user: String,
     #[serde(skip)]
     pub proxy_pass: String,
@@ -86,6 +92,11 @@ impl Default for Settings {
             block_marker: String::new(),
             inspect_quality: true,
             badcert_hosts: "expired.badssl.com\nself-signed.badssl.com\nuntrusted-root.badssl.com\nwrong.host.badssl.com".into(),
+            egress_target: "portquiz.net".into(),
+            egress_ports: "21,22,23,25,53,80,110,143,443,445,465,587,993,995,1080,1194,1723,3128,3389,5222,8080,8443,9001".into(),
+            egress_dns: "8.8.8.8, 1.1.1.1, 77.88.8.8".into(),
+            egress_domain: "example.com".into(),
+            egress_timeout_ms: 3000,
             proxy_user: String::new(),
             proxy_pass: String::new(),
         }
@@ -392,6 +403,12 @@ pub enum AppEvent {
     GroupDone(usize),
     /// Этап обнаружения завершён.
     DiscoveryFinished(Result<String, String>),
+    /// Результат одной проверки обхода прокси.
+    Egress(Box<crate::egress::EgressItem>),
+    /// Проверка обхода прокси завершена.
+    EgressDone,
+    /// Слушатель запущен: занятые порты и ошибки.
+    ListenerStarted(Vec<u16>, Vec<String>),
 }
 
 /// Место, с которого можно продолжить обнаружение.

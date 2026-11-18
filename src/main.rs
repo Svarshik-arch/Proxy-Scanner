@@ -8,6 +8,7 @@
 
 mod app;
 mod columns;
+mod egress;
 mod export;
 mod filters;
 mod graph;

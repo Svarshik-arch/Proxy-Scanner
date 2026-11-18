@@ -257,6 +257,9 @@ pub struct Session {
     /// Уже проверенные адреса × порты всех сканирований этой сессии.
     #[serde(default)]
     pub coverage: Vec<Coverage>,
+    /// Результаты последней проверки обхода прокси.
+    #[serde(default)]
+    pub egress: Vec<crate::egress::EgressItem>,
 }
 
 impl Session {
@@ -270,6 +273,7 @@ impl Session {
             scan,
             rows,
             coverage: Vec::new(),
+            egress: Vec::new(),
         }
     }
 

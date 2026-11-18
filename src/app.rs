@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::columns::{self, Col};
+use crate::egress::{self, EgressItem};
 use crate::export;
 use crate::filters::{self, Choice, Filters, Preset};
 use crate::graph::{GraphSettings, GraphView};
@@ -51,6 +52,14 @@ enum ThemeChoice {
     System,
     Dark,
     Light,
+}
+
+/// Раздел центральной области.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum Section {
+    #[default]
+    Proxies,
+    Egress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -95,6 +104,7 @@ struct ViewPrefs {
     filters_open: bool,
     results_view: ResultsView,
     graph: GraphSettings,
+    section: Section,
 }
 
 impl Default for ViewPrefs {
@@ -108,6 +118,7 @@ impl Default for ViewPrefs {
             filters_open: false,
             results_view: ResultsView::Table,
             graph: GraphSettings::default(),
+            section: Section::Proxies,
         }
     }
 }
@@ -185,6 +196,11 @@ pub struct App {
     stage: Option<(usize, usize)>,
     /// Кэш оценки «Дополнить»: ключ параметров → (новых проверок, всего запрошено).
     append_preview: Option<(String, AppendEstimate)>,
+    /// Проверка обхода прокси: результаты и отмена идущей проверки.
+    egress_items: Vec<EgressItem>,
+    egress_cancel: Option<CancellationToken>,
+    /// Слушатель: отмена, занятые порты, ошибки.
+    listener: Option<(CancellationToken, Vec<u16>, Vec<String>)>,
 }
 
 /// Описание сессии, загруженной при запуске или из файла.
@@ -244,6 +260,9 @@ impl App {
             coverage: Vec::new(),
             stage: None,
             append_preview: None,
+            egress_items: Vec::new(),
+            egress_cancel: None,
+            listener: None,
         };
         app.archive = session::list_archive(&app.session_path);
         // Незавершённая сессия рядом с программой (в том числе перенесённая с другого ПК).
@@ -287,6 +306,7 @@ impl App {
             st.ensure_groups();
         }
         self.coverage = s.coverage;
+        self.egress_items = s.egress;
         // Сессии старых версий: завершённое сканирование целиком считается проверенным.
         if self.coverage.is_empty()
             && let Some(st) = &self.scan_state
@@ -330,6 +350,7 @@ impl App {
         }
         let mut s = Session::new(&self.settings, self.scan_state.clone(), rows);
         s.coverage = self.coverage.clone();
+        s.egress = self.egress_items.clone();
         s
     }
 
@@ -399,7 +420,10 @@ impl App {
 
     /// Копирует текущие результаты в архив, если есть что сохранять.
     fn archive_current(&mut self) {
-        if self.rows.is_empty() && self.scan_state.as_ref().is_none_or(|s| !s.has_progress()) {
+        if self.rows.is_empty()
+            && self.egress_items.is_empty()
+            && self.scan_state.as_ref().is_none_or(|s| !s.has_progress())
+        {
             return;
         }
         match session::archive(&self.session_snapshot(), &self.session_path) {
@@ -431,6 +455,7 @@ impl App {
         self.selected = None;
         self.scan_state = None;
         self.coverage.clear();
+        self.egress_items.clear();
         self.append_preview = None;
         self.restored = None;
         self.progress = 0.0;
@@ -1025,6 +1050,26 @@ impl App {
                             }
                         }
                         self.dirty = true;
+                    }
+                }
+                AppEvent::Egress(item) => {
+                    self.egress_items.push(*item);
+                    self.dirty = true;
+                }
+                AppEvent::EgressDone => {
+                    let cancelled = self.egress_cancel.take().is_some_and(|c| c.is_cancelled());
+                    let leaks = self.egress_items.iter().filter(|i| i.status.is_leak()).count();
+                    self.push_log(format!(
+                        "обход прокси: проверок {}, прямых выходов {leaks}{}",
+                        self.egress_items.len(),
+                        if cancelled { " (остановлено)" } else { "" }
+                    ));
+                    self.autosave();
+                }
+                AppEvent::ListenerStarted(ok, errors) => {
+                    if let Some(l) = &mut self.listener {
+                        l.1 = ok;
+                        l.2 = errors;
                     }
                 }
                 AppEvent::GroupStarted(k, n) => {
@@ -1948,6 +1993,244 @@ impl App {
         }
     }
 
+    fn ui_central(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.view.section, Section::Proxies, RichText::new("Прокси").strong());
+            let leaks = self.egress_items.iter().filter(|i| i.status.is_leak()).count();
+            let label = if leaks > 0 {
+                RichText::new(format!("Обход прокси ({leaks})")).strong().color(RED)
+            } else {
+                RichText::new("Обход прокси").strong()
+            };
+            ui.selectable_value(&mut self.view.section, Section::Egress, label)
+                .on_hover_text("Можно ли с этой рабочей станции выйти наружу напрямую, мимо прокси");
+        });
+        ui.separator();
+        match self.view.section {
+            Section::Proxies => self.ui_results(ui),
+            Section::Egress => self.ui_egress(ui),
+        }
+    }
+
+    fn start_egress(&mut self, ctx: &egui::Context) {
+        self.error = None;
+        let s = &self.settings;
+        let cfg = (|| -> Result<egress::EgressConfig, String> {
+            Ok(egress::EgressConfig {
+                target: s.egress_target.trim().to_string(),
+                ports: if s.egress_ports.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    targets::parse_ports(&s.egress_ports).map_err(|e| format!("Порты: {e}"))?
+                },
+                dns_servers: egress::parse_dns_servers(&s.egress_dns)?,
+                test_domain: s.egress_domain.trim().to_string(),
+                timeout: Duration::from_millis(s.egress_timeout_ms.clamp(200, 30_000)),
+                concurrency: 64,
+            })
+        })();
+        let cfg = match cfg {
+            Ok(c) => c,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        self.egress_items.clear();
+        let cancel = CancellationToken::new();
+        self.egress_cancel = Some(cancel.clone());
+        self.push_log(format!(
+            "— проверка обхода прокси: узел {}, портов {}, DNS-серверов {} —",
+            cfg.target,
+            cfg.ports.len(),
+            cfg.dns_servers.len()
+        ));
+        let tx = self.tx(ctx);
+        self.rt.spawn(async move {
+            let tx2 = tx.clone();
+            egress::run(cfg, cancel, move |item| tx2.send(AppEvent::Egress(Box::new(item)))).await;
+            tx.send(AppEvent::EgressDone);
+        });
+    }
+
+    fn toggle_listener(&mut self, ctx: &egui::Context) {
+        if let Some((cancel, _, _)) = self.listener.take() {
+            cancel.cancel();
+            self.push_log("слушатель остановлен".to_string());
+            return;
+        }
+        let ports = match targets::parse_ports(&self.settings.egress_ports) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error = Some(format!("Порты слушателя: {e}"));
+                return;
+            }
+        };
+        let cancel = CancellationToken::new();
+        self.listener = Some((cancel.clone(), Vec::new(), Vec::new()));
+        let tx = self.tx(ctx);
+        self.rt.spawn(async move {
+            let (ok, errors) = egress::start_listener(&ports, cancel).await;
+            tx.log(format!("слушатель: занято портов {}, ошибок {}", ok.len(), errors.len()));
+            tx.send(AppEvent::ListenerStarted(ok, errors));
+        });
+    }
+
+    fn ui_egress(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let running = self.egress_cancel.is_some();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(
+                "Проверяет, может ли эта рабочая станция выйти наружу напрямую, мимо прокси: \
+                 по TCP-портам до тестового узла, через внешние DNS-серверы, по HTTP и HTTPS. \
+                 Любой «ОТКРЫТ» или «отказ» означает, что трафик уходит наружу без прокси.",
+            );
+            ui.add_space(6.0);
+            let s = &mut self.settings;
+            egui::Grid::new("egress_grid").num_columns(2).show(ui, |ui| {
+                ui.label("Тестовый узел").on_hover_text(
+                    "portquiz.net принимает подключения на любом порту.\n\
+                     В закрытом контуре укажите адрес машины со слушателем (см. ниже).",
+                );
+                ui.add(egui::TextEdit::singleline(&mut s.egress_target).desired_width(220.0));
+                ui.end_row();
+                ui.label("TCP-порты");
+                ui.add(egui::TextEdit::singleline(&mut s.egress_ports).desired_width(f32::INFINITY));
+                ui.end_row();
+                ui.label("Внешние DNS-серверы");
+                ui.add(egui::TextEdit::singleline(&mut s.egress_dns).desired_width(220.0));
+                ui.end_row();
+                ui.label("Сайт для HTTP/HTTPS/DNS");
+                ui.add(egui::TextEdit::singleline(&mut s.egress_domain).desired_width(220.0));
+                ui.end_row();
+                ui.label("Таймаут, мс");
+                ui.add(egui::DragValue::new(&mut s.egress_timeout_ms).range(200..=30_000).speed(50));
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if running {
+                    if ui.button(RichText::new("■ Остановить").strong()).clicked()
+                        && let Some(c) = &self.egress_cancel
+                    {
+                        c.cancel();
+                    }
+                    ui.spinner();
+                } else if ui.button(RichText::new("▶ Проверить обход").strong()).clicked() {
+                    self.start_egress(&ctx);
+                }
+            });
+
+            // Итог.
+            if !self.egress_items.is_empty() {
+                ui.add_space(6.0);
+                let leaks: Vec<&EgressItem> = self.egress_items.iter().filter(|i| i.status.is_leak()).collect();
+                if leaks.is_empty() {
+                    ui.colored_label(GREEN, RichText::new("Прямой выход наружу не обнаружен").strong());
+                } else {
+                    let mut tcp: Vec<u16> = leaks
+                        .iter()
+                        .filter(|i| i.kind == egress::EgressKind::Tcp)
+                        .filter_map(|i| i.target.rsplit(':').next()?.parse().ok())
+                        .collect();
+                    tcp.sort_unstable();
+                    let tcp: Vec<String> = tcp.iter().map(u16::to_string).collect();
+                    let mut other: Vec<String> = Vec::new();
+                    for i in leaks.iter().filter(|i| i.kind != egress::EgressKind::Tcp) {
+                        let label = if i.kind == egress::EgressKind::Dns {
+                            format!("DNS через {}", i.target.trim_end_matches(":53"))
+                        } else {
+                            i.kind.label().to_string()
+                        };
+                        if !other.contains(&label) {
+                            other.push(label);
+                        }
+                    }
+                    ui.colored_label(
+                        RED,
+                        RichText::new(format!(
+                            "Обход прокси возможен: {}{}{}",
+                            if tcp.is_empty() { String::new() } else { format!("TCP-порты {}", tcp.join(", ")) },
+                            if !tcp.is_empty() && !other.is_empty() { "; " } else { "" },
+                            other.join(", ")
+                        ))
+                        .strong(),
+                    );
+                }
+                ui.add_space(4.0);
+                let mut items: Vec<&EgressItem> = self.egress_items.iter().collect();
+                items.sort_by_key(|i| {
+                    let port: u32 = i.target.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                    (!i.status.is_leak(), i.kind as u8, port, i.target.clone())
+                });
+                egui::Grid::new("egress_results").num_columns(5).striped(true).show(ui, |ui| {
+                    for h in ["Проверка", "Цель", "Результат", "мс", "Подробности"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for i in items {
+                        ui.label(i.kind.label());
+                        ui.label(RichText::new(&i.target).monospace());
+                        let color = match i.status {
+                            s if s.is_leak() => RED,
+                            egress::EgressStatus::Intercepted => AMBER,
+                            egress::EgressStatus::Error => AMBER,
+                            _ => GREEN,
+                        };
+                        let mut text = i.status.label().to_string();
+                        if i.confirmed {
+                            text.push_str(" ✔");
+                        }
+                        ui.colored_label(color, RichText::new(text).strong())
+                            .on_hover_text(if i.confirmed { "ответил слушатель Proxy Scanner" } else { "" });
+                        ui.label(i.rtt_ms.map(|v| v.to_string()).unwrap_or_default());
+                        ui.add(egui::Label::new(&i.detail).wrap());
+                        ui.end_row();
+                    }
+                });
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            egui::CollapsingHeader::new("Слушатель для закрытого контура")
+                .default_open(self.listener.is_some())
+                .show(ui, |ui| {
+                    ui.label(
+                        "Запустите Proxy Scanner на машине за пределами проверяемого сегмента \
+                         (другой сегмент, DMZ) и включите слушатель: он займёт порты из поля \
+                         «TCP-порты» и будет отвечать меткой. На проверяемой станции укажите адрес \
+                         этой машины в поле «Тестовый узел» — «✔» в результатах подтвердит, что \
+                         соединение действительно дошло до слушателя.",
+                    );
+                    if !cfg!(windows) {
+                        ui.weak("В Linux порты ниже 1024 занимаются только с правами root.");
+                    }
+                    ui.horizontal(|ui| {
+                        let text = if self.listener.is_some() { "■ Остановить слушатель" } else { "▶ Запустить слушатель" };
+                        if ui.button(text).clicked() {
+                            self.toggle_listener(&ctx);
+                        }
+                    });
+                    if let Some((_, ok, errors)) = &self.listener {
+                        ui.colored_label(
+                            if ok.is_empty() { AMBER } else { GREEN },
+                            format!(
+                                "Слушает портов: {} {}",
+                                ok.len(),
+                                if ok.is_empty() { String::new() } else { format!("({})", targets::ports_to_masscan(ok)) }
+                            ),
+                        );
+                        for e in errors.iter().take(10) {
+                            ui.colored_label(AMBER, format!("не удалось занять порт {e}"));
+                        }
+                        if errors.len() > 10 {
+                            ui.weak(format!("… и ещё {}", errors.len() - 10));
+                        }
+                    }
+                });
+        });
+    }
+
     /// Баннер о незавершённом сканировании / восстановленной сессии.
     fn ui_banner(&mut self, ui: &mut egui::Ui) {
         let resumable = self.can_resume();
@@ -2524,7 +2807,7 @@ impl eframe::App for App {
                             .max_size(full.height() * 0.75)
                             .show(ui, |ui| self.ui_details(ui, key));
                     }
-                    egui::CentralPanel::default().show(ui, |ui| self.ui_results(ui));
+                    egui::CentralPanel::default().show(ui, |ui| self.ui_central(ui));
                 }
             }
             return;
@@ -2558,7 +2841,7 @@ impl eframe::App for App {
                     .show(ui, |ui| self.ui_details(ui, key));
             }
         }
-        egui::CentralPanel::default().show(ui, |ui| self.ui_results(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.ui_central(ui));
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
