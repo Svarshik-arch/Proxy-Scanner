@@ -6,6 +6,7 @@
 | `masscan64.exe` | Windows 10/11 x64 | Внешний сканер для режима «masscan» |
 | `proxy-scanner` | Linux x86_64 | Proxy Scanner — сама программа |
 | `masscan` | Linux x86_64 | Внешний сканер для режима «masscan» |
+| `proxy-scanner.sh` | Linux | Скрипт запуска: лимиты, libpcap, root и доступ к экрану |
 
 Скачайте программу и (при необходимости) masscan для своей ОС в одну папку —
 Proxy Scanner найдёт masscan рядом с собой. Режим «TCP-connect» работает и без masscan.
@@ -22,25 +23,23 @@ Proxy Scanner найдёт masscan рядом с собой. Режим «TCP-co
 ## Linux
 
 - Нужна glibc 2.35 или новее (Ubuntu 22.04+, Debian 12+, RHEL/Alma/Rocky 10, Astra Linux 1.8+ и т. п.)
-  и графическая сессия X11 или Wayland.
-- Перед первым запуском сделайте файлы исполняемыми:
+  и графический сеанс X11 или Wayland.
+- Скачайте `proxy-scanner`, `masscan` и `proxy-scanner.sh` в одну папку и запустите скрипт:
 
   ```bash
-  chmod +x proxy-scanner masscan
+  chmod +x proxy-scanner masscan proxy-scanner.sh
   ```
-
-- Для режима «masscan» нужна библиотека libpcap (`libpcap0.8` в Debian/Ubuntu,
-  `libpcap` в RHEL-подобных) и права root:
 
   ```bash
-  sudo ./proxy-scanner
+  ./proxy-scanner.sh
   ```
 
-  Либо выдайте masscan право на «сырые» сокеты и запускайте программу как обычно:
-
-  ```bash
-  sudo setcap cap_net_raw,cap_net_admin=eip ./masscan
-  ```
+  Скрипт поднимает лимит открытых файлов, проверяет и при необходимости ставит libpcap,
+  разрешает root открыть окно на вашем экране, запускает программу через `sudo` и после
+  выхода отзывает доступ. Вариант без root для интерфейса: `./proxy-scanner.sh --caps`
+  (права получает только masscan).
+- Подробно, в том числе ручной запуск: [docs/LINUX.md](../docs/LINUX.md).
+  Параметры для максимальной скорости: [docs/TUNING.md](../docs/TUNING.md).
 
 ## Происхождение
 
