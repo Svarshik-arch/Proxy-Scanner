@@ -609,6 +609,7 @@ impl App {
             policy,
             block_marker: s.block_marker.trim().to_string(),
             proxy_auth: probe::basic_auth(s.proxy_user.trim(), &s.proxy_pass),
+            retries: s.probe_retries.min(10),
         })
     }
 
@@ -776,6 +777,7 @@ impl App {
         };
         let tcp_concurrency = s.tcp_concurrency.clamp(1, 4000);
         let tcp_timeout = Duration::from_millis(s.tcp_timeout_ms.clamp(50, 30_000));
+        let tcp_retries = s.tcp_retries.min(5);
 
         let job = self.new_job(s.auto_probe)?;
         let cancel = job.cancel.clone();
@@ -889,6 +891,7 @@ impl App {
                             concurrency: tcp_concurrency,
                             timeout: tcp_timeout,
                             skip_hosts: if first { skip_hosts } else { 0 },
+                            retries: tcp_retries,
                         };
                         scan::tcp_connect_scan(cfg, tx.clone(), cancel.clone()).await
                     }
@@ -1473,6 +1476,12 @@ impl App {
                     ui.label("Таймаут подключения, мс");
                     ui.add(egui::DragValue::new(&mut s.tcp_timeout_ms).range(50..=30_000));
                     ui.end_row();
+                    ui.label("Повторов при таймауте").on_hover_text(
+                        "Сколько раз повторять подключение, если ответа нет.\n\
+                         0 — быстрее; 1 — надёжнее в сетях с потерями (пустые адреса проверяются дольше).",
+                    );
+                    ui.add(egui::DragValue::new(&mut s.tcp_retries).range(0..=5));
+                    ui.end_row();
                 });
             }
             ScanMode::Masscan => {
@@ -1652,6 +1661,12 @@ impl App {
                     ui.end_row();
                     ui.label("Таймаут, мс");
                     ui.add(egui::DragValue::new(&mut s.probe_timeout_ms).range(200..=60_000).speed(50));
+                    ui.end_row();
+                    ui.label("Повторов при сбое").on_hover_text(
+                        "Загруженный прокси часто отвечает не с первого раза: при таймауте или обрыве\n\
+                         подключение, CONNECT, SOCKS и проверки политик повторяются с паузой.",
+                    );
+                    ui.add(egui::DragValue::new(&mut s.probe_retries).range(0..=10));
                     ui.end_row();
                 });
             });

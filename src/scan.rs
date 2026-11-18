@@ -50,6 +50,8 @@ pub struct TcpScanConfig {
     pub timeout: Duration,
     /// Пропустить столько первых адресов (продолжение прерванного сканирования).
     pub skip_hosts: u64,
+    /// Повторов подключения при таймауте (отказ в подключении не повторяется).
+    pub retries: u32,
 }
 
 /// Число первых адресов, полностью проверенных по всем портам.
@@ -125,10 +127,23 @@ pub async fn tcp_connect_scan(
             };
             let (tx, done, found, per_host) = (tx.clone(), done.clone(), found.clone(), per_host.clone());
             let timeout = cfg.timeout;
+            let retries = cfg.retries;
             set.spawn(async move {
                 let addr = SocketAddr::from((ip, port));
-                if let Ok(Ok(_stream)) = tokio::time::timeout(timeout, TcpStream::connect(addr)).await
-                {
+                let mut open = false;
+                for _ in 0..=retries {
+                    match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+                        Ok(Ok(_stream)) => {
+                            open = true;
+                            break;
+                        }
+                        // Явный отказ — порт закрыт, повторять незачем.
+                        Ok(Err(_)) => break,
+                        // Таймаут — пакет мог потеряться, пробуем ещё раз.
+                        Err(_) => {}
+                    }
+                }
+                if open {
                     found.fetch_add(1, Ordering::Relaxed);
                     tx.send(AppEvent::Open {
                         ip,
@@ -494,6 +509,7 @@ mod tests {
             concurrency: 4,
             timeout: Duration::from_secs(2),
             skip_hosts: 0,
+            retries: 0,
         };
         let res = tcp_connect_scan(cfg, tx, CancellationToken::new()).await;
         assert!(res.is_ok());
@@ -520,6 +536,7 @@ mod tests {
             concurrency: 4,
             timeout: Duration::from_millis(500),
             skip_hosts: 2,
+            retries: 1,
         };
         tcp_connect_scan(cfg, tx, CancellationToken::new()).await.unwrap();
         let events: Vec<AppEvent> = srx.try_iter().collect();

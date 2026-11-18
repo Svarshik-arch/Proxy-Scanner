@@ -35,11 +35,15 @@ pub struct Settings {
     // tcp-connect
     pub tcp_concurrency: usize,
     pub tcp_timeout_ms: u64,
+    /// TCP-connect: повторов при таймауте (0 — без повторов).
+    pub tcp_retries: u32,
 
     // диагностика
     pub auto_probe: bool,
     pub probe_concurrency: usize,
     pub probe_timeout_ms: u64,
+    /// Диагностика: повторов при сбоях и таймаутах.
+    pub probe_retries: u32,
     pub test_http_url: String,
     pub test_tls_host: String,
     pub reference_fp: String,
@@ -66,9 +70,11 @@ impl Default for Settings {
             extra_args: String::new(),
             tcp_concurrency: 500,
             tcp_timeout_ms: 800,
+            tcp_retries: 0,
             auto_probe: true,
             probe_concurrency: 32,
             probe_timeout_ms: 4000,
+            probe_retries: 2,
             test_http_url: "http://example.com/".into(),
             test_tls_host: "example.com:443".into(),
             reference_fp: String::new(),

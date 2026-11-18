@@ -154,6 +154,20 @@ pub struct ProbeConfig {
     pub block_marker: String,
     /// Готовое значение заголовка `Proxy-Authorization`.
     pub proxy_auth: Option<String>,
+    /// Сколько раз повторять сетевую операцию при сбое (загруженный прокси
+    /// часто отвечает не с первого раза).
+    pub retries: u32,
+}
+
+/// Ошибка, при которой повтор имеет смысл (таймаут, обрыв), — в отличие от
+/// определённого ответа «это не HTTP / не SOCKS».
+fn transient(e: &str) -> bool {
+    !(e.contains("не является HTTP") || e.contains("не SOCKS") || e.contains("некорректн"))
+}
+
+/// Пауза перед повтором: 300 мс, 600 мс, 900 мс…
+async fn backoff(attempt: u32) {
+    tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
 }
 
 pub fn basic_auth(user: &str, pass: &str) -> Option<String> {
@@ -624,6 +638,19 @@ fn classify_policy(resp: &HttpResp, marker: &str) -> (PolicyVerdict, String) {
 }
 
 async fn check_policy_rule(addr: SocketAddr, rule: &PolicyRule, cfg: &ProbeConfig) -> PolicyResult {
+    let mut attempt = 0;
+    loop {
+        let r = check_policy_rule_once(addr, rule, cfg).await;
+        if r.verdict == PolicyVerdict::Error && transient(&r.detail) && attempt < cfg.retries {
+            attempt += 1;
+            backoff(attempt).await;
+            continue;
+        }
+        return r;
+    }
+}
+
+async fn check_policy_rule_once(addr: SocketAddr, rule: &PolicyRule, cfg: &ProbeConfig) -> PolicyResult {
     let auth = cfg.proxy_auth.as_deref();
     let outcome: Result<(PolicyVerdict, String), String> = async {
         let mut s = with_timeout(cfg.timeout, TcpStream::connect(addr)).await?;
@@ -687,21 +714,40 @@ pub async fn probe_endpoint(ip: Ipv4Addr, port: u16, cfg: &ProbeConfig) -> Probe
     let mut res = ProbeResult::default();
     let auth = cfg.proxy_auth.as_deref();
 
-    // 1. Доступность и время отклика.
-    let started = Instant::now();
-    let mut stream = match with_timeout(cfg.timeout, TcpStream::connect(addr)).await {
-        Ok(s) => s,
-        Err(e) => {
-            res.error = Some(format!("подключение: {e}"));
-            return res;
+    // 1–2. Подключение и HTTP-запрос с абсолютным URI (так обращаются к прокси).
+    //      При сбое повторяем: загруженный прокси отвечает не с первого раза.
+    let req = get_request(&cfg.test_url.absolute(), &cfg.test_url.host_header(), auth);
+    let mut attempt = 0;
+    let http = loop {
+        let started = Instant::now();
+        let mut stream = match with_timeout(cfg.timeout, TcpStream::connect(addr)).await {
+            Ok(s) => s,
+            Err(e) if attempt < cfg.retries => {
+                attempt += 1;
+                backoff(attempt).await;
+                let _ = e;
+                continue;
+            }
+            Err(e) => {
+                res.error = Some(format!("подключение: {e} (попыток: {})", attempt + 1));
+                return res;
+            }
+        };
+        if res.rtt_ms.is_none() {
+            res.rtt_ms = Some(started.elapsed().as_millis().min(u32::MAX as u128) as u32);
+        }
+        let r = http_exchange(&mut stream, &req, cfg.timeout, false).await;
+        match r {
+            Err(e) if transient(&e) && attempt < cfg.retries => {
+                attempt += 1;
+                backoff(attempt).await;
+            }
+            other => break other,
         }
     };
-    res.rtt_ms = Some(started.elapsed().as_millis().min(u32::MAX as u128) as u32);
-
-    // 2. HTTP-запрос с абсолютным URI (так обращаются к прокси).
-    let req = get_request(&cfg.test_url.absolute(), &cfg.test_url.host_header(), auth);
-    let http = http_exchange(&mut stream, &req, cfg.timeout, false).await;
-    drop(stream);
+    if attempt > 0 && http.is_ok() {
+        res.notes.push(format!("ответ получен с {}-й попытки", attempt + 1));
+    }
 
     match http {
         Ok(resp) => {
@@ -725,14 +771,25 @@ pub async fn probe_endpoint(ip: Ipv4Addr, port: u16, cfg: &ProbeConfig) -> Probe
                 ));
             }
 
-            // 3. CONNECT и проверка SSL-инспекции.
-            match probe_connect(addr, cfg, &mut res).await {
-                Ok(status) => {
-                    if (200..300).contains(&status) || status == 407 {
-                        is_proxy = true;
+            // 3. CONNECT и проверка SSL-инспекции (с повторами при сбоях).
+            let mut attempt = 0;
+            loop {
+                match probe_connect(addr, cfg, &mut res).await {
+                    Ok(status) => {
+                        if (200..300).contains(&status) || status == 407 {
+                            is_proxy = true;
+                        }
+                        break;
+                    }
+                    Err(e) if transient(&e) && attempt < cfg.retries => {
+                        attempt += 1;
+                        backoff(attempt).await;
+                    }
+                    Err(e) => {
+                        res.notes.push(format!("CONNECT: {e}"));
+                        break;
                     }
                 }
-                Err(e) => res.notes.push(format!("CONNECT: {e}")),
             }
 
             res.kind = Some(if is_proxy {
@@ -816,10 +873,25 @@ async fn resolve_v4(host: &str, port: u16, timeout: Duration) -> Option<Ipv4Addr
 }
 
 async fn probe_socks(addr: SocketAddr, cfg: &ProbeConfig, res: &mut ProbeResult) {
-    // SOCKS5
-    if let Ok(mut s) = with_timeout(cfg.timeout, TcpStream::connect(addr)).await
-        && let Ok(method) = socks5_greet(&mut s, cfg.timeout).await
-    {
+    // SOCKS5 (с повторами при обрывах и таймаутах).
+    let mut greeted = None;
+    for attempt in 0..=cfg.retries {
+        let r = async {
+            let mut s = with_timeout(cfg.timeout, TcpStream::connect(addr)).await?;
+            let m = socks5_greet(&mut s, cfg.timeout).await?;
+            Ok::<_, String>((s, m))
+        }
+        .await;
+        match r {
+            Ok(v) => {
+                greeted = Some(v);
+                break;
+            }
+            Err(e) if transient(&e) && attempt < cfg.retries => backoff(attempt + 1).await,
+            Err(_) => break,
+        }
+    }
+    if let Some((mut s, method)) = greeted {
         res.kind = Some(ProxyKind::Socks5);
         match method {
             Socks5Auth::None => {
@@ -884,6 +956,7 @@ mod tests {
             policy: parse_policy_rules("+ http://ok.test/\n- http://bad.test/x").unwrap(),
             block_marker: String::new(),
             proxy_auth: None,
+            retries: 1,
         }
     }
 
@@ -977,6 +1050,46 @@ mod tests {
         assert_eq!(r.server, "squid/6.1");
         assert_eq!(r.policy.len(), 2);
         assert!(r.policy.iter().all(|p| p.compliant), "{:?}", r.policy);
+    }
+
+    /// Перегруженный прокси: первое подключение закрывает молча, дальше отвечает.
+    async fn flaky_proxy() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut n = 0;
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { break };
+                n += 1;
+                if n == 1 {
+                    drop(s);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let Ok(_) = read_request(&mut s).await else { return };
+                    let _ = s
+                        .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"x\"\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn retries_find_overloaded_proxy() {
+        let port = flaky_proxy().await;
+        let mut c = cfg();
+        c.retries = 2;
+        let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &c).await;
+        assert_eq!(r.kind, Some(ProxyKind::HttpProxy), "{:?}", r.notes);
+        assert!(r.notes.iter().any(|n| n.contains("2-й попытки")), "{:?}", r.notes);
+
+        let port = flaky_proxy().await;
+        let mut c = cfg();
+        c.retries = 0;
+        let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &c).await;
+        assert_ne!(r.kind, Some(ProxyKind::HttpProxy), "без повторов первый сбой скрывает прокси");
     }
 
     #[tokio::test]
