@@ -176,6 +176,118 @@ fn dir_writable(dir: &Path) -> bool {
     }
 }
 
+/// Сколько архивных копий сессий хранить.
+pub const ARCHIVE_KEEP: usize = 30;
+const ARCHIVE_DIR: &str = "proxy-scanner-sessions";
+
+/// Папка архива рядом с файлом сессии.
+pub fn archive_dir(session_path: &Path) -> PathBuf {
+    session_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(ARCHIVE_DIR)
+}
+
+/// Время для имени файла: `20261118-143005`.
+fn compact_time(unix: u64) -> String {
+    format_time(unix)
+        .trim_end_matches(" UTC")
+        .replace(['-', ':'], "")
+        .replace(' ', "-")
+        + &format!("{:02}", unix % 60)
+}
+
+/// Копия сессии в архив. Возвращает путь к созданному файлу.
+pub fn archive(session: &Session, session_path: &Path) -> Result<PathBuf, String> {
+    let dir = archive_dir(session_path);
+    let base = format!("session-{}-{}", compact_time(session.saved_at), session.rows.len());
+    let mut path = dir.join(format!("{base}.json"));
+    let mut n = 1;
+    while path.exists() {
+        n += 1;
+        path = dir.join(format!("{base}-{n}.json"));
+    }
+    save(&path, session)?;
+    prune_archive(&dir, ARCHIVE_KEEP);
+    Ok(path)
+}
+
+fn archive_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().is_some_and(|e| e == "json")
+                        && p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with("session-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Имена начинаются со времени, поэтому сортировка по имени — по времени.
+    files.sort();
+    files
+}
+
+fn prune_archive(dir: &Path, keep: usize) {
+    let files = archive_files(dir);
+    if files.len() > keep {
+        for f in &files[..files.len() - keep] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
+/// Сведения об архивной сессии для меню.
+#[derive(Debug, Clone)]
+pub struct ArchiveEntry {
+    pub path: PathBuf,
+    pub saved_at: u64,
+    pub computer: String,
+    pub rows: usize,
+    pub fraction: Option<f32>,
+    pub targets: String,
+}
+
+impl ArchiveEntry {
+    pub fn label(&self) -> String {
+        let progress = self
+            .fraction
+            .map(|f| format!(" · обнаружение {:.0}%", f * 100.0))
+            .unwrap_or_default();
+        format!(
+            "{} · {} · узлов: {}{} · {}",
+            format_time(self.saved_at),
+            self.computer,
+            self.rows,
+            progress,
+            self.targets
+        )
+    }
+}
+
+/// Архив, новые сессии первыми.
+pub fn list_archive(session_path: &Path) -> Vec<ArchiveEntry> {
+    let mut out: Vec<ArchiveEntry> = archive_files(&archive_dir(session_path))
+        .into_iter()
+        .filter_map(|path| {
+            let s = load(&path).ok()?;
+            Some(ArchiveEntry {
+                saved_at: s.saved_at,
+                computer: s.computer,
+                rows: s.rows.len(),
+                fraction: s.scan.as_ref().map(ScanState::fraction),
+                targets: s.settings.targets.trim().chars().take(40).collect(),
+                path,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.saved_at.cmp(&a.saved_at).then(b.path.cmp(&a.path)));
+    out
+}
+
 /// Запись через временный файл: при сбое старая сессия не портится.
 pub fn save(path: &Path, session: &Session) -> Result<(), String> {
     if let Some(dir) = path.parent() {
@@ -277,8 +389,32 @@ mod tests {
     }
 
     #[test]
+    fn archive_keeps_copies_and_prunes() {
+        let dir = std::env::temp_dir().join(format!("ps-archive-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let session_path = dir.join(FILE_NAME);
+        let s = settings();
+        for i in 0..(ARCHIVE_KEEP as u64 + 5) {
+            let mut sess = Session::new(&s, None, vec![]);
+            sess.saved_at = 1_794_997_800 + i;
+            archive(&sess, &session_path).unwrap();
+        }
+        let list = list_archive(&session_path);
+        assert_eq!(list.len(), ARCHIVE_KEEP, "старые копии удаляются");
+        assert_eq!(list[0].saved_at, 1_794_997_800 + ARCHIVE_KEEP as u64 + 4, "новые первыми");
+        assert!(list[0].label().contains("10.0.0.0/24"));
+        // Две копии в одну секунду не затирают друг друга.
+        let sess = Session::new(&s, None, vec![]);
+        let a = archive(&sess, &session_path).unwrap();
+        let b = archive(&sess, &session_path).unwrap();
+        assert_ne!(a, b);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn time_format() {
         assert_eq!(format_time(0), "1970-01-01 00:00 UTC");
         assert_eq!(format_time(1_794_997_800), "2026-11-18 10:30 UTC");
+        assert_eq!(compact_time(1_794_997_805), "20261118-103005");
     }
 }

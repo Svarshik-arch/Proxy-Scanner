@@ -24,7 +24,7 @@ use crate::model::{
 use crate::netdetect::{self, IfaceEntry};
 use crate::probe::{self, ProbeConfig, Url};
 use crate::scan::{self, MasscanConfig, TcpScanConfig, Tx};
-use crate::session::{self, ScanState, Session};
+use crate::session::{self, ArchiveEntry, ScanState, Session};
 use crate::targets::{self, TCP_SCAN_MAX_HOSTS};
 use crate::util;
 
@@ -160,6 +160,10 @@ pub struct App {
     last_autosave: Instant,
     /// Изменились ли данные с последнего сохранения сессии.
     dirty: bool,
+    /// Архив предыдущих сессий (новые первыми).
+    archive: Vec<ArchiveEntry>,
+    /// Ждём подтверждения перед новым сканированием.
+    confirm_new_scan: bool,
 }
 
 /// Описание сессии, загруженной при запуске или из файла.
@@ -214,7 +218,10 @@ impl App {
             restored: None,
             last_autosave: Instant::now(),
             dirty: false,
+            archive: Vec::new(),
+            confirm_new_scan: false,
         };
+        app.archive = session::list_archive(&app.session_path);
         // Незавершённая сессия рядом с программой (в том числе перенесённая с другого ПК).
         if app.session_path.is_file() {
             match session::load(&app.session_path) {
@@ -328,13 +335,48 @@ impl App {
         else {
             return;
         };
-        match session::load(&path) {
+        self.open_session_path(&path);
+    }
+
+    /// Открывает сессию из файла; текущие результаты предварительно уходят в архив.
+    fn open_session_path(&mut self, path: &std::path::Path) {
+        if self.busy() {
+            self.error = Some("Сначала остановите текущее сканирование".into());
+            return;
+        }
+        match session::load(path) {
             Ok(s) => {
+                self.archive_current();
                 self.restore_session(s);
                 self.dirty = true;
+                self.autosave();
                 self.status = format!("Сессия открыта: {}", path.display());
             }
             Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Копирует текущие результаты в архив, если есть что сохранять.
+    fn archive_current(&mut self) {
+        if self.rows.is_empty() && self.scan_state.as_ref().is_none_or(|s| !s.has_progress()) {
+            return;
+        }
+        match session::archive(&self.session_snapshot(), &self.session_path) {
+            Ok(path) => self.push_log(format!("сессия: предыдущие результаты сохранены в архив {}", path.display())),
+            Err(e) => {
+                self.push_log(format!("сессия: не удалось сохранить архивную копию — {e}"));
+                self.error = Some(format!("Не удалось сохранить архивную копию сессии: {e}"));
+            }
+        }
+        self.archive = session::list_archive(&self.session_path);
+    }
+
+    fn open_archive_folder(&mut self) {
+        let dir = session::archive_dir(&self.session_path);
+        let _ = std::fs::create_dir_all(&dir);
+        let program = if cfg!(windows) { "explorer" } else { "xdg-open" };
+        if let Err(e) = std::process::Command::new(program).arg(&dir).spawn() {
+            self.error = Some(format!("Не удалось открыть папку {}: {e}", dir.display()));
         }
     }
 
@@ -342,6 +384,7 @@ impl App {
         if self.busy() {
             return;
         }
+        self.archive_current();
         self.rows.clear();
         self.index.clear();
         self.selected = None;
@@ -350,6 +393,58 @@ impl App {
         self.progress = 0.0;
         self.status = "Новая сессия".into();
         let _ = std::fs::remove_file(&self.session_path);
+    }
+
+    /// Новое сканирование: при наличии результатов сначала спрашиваем подтверждение.
+    fn request_new_scan(&mut self, ctx: &egui::Context) {
+        if self.rows.is_empty() && self.scan_state.as_ref().is_none_or(|s| !s.has_progress()) {
+            self.start_scan(ctx, false);
+        } else {
+            self.confirm_new_scan = true;
+        }
+    }
+
+    fn ui_confirm_new_scan(&mut self, ctx: &egui::Context) {
+        if !self.confirm_new_scan {
+            return;
+        }
+        let pct = self
+            .scan_state
+            .as_ref()
+            .filter(|s| !s.finished)
+            .map(|s| format!(", обнаружение выполнено на {:.0}%", s.fraction() * 100.0))
+            .unwrap_or_default();
+        let mut start = false;
+        let mut cancel = false;
+        let resp = egui::Modal::new(egui::Id::unique("confirm_new_scan")).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.heading("Начать новое сканирование?");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "Текущие результаты (узлов — {}{pct}) будут убраны из таблицы.",
+                self.rows.len()
+            ));
+            ui.label(
+                "Они не пропадут: копия сохранится в архив, открыть её можно в меню «Сессия → Архив сессий».",
+            );
+            if self.can_resume() {
+                ui.colored_label(AMBER, "Чтобы продолжить прерванное сканирование, нажмите «Продолжить», а не «Сканировать».");
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                start = ui.button(RichText::new("Начать новое").strong()).clicked();
+                cancel = ui.button("Отмена").clicked();
+            });
+        });
+        if resp.should_close() {
+            cancel = true;
+        }
+        if start {
+            self.confirm_new_scan = false;
+            self.start_scan(ctx, false);
+        } else if cancel {
+            self.confirm_new_scan = false;
+        }
     }
 
     /// Можно ли продолжить последнее сканирование с текущими настройками.
@@ -605,6 +700,8 @@ impl App {
                 .map(|r| (r.ip, r.port))
                 .collect()
         } else {
+            // Прежние результаты не теряются: копия уходит в архив сессий.
+            self.archive_current();
             self.rows.clear();
             self.index.clear();
             self.selected = None;
@@ -1055,9 +1152,38 @@ impl App {
                 self.open_session();
             }
             ui.separator();
+            let busy = self.busy();
+            let mut open: Option<std::path::PathBuf> = None;
+            ui.menu_button(format!("Архив сессий ({})", self.archive.len()), |ui| {
+                ui.weak("Копии сохраняются перед новым сканированием и открытием другой сессии.");
+                ui.separator();
+                if self.archive.is_empty() {
+                    ui.weak("Архив пуст");
+                }
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for e in &self.archive {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new(e.label()))
+                            .on_hover_text(e.path.display().to_string())
+                            .clicked()
+                        {
+                            open = Some(e.path.clone());
+                        }
+                    }
+                });
+                ui.separator();
+                if ui.button("Открыть папку архива").clicked() {
+                    self.open_archive_folder();
+                    ui.close();
+                }
+            });
+            if let Some(p) = open {
+                ui.close();
+                self.open_session_path(&p);
+            }
             if ui
-                .add_enabled(!self.busy(), egui::Button::new("Новая сессия"))
-                .on_hover_text("Очистить результаты и удалить файл сессии")
+                .add_enabled(!busy, egui::Button::new("Новая сессия"))
+                .on_hover_text("Очистить результаты (копия сохранится в архив)")
                 .clicked()
             {
                 self.new_session();
@@ -1370,14 +1496,14 @@ impl App {
                     .on_hover_text("Начать сканирование с начала (текущие результаты будут очищены)")
                     .clicked()
                 {
-                    self.start_scan(&ctx, false);
+                    self.request_new_scan(&ctx);
                 }
             } else {
                 if ui
                     .add(egui::Button::new(RichText::new("▶ Сканировать").strong()).min_size([130.0, 28.0].into()))
                     .clicked()
                 {
-                    self.start_scan(&ctx, false);
+                    self.request_new_scan(&ctx);
                 }
                 if ui
                     .add_enabled(!self.rows.is_empty(), egui::Button::new("Перепроверить все"))
@@ -2078,6 +2204,8 @@ impl eframe::App for App {
             }
             self.last_compact = Some(compact);
         }
+
+        self.ui_confirm_new_scan(&ui.ctx().clone());
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
