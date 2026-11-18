@@ -610,6 +610,12 @@ impl App {
             block_marker: s.block_marker.trim().to_string(),
             proxy_auth: probe::basic_auth(s.proxy_user.trim(), &s.proxy_pass),
             retries: s.probe_retries.min(10),
+            badcert_hosts: if s.inspect_quality {
+                probe::parse_host_list(&s.badcert_hosts, 443)
+                    .map_err(|e| format!("Узлы с плохими сертификатами: {e}"))?
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -1197,6 +1203,11 @@ impl App {
                 Col::State => (x.state as u8).cmp(&(y.state as u8)),
                 Col::Source => x.source.cmp(&y.source),
                 Col::Http => x.probe.http_status.cmp(&y.probe.http_status),
+                Col::Inspect => {
+                    let (xb, xn) = x.inspect_counts();
+                    let (yb, yn) = y.inspect_counts();
+                    (xb, xn).cmp(&(yb, yn))
+                }
             }
             .then_with(|| x.ip.cmp(&y.ip))
             .then_with(|| x.port.cmp(&y.port));
@@ -1640,6 +1651,22 @@ impl App {
                         .desired_width(f32::INFINITY)
                         .hint_text("+ http://portal.corp.local/\n- https://blocked.example/"),
                 );
+                ui.checkbox(&mut s.inspect_quality, "Проверять качество SSL-инспекции").on_hover_text(
+                    "Через прокси с инспекцией открываются сайты с плохими сертификатами.\n\
+                     Если прокси переподписывает их своим CA, пользователь не увидит ошибку.",
+                );
+                if s.inspect_quality {
+                    ui.label("Узлы с плохими сертификатами (host[:port], по одному в строке)")
+                        .on_hover_text(
+                            "По умолчанию — badssl.com. В закрытом контуре поднимите внутренние узлы\n\
+                             с просроченным, самоподписанным и «чужим» сертификатом и укажите их здесь.",
+                        );
+                    ui.add(
+                        egui::TextEdit::multiline(&mut s.badcert_hosts)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                }
                 ui.label("Маркер страницы блокировки").on_hover_text(
                     "Подстрока в ответе прокси, по которой распознаётся страница блокировки \
                      (если прокси отдаёт её с кодом 200).",
@@ -1875,6 +1902,25 @@ impl App {
                 }
             }
 
+            if !p.inspection_checks.is_empty() {
+                ui.add_space(6.0);
+                ui.strong("Качество SSL-инспекции").on_hover_text(
+                    "Через прокси открываются сайты с плохими сертификатами. Если инспекция \
+                     переподписывает их своим CA, пользователь не увидит ошибку — это уязвимость.",
+                );
+                for c in &p.inspection_checks {
+                    let (mark, color) = match c.verdict {
+                        crate::model::InspectVerdict::Masked => ("✖", RED),
+                        crate::model::InspectVerdict::Error => ("?", AMBER),
+                        _ => ("✔", GREEN),
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(color, mark);
+                        ui.label(format!("{} — {}: {}", c.host, c.verdict.label(), c.detail));
+                    });
+                }
+            }
+
             if !p.notes.is_empty() {
                 ui.add_space(6.0);
                 ui.strong("Примечания");
@@ -1984,6 +2030,7 @@ impl App {
                 choice_combo(ui, right, "f_connect", "CONNECT:", &mut self.filters.connect);
                 choice_combo(ui, right, "f_ssl", "SSL-инспекция:", &mut self.filters.ssl);
                 choice_combo(ui, right, "f_policy", "Политики:", &mut self.filters.policy);
+                choice_combo(ui, right, "f_inspect", "Качество инспекции:", &mut self.filters.inspect);
                 choice_combo(ui, right, "f_state", "Состояние:", &mut self.filters.state);
                 choice_combo(ui, right, "f_source", "Обнаружен:", &mut self.filters.source);
                 flow(ui, right, "f_ports", |ui| {
@@ -2400,6 +2447,17 @@ fn cell(ui: &mut egui::Ui, r: &ProxyRow, col: Col) {
         },
         Col::Source => {
             ui.weak(&r.source);
+        }
+        Col::Inspect => {
+            let (bad, n) = r.inspect_counts();
+            let label = r.inspect_label();
+            if bad > 0 {
+                ui.colored_label(RED, RichText::new(label).strong());
+            } else if n > 0 {
+                ui.colored_label(GREEN, label);
+            } else {
+                ui.weak(label);
+            }
         }
         Col::Http => {
             if let Some(v) = r.probe.http_status {

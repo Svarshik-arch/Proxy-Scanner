@@ -72,6 +72,13 @@ choice!(PolicyFilter {
     NotChecked => "не проверялись",
 });
 
+choice!(InspectFilter {
+    Any => "любое",
+    Problems => "скрывает ошибки",
+    Fine => "в порядке",
+    NotChecked => "не проверялось",
+});
+
 choice!(StateFilter {
     Any => "любое",
     Done => "готово",
@@ -95,6 +102,7 @@ pub struct Filters {
     pub connect: ConnectFilter,
     pub ssl: SslFilter,
     pub policy: PolicyFilter,
+    pub inspect: InspectFilter,
     pub state: StateFilter,
     pub source: SourceFilter,
     /// Порты: `3128,8080-8090`; пусто — любые.
@@ -113,6 +121,7 @@ pub enum Preset {
     OpenConnect,
     SslInspection,
     PolicyViolations,
+    InspectionMasks,
     Errors,
 }
 
@@ -123,6 +132,7 @@ impl Preset {
         Preset::OpenConnect,
         Preset::SslInspection,
         Preset::PolicyViolations,
+        Preset::InspectionMasks,
         Preset::Errors,
     ];
 
@@ -133,6 +143,7 @@ impl Preset {
             Preset::OpenConnect => "Открытый CONNECT без аутентификации",
             Preset::SslInspection => "С SSL-инспекцией",
             Preset::PolicyViolations => "Нарушения политик",
+            Preset::InspectionMasks => "Инспекция скрывает ошибки сертификатов",
             Preset::Errors => "Ошибки проверки",
         }
     }
@@ -147,6 +158,10 @@ impl Preset {
             }
             Preset::SslInspection => "Сертификат через прокси отличается от эталонного",
             Preset::PolicyViolations => "Хотя бы одно правило политики не выполняется",
+            Preset::InspectionMasks => {
+                "SSL-инспекция переподписывает сайты с просроченными, самоподписанными \
+                 или чужими сертификатами — пользователь не видит ошибку"
+            }
             Preset::Errors => "Узлы, проверка которых завершилась ошибкой",
         }
     }
@@ -176,6 +191,7 @@ impl Filters {
             }
             Preset::SslInspection => self.ssl = SslFilter::Yes,
             Preset::PolicyViolations => self.policy = PolicyFilter::Violations,
+            Preset::InspectionMasks => self.inspect = InspectFilter::Problems,
             Preset::Errors => self.state = StateFilter::Error,
         }
     }
@@ -196,6 +212,7 @@ impl Filters {
             !self.connect.is_any(),
             !self.ssl.is_any(),
             !self.policy.is_any(),
+            !self.inspect.is_any(),
             !self.state.is_any(),
             !self.source.is_any(),
             !self.ports.trim().is_empty(),
@@ -248,6 +265,7 @@ impl Filters {
             connect: self.connect,
             ssl: self.ssl,
             policy: self.policy,
+            inspect: self.inspect,
             state: self.state,
             source: self.source,
             ports,
@@ -266,6 +284,7 @@ pub struct Compiled {
     connect: ConnectFilter,
     ssl: SslFilter,
     policy: PolicyFilter,
+    inspect: InspectFilter,
     state: StateFilter,
     source: SourceFilter,
     ports: Option<HashSet<u16>>,
@@ -344,6 +363,17 @@ impl Compiled {
             PolicyFilter::NotChecked => total == 0,
         };
         if !policy_ok {
+            return false;
+        }
+
+        let (bad, checked) = r.inspect_counts();
+        let inspect_ok = match self.inspect {
+            InspectFilter::Any => true,
+            InspectFilter::Problems => bad > 0,
+            InspectFilter::Fine => checked > 0 && bad == 0,
+            InspectFilter::NotChecked => checked == 0,
+        };
+        if !inspect_ok {
             return false;
         }
 

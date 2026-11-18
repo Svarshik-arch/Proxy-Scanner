@@ -16,7 +16,8 @@ use tokio_rustls::TlsConnector;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::model::{
-    CertInfo, PolicyResult, PolicyVerdict, ProbeResult, ProxyKind, SslInspection,
+    CertInfo, InspectVerdict, InspectionCheck, PolicyResult, PolicyVerdict, ProbeResult, ProxyKind,
+    SslInspection,
 };
 
 const MAX_HEAD: usize = 16 * 1024;
@@ -157,6 +158,35 @@ pub struct ProbeConfig {
     /// Сколько раз повторять сетевую операцию при сбое (загруженный прокси
     /// часто отвечает не с первого раза).
     pub retries: u32,
+    /// Узлы с плохими сертификатами для проверки качества SSL-инспекции
+    /// (пусто — проверка выключена).
+    pub badcert_hosts: Vec<(String, u16)>,
+}
+
+/// Список узлов «host[:port]» по одному в строке; `#` — комментарий.
+pub fn parse_host_list(text: &str, default_port: u16) -> Result<Vec<(String, u16)>, String> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        out.push(split_host_port(line, default_port).map_err(|e| format!("строка {}: {e}", n + 1))?);
+    }
+    Ok(out)
+}
+
+/// Подходит ли сертификат для имени узла (с учётом `*.example.com`).
+pub fn name_matches(names: &[String], host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    names.iter().any(|n| {
+        let n = n.to_ascii_lowercase();
+        if let Some(rest) = n.strip_prefix("*.") {
+            host.split_once('.').is_some_and(|(label, tail)| !label.is_empty() && tail == rest)
+        } else {
+            n == host
+        }
+    })
 }
 
 /// Ошибка, при которой повтор имеет смысл (таймаут, обрыв), — в отличие от
@@ -446,6 +476,21 @@ pub fn cert_info(chain: &[CertificateDer<'_>]) -> Result<CertInfo, String> {
             info.not_before = cert.validity().not_before.to_string();
             info.not_after = cert.validity().not_after.to_string();
             info.self_signed = cert.subject() == cert.issuer();
+            info.expired = !cert.validity().is_valid();
+            for cn in cert.subject().iter_common_name() {
+                if let Ok(v) = cn.as_str() {
+                    info.names.push(v.to_string());
+                }
+            }
+            if let Ok(Some(san)) = cert.subject_alternative_name() {
+                for gn in &san.value.general_names {
+                    if let x509_parser::extensions::GeneralName::DNSName(d) = gn
+                        && !info.names.iter().any(|n| n.eq_ignore_ascii_case(d))
+                    {
+                        info.names.push(d.to_string());
+                    }
+                }
+            }
         }
         Err(e) => info.subject = format!("(не удалось разобрать сертификат: {e})"),
     }
@@ -708,6 +753,89 @@ async fn check_policy_rule_once(addr: SocketAddr, rule: &PolicyRule, cfg: &Probe
 // Основная процедура
 // ---------------------------------------------------------------------------
 
+/// Как прокси обходится с сайтом, у которого плохой сертификат (просрочен,
+/// самоподписан, чужое имя): если инспекция переподписывает его своим CA,
+/// пользователь не увидит ошибку — это уязвимость.
+async fn check_bad_cert(
+    addr: SocketAddr,
+    host: &str,
+    port: u16,
+    inspect_issuer: &str,
+    cfg: &ProbeConfig,
+) -> InspectionCheck {
+    let mut attempt = 0;
+    loop {
+        let (verdict, detail) = check_bad_cert_once(addr, host, port, inspect_issuer, cfg).await;
+        if verdict == InspectVerdict::Error && transient(&detail) && attempt < cfg.retries {
+            attempt += 1;
+            backoff(attempt).await;
+            continue;
+        }
+        return InspectionCheck { host: format!("{host}:{port}"), verdict, detail };
+    }
+}
+
+async fn check_bad_cert_once(
+    addr: SocketAddr,
+    host: &str,
+    port: u16,
+    inspect_issuer: &str,
+    cfg: &ProbeConfig,
+) -> (InspectVerdict, String) {
+    let r: Result<(InspectVerdict, String), String> = async {
+        let mut s = with_timeout(cfg.timeout, TcpStream::connect(addr)).await?;
+        let req = connect_request(host, port, cfg.proxy_auth.as_deref());
+        let resp = http_exchange(&mut s, &req, cfg.timeout, false).await?;
+        match resp.status {
+            200..=299 => {}
+            502..=504 => {
+                return Ok((
+                    InspectVerdict::Error,
+                    format!("HTTP {}: прокси не смог связаться с узлом", resp.status),
+                ))
+            }
+            407 => return Ok((InspectVerdict::Error, "HTTP 407: требуется аутентификация".into())),
+            st => return Ok((InspectVerdict::Blocked, format!("CONNECT запрещён (HTTP {st})"))),
+        }
+        let (mut tls, cert) = match tls_handshake(s, host, cfg.timeout).await {
+            Ok(v) => v,
+            Err(e) => return Ok((InspectVerdict::Blocked, format!("прокси оборвал TLS ({e})"))),
+        };
+        if cert.issuer != inspect_issuer {
+            return Ok((
+                InspectVerdict::PassedThrough,
+                format!("передан исходный сертификат (издатель «{}»)", cert.issuer),
+            ));
+        }
+        if cert.expired {
+            return Ok((InspectVerdict::PassedThrough, "прокси передал просроченный сертификат".into()));
+        }
+        if !name_matches(&cert.names, host) {
+            return Ok((
+                InspectVerdict::PassedThrough,
+                "имя в сертификате не совпадает с узлом — браузер покажет ошибку".into(),
+            ));
+        }
+        // Сертификат «хороший» и выдан CA инспекции. Возможно, прокси показывает
+        // страницу блокировки — проверим ответ.
+        let get = get_request("/", &if port == 443 { host.to_string() } else { format!("{host}:{port}") }, None);
+        if let Ok(resp) = http_exchange(&mut tls, &get, cfg.timeout, true).await
+            && (matches!(resp.status, 403 | 451) || contains_marker(&resp, &cfg.block_marker))
+        {
+            return Ok((
+                InspectVerdict::Blocked,
+                format!("прокси показывает страницу блокировки (HTTP {})", resp.status),
+            ));
+        }
+        Ok((
+            InspectVerdict::Masked,
+            "сертификат переподписан CA инспекции — пользователь не увидит ошибку".into(),
+        ))
+    }
+    .await;
+    r.unwrap_or_else(|e| (InspectVerdict::Error, e))
+}
+
 /// Полная диагностика одного узла `ip:port`.
 pub async fn probe_endpoint(ip: Ipv4Addr, port: u16, cfg: &ProbeConfig) -> ProbeResult {
     let addr = SocketAddr::from((ip, port));
@@ -789,6 +917,19 @@ pub async fn probe_endpoint(ip: Ipv4Addr, port: u16, cfg: &ProbeConfig) -> Probe
                         res.notes.push(format!("CONNECT: {e}"));
                         break;
                     }
+                }
+            }
+
+            // 3a. Качество SSL-инспекции: не скрывает ли прокси ошибки сертификатов сайтов.
+            let tunnel_ok = res.connect_status.is_some_and(|c| (200..300).contains(&c));
+            let inspecting = matches!(res.ssl, Some(SslInspection::Yes | SslInspection::NoReference));
+            if tunnel_ok
+                && inspecting
+                && let Some(issuer) = res.cert.as_ref().map(|c| c.issuer.clone())
+            {
+                for (host, port) in &cfg.badcert_hosts {
+                    let check = check_bad_cert(addr, host, *port, &issuer, cfg).await;
+                    res.inspection_checks.push(check);
                 }
             }
 
@@ -957,6 +1098,7 @@ mod tests {
             block_marker: String::new(),
             proxy_auth: None,
             retries: 1,
+            badcert_hosts: Vec::new(),
         }
     }
 
@@ -1090,6 +1232,120 @@ mod tests {
         c.retries = 0;
         let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &c).await;
         assert_ne!(r.kind, Some(ProxyKind::HttpProxy), "без повторов первый сбой скрывает прокси");
+    }
+
+    /// Поддельный «инспектирующий» прокси: на CONNECT отвечает 200 и выдаёт
+    /// сертификат для запрошенного узла, подписанный своим CA. `mode`:
+    /// "mask" — переподписывает всё; "block" — запрещает CONNECT к узлам `bad-*`;
+    /// "pass" — для `bad-*` предъявляет самоподписанный сертификат (как исходный).
+    async fn inspecting_proxy(mode: &'static str) -> u16 {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+        use rustls::pki_types::PrivateKeyDer;
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(DnType::CommonName, "Corp Inspection CA");
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Arc::new(Issuer::new(ca_params, ca_key));
+        let ca_der = ca_cert.der().clone();
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { break };
+                let (issuer, ca_der) = (issuer.clone(), ca_der.clone());
+                tokio::spawn(async move {
+                    let Ok(head) = read_request(&mut s).await else { return };
+                    let target = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let host = target.rsplit_once(':').map(|x| x.0).unwrap_or(&target).to_string();
+                    if !head.starts_with("CONNECT") {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nVia: 1.1 fake\r\nContent-Length: 0\r\n\r\n").await;
+                        return;
+                    }
+                    let bad = host.starts_with("bad-");
+                    if mode == "block" && bad {
+                        let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+                        return;
+                    }
+                    let _ = s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+                    let key = KeyPair::generate().unwrap();
+                    let mut params = CertificateParams::new(vec![host.clone()]).unwrap();
+                    params.distinguished_name.push(DnType::CommonName, host.clone());
+                    let (chain, key_der) = if mode == "pass" && bad {
+                        let c = params.self_signed(&key).unwrap();
+                        (vec![c.der().clone()], key.serialize_der())
+                    } else {
+                        let c = params.signed_by(&key, &issuer).unwrap();
+                        (vec![c.der().clone(), ca_der], key.serialize_der())
+                    };
+                    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+                        rustls::crypto::ring::default_provider(),
+                    ))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(chain, PrivateKeyDer::Pkcs8(key_der.into()))
+                    .unwrap();
+                    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+                    let Ok(mut tls) = acceptor.accept(s).await else { return };
+                    let mut buf = [0u8; 1024];
+                    let _ = tls.read(&mut buf).await;
+                    let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    fn inspect_cfg() -> ProbeConfig {
+        let mut c = cfg();
+        c.tls_host = "good.test".into();
+        c.policy.clear();
+        c.badcert_hosts = vec![("bad-expired.test".into(), 443), ("bad-self-signed.test".into(), 443)];
+        c
+    }
+
+    #[tokio::test]
+    async fn inspection_that_masks_bad_certs_is_flagged() {
+        let port = inspecting_proxy("mask").await;
+        let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &inspect_cfg()).await;
+        assert_eq!(r.ssl, Some(SslInspection::NoReference));
+        assert!(r.cert.as_ref().unwrap().issuer.contains("Corp Inspection CA"));
+        assert_eq!(r.inspection_checks.len(), 2, "{:?}", r.notes);
+        assert!(
+            r.inspection_checks.iter().all(|c| c.verdict == InspectVerdict::Masked),
+            "{:?}",
+            r.inspection_checks
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_that_blocks_or_passes_bad_certs_is_ok() {
+        let port = inspecting_proxy("block").await;
+        let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &inspect_cfg()).await;
+        assert!(r.inspection_checks.iter().all(|c| c.verdict == InspectVerdict::Blocked), "{:?}", r.inspection_checks);
+
+        let port = inspecting_proxy("pass").await;
+        let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &inspect_cfg()).await;
+        assert!(
+            r.inspection_checks.iter().all(|c| c.verdict == InspectVerdict::PassedThrough),
+            "{:?}",
+            r.inspection_checks
+        );
+    }
+
+    #[test]
+    fn wildcard_names() {
+        let names = vec!["*.corp.local".to_string(), "corp.local".to_string()];
+        assert!(name_matches(&names, "www.corp.local"));
+        assert!(name_matches(&names, "CORP.local"));
+        assert!(!name_matches(&names, "a.b.corp.local"));
+        assert!(!name_matches(&names, "evil.com"));
+        assert_eq!(parse_host_list("a.test\n# x\nb.test:8443 # c\n", 443).unwrap(),
+            vec![("a.test".to_string(), 443), ("b.test".to_string(), 8443)]);
     }
 
     #[tokio::test]

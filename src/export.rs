@@ -17,7 +17,7 @@ pub fn to_csv(rows: &[&ProxyRow]) -> String {
     let mut out = String::from("\u{feff}");
     out.push_str(
         "IP;Порт;Источник;Тип;Отклик, мс;HTTP;Сервер;Via;Аутентификация;CONNECT;\
-         SSL-инспекция;Издатель сертификата;Субъект сертификата;SHA-256;\
+         SSL-инспекция;Качество инспекции;Издатель сертификата;Субъект сертификата;SHA-256;\
          Политики (соответствует/всего);Нарушения политик;Примечания;Состояние\r\n",
     );
     for r in rows {
@@ -43,6 +43,7 @@ pub fn to_csv(rows: &[&ProxyRow]) -> String {
             r.auth_label(),
             r.connect_label(),
             r.ssl.label().to_string(),
+            r.inspect_label(),
             cert.issuer,
             cert.subject,
             cert.sha256,

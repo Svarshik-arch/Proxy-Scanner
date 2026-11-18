@@ -49,6 +49,10 @@ pub struct Settings {
     pub reference_fp: String,
     pub policy_rules: String,
     pub block_marker: String,
+    /// Проверять, не скрывает ли SSL-инспекция ошибки сертификатов сайтов.
+    pub inspect_quality: bool,
+    /// Узлы с заведомо плохими сертификатами (по одному в строке, host[:port]).
+    pub badcert_hosts: String,
     pub proxy_user: String,
     #[serde(skip)]
     pub proxy_pass: String,
@@ -80,6 +84,8 @@ impl Default for Settings {
             reference_fp: String::new(),
             policy_rules: String::new(),
             block_marker: String::new(),
+            inspect_quality: true,
+            badcert_hosts: "expired.badssl.com\nself-signed.badssl.com\nuntrusted-root.badssl.com\nwrong.host.badssl.com".into(),
             proxy_user: String::new(),
             proxy_pass: String::new(),
         }
@@ -161,6 +167,7 @@ impl RowState {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CertInfo {
     pub subject: String,
     pub issuer: String,
@@ -169,6 +176,45 @@ pub struct CertInfo {
     pub sha256: String,
     pub chain_len: usize,
     pub self_signed: bool,
+    /// Срок действия истёк или ещё не наступил.
+    pub expired: bool,
+    /// Имена, на которые выдан сертификат (CN и SAN).
+    pub names: Vec<String>,
+}
+
+/// Результат проверки того, как SSL-инспекция обходится с плохим сертификатом сайта.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InspectVerdict {
+    /// Прокси переподписал плохой сертификат своим CA — пользователь не увидит ошибку.
+    Masked,
+    /// Пользователю передан исходный (плохой) сертификат или явная ошибка.
+    PassedThrough,
+    /// Прокси заблокировал соединение.
+    Blocked,
+    /// Проверить не удалось (нет связи с узлом и т. п.).
+    Error,
+}
+
+impl InspectVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            InspectVerdict::Masked => "скрывает ошибку",
+            InspectVerdict::PassedThrough => "ошибка видна пользователю",
+            InspectVerdict::Blocked => "заблокировано",
+            InspectVerdict::Error => "не проверено",
+        }
+    }
+
+    pub fn is_problem(self) -> bool {
+        self == InspectVerdict::Masked
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectionCheck {
+    pub host: String,
+    pub verdict: InspectVerdict,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +262,9 @@ pub struct ProbeResult {
     pub ssl: Option<SslInspection>,
     pub cert: Option<CertInfo>,
     pub policy: Vec<PolicyResult>,
+    /// Проверка качества SSL-инспекции на узлах с плохими сертификатами.
+    #[serde(default)]
+    pub inspection_checks: Vec<InspectionCheck>,
     pub raw_headers: String,
     pub notes: Vec<String>,
     pub error: Option<String>,
@@ -276,6 +325,30 @@ impl ProxyRow {
             String::new()
         } else {
             format!("{ok}/{total}")
+        }
+    }
+
+    /// (скрытых ошибок, проверено) по проверкам качества инспекции.
+    pub fn inspect_counts(&self) -> (usize, usize) {
+        let checked: Vec<_> = self
+            .probe
+            .inspection_checks
+            .iter()
+            .filter(|c| c.verdict != InspectVerdict::Error)
+            .collect();
+        (checked.iter().filter(|c| c.verdict.is_problem()).count(), checked.len())
+    }
+
+    pub fn inspect_label(&self) -> String {
+        let (bad, n) = self.inspect_counts();
+        if self.probe.inspection_checks.is_empty() {
+            String::new()
+        } else if n == 0 {
+            "не проверено".into()
+        } else if bad > 0 {
+            format!("скрывает {bad} из {n}")
+        } else {
+            format!("в порядке ({n})")
         }
     }
 
