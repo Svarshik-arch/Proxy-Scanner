@@ -107,7 +107,9 @@ jobs:
         run: |
           $out = & .\masscan64.exe --version 2>&1 | Out-String
           $out
-          if ($out -notmatch "Masscan version") { Write-Error "unexpected --version output"; exit 1 }
+          # masscan --version завершается с ненулевым кодом, поэтому проверяем только вывод.
+          if ($out -notmatch "Masscan version $env:MASSCAN_TAG") { Write-Error "unexpected --version output"; exit 1 }
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
