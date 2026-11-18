@@ -45,6 +45,67 @@ impl TargetSet {
         self.ranges.first().map(|r| r.first())
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Отсортированные непересекающиеся диапазоны (соседние склеены).
+    pub fn normalized(&self) -> TargetSet {
+        let mut r = self.ranges.clone();
+        r.sort_by_key(|x| x.start);
+        let mut out: Vec<Ipv4Range> = Vec::with_capacity(r.len());
+        for x in r {
+            match out.last_mut() {
+                Some(last) if (x.start as u64) <= last.end as u64 + 1 => {
+                    last.end = last.end.max(x.end);
+                }
+                _ => out.push(x),
+            }
+        }
+        TargetSet { ranges: out }
+    }
+
+    /// Адреса из `self`, которых нет в `other`.
+    pub fn subtract(&self, other: &TargetSet) -> TargetSet {
+        let other = other.normalized();
+        let mut out = Vec::new();
+        for r in self.normalized().ranges {
+            let mut start = r.start as u64;
+            let end = r.end as u64;
+            for o in &other.ranges {
+                let (os, oe) = (o.start as u64, o.end as u64);
+                if oe < start || os > end {
+                    continue;
+                }
+                if os > start {
+                    out.push(Ipv4Range { start: start as u32, end: (os - 1) as u32 });
+                }
+                start = oe + 1;
+                if start > end {
+                    break;
+                }
+            }
+            if start <= end {
+                out.push(Ipv4Range { start: start as u32, end: end as u32 });
+            }
+        }
+        TargetSet { ranges: out }
+    }
+
+    /// Первые `n` адресов в порядке обхода.
+    pub fn take_first(&self, mut n: u64) -> TargetSet {
+        let mut out = Vec::new();
+        for r in &self.ranges {
+            if n == 0 {
+                break;
+            }
+            let take = r.len().min(n);
+            out.push(Ipv4Range { start: r.start, end: (r.start as u64 + take - 1) as u32 });
+            n -= take;
+        }
+        TargetSet { ranges: out }
+    }
+
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
         let v = u32::from(ip);
         self.ranges.iter().any(|r| (r.start..=r.end).contains(&v))
@@ -219,6 +280,23 @@ mod tests {
         assert_eq!(ports_to_masscan(&p), "80,3128,8000-8002,8080");
         assert!(parse_ports("0").is_err());
         assert!(parse_ports("abc").is_err());
+    }
+
+    #[test]
+    fn set_operations() {
+        let a = parse_targets("10.0.0.0/24, 10.0.0.10-10.0.1.5").unwrap().normalized();
+        assert_eq!(a.to_masscan_arg(), "10.0.0.0-10.0.1.5");
+        let b = parse_targets("10.0.0.0/24").unwrap();
+        let rest = parse_targets("10.0.0.0-10.0.1.5").unwrap().subtract(&b);
+        assert_eq!(rest.to_masscan_arg(), "10.0.1.0-10.0.1.5");
+        let hole = parse_targets("10.0.0.0/24").unwrap().subtract(&parse_targets("10.0.0.10-20").unwrap());
+        assert_eq!(hole.to_masscan_arg(), "10.0.0.0-10.0.0.9,10.0.0.21-10.0.0.255");
+        assert!(b.subtract(&b).is_empty());
+        let first = parse_targets("10.0.0.0/30, 10.0.1.0/30").unwrap().take_first(6);
+        assert_eq!(first.to_masscan_arg(), "10.0.0.0-10.0.0.3,10.0.1.0-10.0.1.1");
+        assert_eq!(b.take_first(0).total_hosts(), 0);
+        let edge = parse_targets("255.255.255.0/24").unwrap().subtract(&parse_targets("255.255.255.255").unwrap());
+        assert_eq!(edge.total_hosts(), 255);
     }
 
     #[test]

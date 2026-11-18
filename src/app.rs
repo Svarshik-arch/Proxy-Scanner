@@ -24,7 +24,7 @@ use crate::model::{
 use crate::netdetect::{self, IfaceEntry};
 use crate::probe::{self, ProbeConfig, Url};
 use crate::scan::{self, MasscanConfig, TcpScanConfig, Tx};
-use crate::session::{self, ArchiveEntry, ScanState, Session};
+use crate::session::{self, ArchiveEntry, Coverage, ScanState, Session};
 use crate::targets::{self, TCP_SCAN_MAX_HOSTS};
 use crate::util;
 
@@ -58,6 +58,21 @@ enum ResultsView {
     #[default]
     Table,
     Graph,
+}
+
+/// Оценка «Дополнить»: (новых проверок, всего по текущим параметрам).
+type AppendEstimate = Result<(u64, u64), String>;
+
+/// Как запускается обнаружение портов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartKind {
+    /// С чистого листа (прежние результаты уходят в архив).
+    Fresh,
+    /// Продолжение остановленного сканирования с теми же параметрами.
+    Resume,
+    /// Дополнение сессии: новые параметры, найденное сохраняется,
+    /// уже проверенные адреса × порты пропускаются.
+    Append,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +179,12 @@ pub struct App {
     archive: Vec<ArchiveEntry>,
     /// Ждём подтверждения перед новым сканированием.
     confirm_new_scan: bool,
+    /// Уже проверенные адреса × порты этой сессии.
+    coverage: Vec<Coverage>,
+    /// Текущий этап сканирования (k, n) для строки состояния.
+    stage: Option<(usize, usize)>,
+    /// Кэш оценки «Дополнить»: ключ параметров → (новых проверок, всего запрошено).
+    append_preview: Option<(String, AppendEstimate)>,
 }
 
 /// Описание сессии, загруженной при запуске или из файла.
@@ -220,6 +241,9 @@ impl App {
             dirty: false,
             archive: Vec::new(),
             confirm_new_scan: false,
+            coverage: Vec::new(),
+            stage: None,
+            append_preview: None,
         };
         app.archive = session::list_archive(&app.session_path);
         // Незавершённая сессия рядом с программой (в том числе перенесённая с другого ПК).
@@ -259,6 +283,21 @@ impl App {
             .map(|(i, r)| ((r.ip, r.port), i))
             .collect();
         self.scan_state = s.scan;
+        if let Some(st) = &mut self.scan_state {
+            st.ensure_groups();
+        }
+        self.coverage = s.coverage;
+        // Сессии старых версий: завершённое сканирование целиком считается проверенным.
+        if self.coverage.is_empty()
+            && let Some(st) = &self.scan_state
+        {
+            if st.finished {
+                self.coverage.extend(st.groups.iter().map(|g| g.coverage()));
+            } else {
+                self.coverage.extend(st.partial_coverage());
+            }
+        }
+        self.append_preview = None;
         self.selected = None;
         self.restored = Some(RestoredInfo {
             computer: s.computer.clone(),
@@ -289,7 +328,9 @@ impl App {
                 r.state = RowState::Found;
             }
         }
-        Session::new(&self.settings, self.scan_state.clone(), rows)
+        let mut s = Session::new(&self.settings, self.scan_state.clone(), rows);
+        s.coverage = self.coverage.clone();
+        s
     }
 
     fn save_session_to(&mut self, path: &std::path::Path) -> Result<(), String> {
@@ -389,6 +430,8 @@ impl App {
         self.index.clear();
         self.selected = None;
         self.scan_state = None;
+        self.coverage.clear();
+        self.append_preview = None;
         self.restored = None;
         self.progress = 0.0;
         self.status = "Новая сессия".into();
@@ -398,7 +441,7 @@ impl App {
     /// Новое сканирование: при наличии результатов сначала спрашиваем подтверждение.
     fn request_new_scan(&mut self, ctx: &egui::Context) {
         if self.rows.is_empty() && self.scan_state.as_ref().is_none_or(|s| !s.has_progress()) {
-            self.start_scan(ctx, false);
+            self.start_scan(ctx, StartKind::Fresh);
         } else {
             self.confirm_new_scan = true;
         }
@@ -441,7 +484,7 @@ impl App {
         }
         if start {
             self.confirm_new_scan = false;
-            self.start_scan(ctx, false);
+            self.start_scan(ctx, StartKind::Fresh);
         } else if cancel {
             self.confirm_new_scan = false;
         }
@@ -612,117 +655,191 @@ impl App {
         }
     }
 
-    fn start_scan(&mut self, ctx: &egui::Context, resume: bool) {
+    fn start_scan(&mut self, ctx: &egui::Context, kind: StartKind) {
         self.error = None;
-        if let Err(e) = self.try_start_scan(ctx, resume) {
+        if let Err(e) = self.try_start_scan(ctx, kind) {
             self.error = Some(e);
         }
     }
 
-    fn try_start_scan(&mut self, ctx: &egui::Context, resume: bool) -> Result<(), String> {
+    /// Проверенное в сессии плюс уже сделанная часть незавершённого сканирования.
+    fn effective_coverage(&self) -> Vec<Coverage> {
+        let mut cov = self.coverage.clone();
+        if let Some(st) = &self.scan_state
+            && !st.finished
+        {
+            for c in st.partial_coverage() {
+                if !cov.contains(&c) {
+                    cov.push(c);
+                }
+            }
+        }
+        cov
+    }
+
+    /// Оценка для «Дополнить»: (новых проверок, всего по текущим параметрам).
+    fn append_estimate(&mut self) -> AppendEstimate {
+        let key = format!(
+            "{}|{}|{}|{:?}",
+            self.settings.targets,
+            self.settings.ports,
+            self.coverage.len(),
+            self.scan_state.as_ref().map(|s| (s.group, s.tcp_hosts_done, s.finished))
+        );
+        if let Some((k, v)) = &self.append_preview
+            && *k == key
+        {
+            return v.clone();
+        }
+        let v = (|| {
+            let t = targets::parse_targets(&self.settings.targets)?;
+            let p = targets::parse_ports(&self.settings.ports)?;
+            let groups = session::plan(&t, &p, &self.effective_coverage());
+            let new: u64 = groups.iter().map(|g| g.checks()).sum();
+            Ok((new, t.normalized().total_hosts() * p.len() as u64))
+        })();
+        self.append_preview = Some((key, v.clone()));
+        v
+    }
+
+    fn try_start_scan(&mut self, ctx: &egui::Context, kind: StartKind) -> Result<(), String> {
         let s = self.settings.clone();
         let target_set = targets::parse_targets(&s.targets).map_err(|e| format!("Цели: {e}"))?;
         let ports = targets::parse_ports(&s.ports).map_err(|e| format!("Порты: {e}"))?;
-        let hosts = target_set.total_hosts();
-
-        let state = match (&self.scan_state, resume) {
-            (Some(st), true) if st.resumable_with(&s) => st.clone(),
-            (_, true) => {
-                return Err("Продолжить нельзя: цели, порты или режим изменились после остановки".into())
-            }
-            _ => {
-                // Новое зерно — новый псевдослучайный порядок обхода masscan.
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(1)
-                    | 1;
-                ScanState::new(&s, hosts, ports.len() as u64, seed)
-            }
+        let new_seed = || {
+            // Новое зерно — новый псевдослучайный порядок обхода masscan.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(1)
+                | 1
         };
 
-        enum Plan {
-            Tcp(TcpScanConfig),
-            Masscan(MasscanConfig),
+        let state = match kind {
+            StartKind::Resume => match &self.scan_state {
+                Some(st) if st.resumable_with(&s) => st.clone(),
+                _ => {
+                    return Err(
+                        "Продолжить нельзя: цели, порты или режим изменились после остановки. \
+                         Нажмите «Дополнить» — уже проверенное повторно сканироваться не будет."
+                            .into(),
+                    )
+                }
+            },
+            StartKind::Append => {
+                let groups = session::plan(&target_set, &ports, &self.effective_coverage());
+                if groups.is_empty() {
+                    return Err("Все адреса и порты из текущих параметров уже проверены — \
+                                добавьте новые порты или подсети."
+                        .into());
+                }
+                ScanState::new(&s, groups, new_seed())
+            }
+            StartKind::Fresh => ScanState::new(&s, session::plan(&target_set, &ports, &[]), new_seed()),
+        };
+
+        // Проверка параметров каждого этапа.
+        if s.mode == ScanMode::TcpConnect
+            && let Some(g) = state.groups.iter().find(|g| g.hosts > TCP_SCAN_MAX_HOSTS)
+        {
+            return Err(format!(
+                "TCP-connect режим рассчитан на подсети до /16 ({TCP_SCAN_MAX_HOSTS} адресов), \
+                 в этапе {} адресов. Сузьте диапазон или используйте masscan.",
+                g.hosts
+            ));
         }
-        let plan = match s.mode {
-            ScanMode::TcpConnect => {
-                if hosts > TCP_SCAN_MAX_HOSTS {
-                    return Err(format!(
-                        "TCP-connect режим рассчитан на подсети до /16 ({TCP_SCAN_MAX_HOSTS} адресов), \
-                         задано {hosts}. Сузьте диапазон или используйте masscan."
-                    ));
-                }
-                Plan::Tcp(TcpScanConfig {
-                    targets: target_set,
-                    ports,
-                    concurrency: s.tcp_concurrency.clamp(1, 4000),
-                    timeout: Duration::from_millis(s.tcp_timeout_ms.clamp(50, 30_000)),
-                    skip_hosts: state.tcp_hosts_done,
-                })
+        let masscan_template = if s.mode == ScanMode::Masscan {
+            if !s.router_mac.trim().is_empty() && !netdetect::is_mac(s.router_mac.trim()) {
+                return Err("router-mac: ожидается формат 00-11-22-33-44-55".into());
             }
-            ScanMode::Masscan => {
-                let exe = util::resolve_masscan(&s.masscan_path);
-                if !s.router_mac.trim().is_empty() && !netdetect::is_mac(s.router_mac.trim()) {
-                    return Err("router-mac: ожидается формат 00-11-22-33-44-55".into());
+            for (name, v) in [("source-ip", &s.source_ip), ("router-ip", &s.router_ip)] {
+                if !v.trim().is_empty() && v.trim().parse::<Ipv4Addr>().is_err() {
+                    return Err(format!("{name}: некорректный IPv4-адрес"));
                 }
-                for (name, v) in [("source-ip", &s.source_ip), ("router-ip", &s.router_ip)] {
-                    if !v.trim().is_empty() && v.trim().parse::<Ipv4Addr>().is_err() {
-                        return Err(format!("{name}: некорректный IPv4-адрес"));
-                    }
-                }
-                Plan::Masscan(MasscanConfig {
-                    exe,
-                    targets: target_set,
-                    ports,
-                    rate: s.rate.clamp(1, 1_000_000),
-                    wait_secs: s.wait_secs.min(120),
-                    adapter: s.adapter.clone(),
-                    source_ip: s.source_ip.clone(),
-                    router_ip: s.router_ip.clone(),
-                    router_mac: s.router_mac.clone(),
-                    extra_args: s.extra_args.clone(),
-                    seed: state.masscan_seed,
-                    resume_index: state.masscan_index,
-                })
             }
+            Some(MasscanConfig {
+                exe: util::resolve_masscan(&s.masscan_path),
+                targets: Default::default(),
+                ports: Vec::new(),
+                rate: s.rate.clamp(1, 1_000_000),
+                wait_secs: s.wait_secs.min(120),
+                adapter: s.adapter.clone(),
+                source_ip: s.source_ip.clone(),
+                router_ip: s.router_ip.clone(),
+                router_mac: s.router_mac.clone(),
+                extra_args: s.extra_args.clone(),
+                seed: state.masscan_seed,
+                resume_index: 0,
+            })
+        } else {
+            None
         };
+        let tcp_concurrency = s.tcp_concurrency.clamp(1, 4000);
+        let tcp_timeout = Duration::from_millis(s.tcp_timeout_ms.clamp(50, 30_000));
 
         let job = self.new_job(s.auto_probe)?;
         let cancel = job.cancel.clone();
         let reference = job.probe.as_ref().map(|p| self.reference_future(&p.cfg));
         let tx = self.tx(ctx);
 
-        let unfinished: Vec<(Ipv4Addr, u16)> = if resume {
-            self.rows
-                .iter()
-                .filter(|r| matches!(r.state, RowState::Found | RowState::Probing))
-                .map(|r| (r.ip, r.port))
-                .collect()
-        } else {
+        let unfinished: Vec<(Ipv4Addr, u16)> = if kind == StartKind::Fresh {
             // Прежние результаты не теряются: копия уходит в архив сессий.
             self.archive_current();
             self.rows.clear();
             self.index.clear();
             self.selected = None;
+            self.coverage.clear();
             Vec::new()
+        } else {
+            if kind == StartKind::Append {
+                // Сделанная часть прерванного сканирования считается проверенной.
+                for c in self.effective_coverage() {
+                    if !self.coverage.contains(&c) {
+                        self.coverage.push(c);
+                    }
+                }
+            }
+            self.rows
+                .iter()
+                .filter(|r| matches!(r.state, RowState::Found | RowState::Probing))
+                .map(|r| (r.ip, r.port))
+                .collect()
         };
+
+        let checks = state.total_checks();
         self.compact_tab = CompactTab::Results;
         self.progress = state.fraction();
-        self.status = if resume { "Продолжение…" } else { "Запуск…" }.into();
+        self.stage = None;
+        self.append_preview = None;
+        self.status = match kind {
+            StartKind::Fresh => "Запуск…",
+            StartKind::Resume => "Продолжение…",
+            StartKind::Append => "Дополнение…",
+        }
+        .into();
         self.push_log(format!(
-            "— {}: {} адресов, режим {} —",
-            if resume {
-                format!("продолжение с {:.1}%", state.fraction() * 100.0)
-            } else {
-                "новая задача".to_string()
+            "— {}: этапов {}, проверок {checks}, режим {} —",
+            match kind {
+                StartKind::Fresh => "новая задача".to_string(),
+                StartKind::Resume => format!("продолжение с {:.1}%", state.fraction() * 100.0),
+                StartKind::Append => format!(
+                    "дополнение сессии (найденное сохраняется, узлов уже {})",
+                    self.rows.len()
+                ),
             },
-            hosts,
+            state.groups.len(),
             match s.mode {
                 ScanMode::Masscan => "masscan",
                 ScanMode::TcpConnect => "TCP-connect",
             }
         ));
+        for (i, g) in state.groups.iter().enumerate().skip(state.group) {
+            self.push_log(format!("  этап {}: адреса {} × порты {}", i + 1, g.targets, g.ports));
+        }
+
+        let groups = state.groups.clone();
+        let start = state.group;
+        let (skip_hosts, resume_index) = (state.tcp_hosts_done, state.masscan_index);
         self.scan_state = Some(state);
         self.restored = None;
         self.dirty = true;
@@ -739,10 +856,54 @@ impl App {
             if let Some(fut) = reference {
                 tx.send(AppEvent::Reference(fut.await));
             }
-            let result = match plan {
-                Plan::Tcp(cfg) => scan::tcp_connect_scan(cfg, tx.clone(), cancel).await,
-                Plan::Masscan(cfg) => scan::masscan_scan(cfg, tx.clone(), cancel).await,
-            };
+            let n = groups.len();
+            let mut result: Result<String, String> = Ok("обнаружение завершено".into());
+            for (k, g) in groups.iter().enumerate().skip(start) {
+                if cancel.is_cancelled() {
+                    result = Err("остановлено".into());
+                    break;
+                }
+                let (t, p) = match g.parse() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        result = Err(format!("этап {}: {e}", k + 1));
+                        break;
+                    }
+                };
+                tx.send(AppEvent::GroupStarted(k, n));
+                let first = k == start;
+                let r = match &masscan_template {
+                    Some(tpl) => {
+                        let cfg = MasscanConfig {
+                            targets: t,
+                            ports: p,
+                            resume_index: if first { resume_index } else { 0 },
+                            ..tpl.clone()
+                        };
+                        scan::masscan_scan(cfg, tx.clone(), cancel.clone()).await
+                    }
+                    None => {
+                        let cfg = TcpScanConfig {
+                            targets: t,
+                            ports: p,
+                            concurrency: tcp_concurrency,
+                            timeout: tcp_timeout,
+                            skip_hosts: if first { skip_hosts } else { 0 },
+                        };
+                        scan::tcp_connect_scan(cfg, tx.clone(), cancel.clone()).await
+                    }
+                };
+                match r {
+                    Ok(m) => {
+                        tx.log(if n > 1 { format!("этап {}/{n}: {m}", k + 1) } else { m });
+                        tx.send(AppEvent::GroupDone(k));
+                    }
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
             tx.send(AppEvent::DiscoveryFinished(result));
         });
         Ok(())
@@ -857,10 +1018,29 @@ impl App {
                         self.dirty = true;
                     }
                 }
+                AppEvent::GroupStarted(k, n) => {
+                    self.stage = (n > 1).then_some((k, n));
+                }
+                AppEvent::GroupDone(k) => {
+                    if let Some(st) = &mut self.scan_state
+                        && let Some(c) = st.group_done(k)
+                        && !self.coverage.contains(&c)
+                    {
+                        self.coverage.push(c);
+                    }
+                    self.dirty = true;
+                }
                 AppEvent::Progress(p, text) => {
                     if self.job.as_ref().is_some_and(|j| !j.discovery_done) {
-                        self.progress = p;
-                        self.status = text;
+                        self.progress = self
+                            .scan_state
+                            .as_ref()
+                            .map(|st| st.fraction_with(p))
+                            .unwrap_or(p);
+                        self.status = match self.stage {
+                            Some((k, n)) => format!("Этап {}/{n} · {text}", k + 1),
+                            None => text,
+                        };
                     }
                 }
                 AppEvent::Reference(r) => {
@@ -926,7 +1106,10 @@ impl App {
                     if let Some(job) = &mut self.job {
                         job.discovery_done = true;
                         let completed = r.is_ok() && !job.cancel.is_cancelled() && job.probe_only.is_none();
-                        if completed && let Some(st) = &mut self.scan_state {
+                        if completed
+                            && let Some(st) = &mut self.scan_state
+                            && st.group >= st.groups.len()
+                        {
                             st.finished = true;
                         }
                     }
@@ -961,7 +1144,11 @@ impl App {
                     " · можно продолжить с {:.1}%",
                     st.fraction() * 100.0
                 ));
+            } else if job.probe_only.is_none() {
+                self.status
+                    .push_str(" · чтобы досканировать, измените порты или цели и нажмите «Дополнить»");
             }
+            self.stage = None;
             self.push_log(self.status.clone());
             self.progress = 1.0;
             self.job = None;
@@ -1470,50 +1657,80 @@ impl App {
             });
 
         ui.add_space(8.0);
+        // Есть ли в сессии что дополнять.
+        let has_session = !self.rows.is_empty()
+            || !self.coverage.is_empty()
+            || self.scan_state.as_ref().is_some_and(|st| st.has_progress());
+        let estimate = if has_session && !busy { Some(self.append_estimate()) } else { None };
+        let big = |text: String| egui::Button::new(RichText::new(text).strong()).min_size([130.0, 28.0].into());
         ui.horizontal_wrapped(|ui| {
             if busy {
-                if ui
-                    .add(egui::Button::new(RichText::new("■ Остановить").strong()).min_size([130.0, 28.0].into()))
-                    .clicked()
-                {
+                if ui.add(big("■ Остановить".into())).clicked() {
                     self.stop();
                 }
                 ui.spinner();
-            } else if self.can_resume() {
+                return;
+            }
+            if self.can_resume() {
                 let pct = self.scan_state.as_ref().map(|s| s.fraction() * 100.0).unwrap_or(0.0);
                 if ui
-                    .add(
-                        egui::Button::new(RichText::new(format!("⏵ Продолжить ({pct:.0}%)")).strong())
-                            .min_size([130.0, 28.0].into()),
-                    )
-                    .on_hover_text("Продолжить обнаружение с места остановки")
+                    .add(big(format!("⏵ Продолжить ({pct:.0}%)")))
+                    .on_hover_text("Продолжить обнаружение с места остановки с теми же параметрами")
                     .clicked()
                 {
-                    self.start_scan(&ctx, true);
+                    self.start_scan(&ctx, StartKind::Resume);
+                }
+            }
+            if has_session {
+                let can_append = matches!(estimate, Some(Ok((n, _))) if n > 0);
+                let resp = ui.add_enabled(can_append, if self.can_resume() {
+                    egui::Button::new("➕ Дополнить")
+                } else {
+                    big("➕ Дополнить".into())
+                });
+                let resp = resp.on_hover_text(
+                    "Сканировать с текущими параметрами, сохранив всё найденное в этой сессии.\n\
+                     Уже проверенные адреса × порты пропускаются — добавьте порты или подсети,\n\
+                     можно сменить режим, скорость и другие параметры.",
+                );
+                if resp.clicked() {
+                    self.start_scan(&ctx, StartKind::Append);
                 }
                 if ui
                     .button("▶ Заново")
-                    .on_hover_text("Начать сканирование с начала (текущие результаты будут очищены)")
+                    .on_hover_text("Начать с чистого листа (текущие результаты уйдут в архив сессий)")
                     .clicked()
                 {
                     self.request_new_scan(&ctx);
                 }
-            } else {
-                if ui
-                    .add(egui::Button::new(RichText::new("▶ Сканировать").strong()).min_size([130.0, 28.0].into()))
-                    .clicked()
-                {
-                    self.request_new_scan(&ctx);
-                }
-                if ui
-                    .add_enabled(!self.rows.is_empty(), egui::Button::new("Перепроверить все"))
-                    .on_hover_text("Повторить диагностику найденных узлов без нового сканирования")
-                    .clicked()
-                {
-                    self.start_reprobe(&ctx, None);
-                }
+            } else if ui.add(big("▶ Сканировать".into())).clicked() {
+                self.request_new_scan(&ctx);
+            }
+            if ui
+                .add_enabled(!self.rows.is_empty(), egui::Button::new("Перепроверить все"))
+                .on_hover_text("Повторить диагностику найденных узлов без нового сканирования")
+                .clicked()
+            {
+                self.start_reprobe(&ctx, None);
             }
         });
+        if let Some(est) = estimate {
+            match est {
+                Ok((0, _)) => {
+                    ui.weak("«Дополнить»: всё по текущим параметрам уже проверено — добавьте порты или подсети.");
+                }
+                Ok((n, total)) if n < total => {
+                    ui.weak(format!(
+                        "«Дополнить»: {n} новых проверок из {total} — {} уже проверено, найденное сохранится.",
+                        total - n
+                    ));
+                }
+                Ok((n, _)) => {
+                    ui.weak(format!("«Дополнить»: {n} проверок, найденное сохранится."));
+                }
+                Err(_) => {}
+            }
+        }
         ui.add_space(4.0);
     }
 
@@ -1726,7 +1943,7 @@ impl App {
                 });
             });
         if resume {
-            self.start_scan(&ctx, true);
+            self.start_scan(&ctx, StartKind::Resume);
         }
         if dismiss {
             self.restored = None;

@@ -10,10 +10,90 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ProxyRow, ScanMode, Settings};
+use crate::targets::{TargetSet, parse_ports, parse_targets, ports_to_masscan};
 
 pub const FILE_NAME: &str = "proxy-scanner-session.json";
 const FORMAT: &str = "proxy-scanner-session";
 const VERSION: u32 = 1;
+
+/// Проверенная часть пространства «адрес × порт»: эти адреса проверены по этим портам.
+/// Адреса и порты хранятся в формате masscan (`10.0.0.0-10.0.0.255`, `80,8000-8100`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Coverage {
+    pub targets: String,
+    pub ports: String,
+}
+
+/// Этап сканирования: адреса × порты.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanGroup {
+    pub targets: String,
+    pub ports: String,
+    pub hosts: u64,
+    pub nports: u64,
+}
+
+impl ScanGroup {
+    pub fn new(targets: &TargetSet, ports: &[u16]) -> Self {
+        Self {
+            targets: targets.to_masscan_arg(),
+            ports: ports_to_masscan(ports),
+            hosts: targets.total_hosts(),
+            nports: ports.len() as u64,
+        }
+    }
+
+    pub fn checks(&self) -> u64 {
+        self.hosts * self.nports
+    }
+
+    pub fn parse(&self) -> Result<(TargetSet, Vec<u16>), String> {
+        Ok((parse_targets(&self.targets)?, parse_ports(&self.ports)?))
+    }
+
+    pub fn coverage(&self) -> Coverage {
+        Coverage { targets: self.targets.clone(), ports: self.ports.clone() }
+    }
+}
+
+/// Что ещё нужно проверить: запрошенные адреса × порты минус уже проверенное.
+/// Порты с одинаковым набором непроверенных адресов объединяются в один этап.
+pub fn plan(targets: &TargetSet, ports: &[u16], coverage: &[Coverage]) -> Vec<ScanGroup> {
+    let covered: Vec<(TargetSet, std::collections::HashSet<u16>)> = coverage
+        .iter()
+        .filter_map(|c| {
+            Some((
+                parse_targets(&c.targets).ok()?,
+                parse_ports(&c.ports).ok()?.into_iter().collect(),
+            ))
+        })
+        .collect();
+    let requested = targets.normalized();
+    // Ключ — непроверенные адреса; порядок этапов — по первому порту.
+    let mut groups: Vec<(TargetSet, Vec<u16>)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for &p in ports {
+        let mut done = TargetSet::default();
+        for (t, ps) in &covered {
+            if ps.contains(&p) {
+                done.ranges.extend(t.ranges.iter().copied());
+            }
+        }
+        let left = requested.subtract(&done);
+        if left.is_empty() {
+            continue;
+        }
+        let key = left.to_masscan_arg();
+        match index.get(&key) {
+            Some(&i) => groups[i].1.push(p),
+            None => {
+                index.insert(key, groups.len());
+                groups.push((left, vec![p]));
+            }
+        }
+    }
+    groups.iter().map(|(t, ps)| ScanGroup::new(t, ps)).collect()
+}
 
 /// Состояние обнаружения портов для продолжения.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -25,26 +105,68 @@ pub struct ScanState {
     pub total_hosts: u64,
     pub total_ports: u64,
     pub finished: bool,
-    /// TCP-connect: число первых адресов, проверенных по всем портам.
+    /// Этапы сканирования (запрошенное минус уже проверенное).
+    #[serde(default)]
+    pub groups: Vec<ScanGroup>,
+    /// Текущий этап.
+    #[serde(default)]
+    pub group: usize,
+    /// TCP-connect: число первых адресов текущего этапа, проверенных по всем его портам.
     pub tcp_hosts_done: u64,
     /// masscan: зерно псевдослучайного порядка (`--seed`).
     pub masscan_seed: u64,
-    /// masscan: индекс, с которого продолжать (`--resume-index`).
+    /// masscan: индекс в текущем этапе, с которого продолжать (`--resume-index`).
     pub masscan_index: u64,
 }
 
 impl ScanState {
-    pub fn new(settings: &Settings, total_hosts: u64, total_ports: u64, seed: u64) -> Self {
+    pub fn new(settings: &Settings, groups: Vec<ScanGroup>, seed: u64) -> Self {
+        let (total_hosts, total_ports) = match (
+            parse_targets(&settings.targets),
+            parse_ports(&settings.ports),
+        ) {
+            (Ok(t), Ok(p)) => (t.total_hosts(), p.len() as u64),
+            _ => (0, 0),
+        };
         Self {
             mode: settings.mode,
             targets: settings.targets.trim().to_string(),
             ports: settings.ports.trim().to_string(),
             total_hosts,
             total_ports,
-            finished: false,
+            finished: groups.is_empty(),
+            groups,
+            group: 0,
             tcp_hosts_done: 0,
             masscan_seed: seed,
             masscan_index: 0,
+        }
+    }
+
+    /// Состояние из старых версий (без этапов): один этап на все цели и порты.
+    pub fn ensure_groups(&mut self) {
+        if self.groups.is_empty()
+            && let (Ok(t), Ok(p)) = (parse_targets(&self.targets), parse_ports(&self.ports))
+        {
+            // Старые версии обходили цели в исходном порядке — его и сохраняем.
+            self.groups = vec![ScanGroup::new(&t, &p)];
+        }
+    }
+
+    pub fn current(&self) -> Option<&ScanGroup> {
+        self.groups.get(self.group)
+    }
+
+    pub fn total_checks(&self) -> u64 {
+        self.groups.iter().map(ScanGroup::checks).sum()
+    }
+
+    /// Проверено в текущем этапе (по контрольной точке).
+    fn current_done(&self) -> u64 {
+        let Some(g) = self.current() else { return 0 };
+        match self.mode {
+            ScanMode::TcpConnect => (self.tcp_hosts_done * g.nports).min(g.checks()),
+            ScanMode::Masscan => self.masscan_index.min(g.checks()),
         }
     }
 
@@ -53,20 +175,63 @@ impl ScanState {
         if self.finished {
             return 1.0;
         }
-        let f = match self.mode {
-            ScanMode::TcpConnect => self.tcp_hosts_done as f64 / self.total_hosts.max(1) as f64,
-            ScanMode::Masscan => {
-                self.masscan_index as f64 / (self.total_hosts * self.total_ports).max(1) as f64
-            }
-        };
-        f.clamp(0.0, 1.0) as f32
+        let total = self.total_checks();
+        if total == 0 {
+            return 0.0;
+        }
+        let before: u64 = self.groups.iter().take(self.group).map(ScanGroup::checks).sum();
+        ((before + self.current_done()) as f64 / total as f64).clamp(0.0, 1.0) as f32
+    }
+
+    /// Доля при прогрессе `p` (0..=1) внутри текущего этапа.
+    pub fn fraction_with(&self, p: f32) -> f32 {
+        let total = self.total_checks().max(1);
+        let before: u64 = self.groups.iter().take(self.group).map(ScanGroup::checks).sum();
+        let cur = self.current().map(ScanGroup::checks).unwrap_or(0) as f64 * p.clamp(0.0, 1.0) as f64;
+        ((before as f64 + cur) / total as f64).clamp(0.0, 1.0) as f32
     }
 
     pub fn has_progress(&self) -> bool {
-        match self.mode {
-            ScanMode::TcpConnect => self.tcp_hosts_done > 0,
-            ScanMode::Masscan => self.masscan_index > 0,
+        self.group > 0
+            || match self.mode {
+                ScanMode::TcpConnect => self.tcp_hosts_done > 0,
+                ScanMode::Masscan => self.masscan_index > 0,
+            }
+    }
+
+    /// Этап `k` завершён: переходим к следующему.
+    pub fn group_done(&mut self, k: usize) -> Option<Coverage> {
+        if k != self.group {
+            return None;
         }
+        let cov = self.groups.get(k).map(ScanGroup::coverage);
+        self.group += 1;
+        self.tcp_hosts_done = 0;
+        self.masscan_index = 0;
+        if self.group >= self.groups.len() {
+            self.finished = true;
+        }
+        cov
+    }
+
+    /// Что уже проверено в незавершённом сканировании (для «Дополнить»):
+    /// завершённые этапы и, для TCP-connect, первые адреса текущего этапа.
+    /// Для masscan частичный прогресс текущего этапа не учитывается — порядок обхода случайный.
+    pub fn partial_coverage(&self) -> Vec<Coverage> {
+        let mut out: Vec<Coverage> =
+            self.groups.iter().take(self.group).map(ScanGroup::coverage).collect();
+        if !self.finished
+            && self.mode == ScanMode::TcpConnect
+            && self.tcp_hosts_done > 0
+            && let Some(g) = self.current()
+            && let Ok((t, _)) = g.parse()
+        {
+            out.push(Coverage {
+                targets: t.take_first(self.tcp_hosts_done).to_masscan_arg(),
+                ports: g.ports.clone(),
+            });
+        }
+        out
     }
 
     /// Можно ли продолжить это сканирование с текущими настройками.
@@ -89,6 +254,9 @@ pub struct Session {
     pub settings: Settings,
     pub scan: Option<ScanState>,
     pub rows: Vec<ProxyRow>,
+    /// Уже проверенные адреса × порты всех сканирований этой сессии.
+    #[serde(default)]
+    pub coverage: Vec<Coverage>,
 }
 
 impl Session {
@@ -101,6 +269,7 @@ impl Session {
             settings: settings.clone(),
             scan,
             rows,
+            coverage: Vec::new(),
         }
     }
 
@@ -330,10 +499,17 @@ mod tests {
         }
     }
 
+    /// Состояние «всё запрошенное — один этап».
+    fn whole(s: &Settings, seed: u64) -> ScanState {
+        let t = parse_targets(&s.targets).unwrap();
+        let p = parse_ports(&s.ports).unwrap();
+        ScanState::new(s, plan(&t, &p, &[]), seed)
+    }
+
     #[test]
     fn roundtrip_without_password() {
         let s = settings();
-        let mut state = ScanState::new(&s, 256, 2, 42);
+        let mut state = whole(&s, 42);
         state.tcp_hosts_done = 64;
         let mut row = ProxyRow::new(Ipv4Addr::new(10, 0, 0, 5), 3128, "tcp-connect");
         row.kind = ProxyKind::HttpProxy;
@@ -369,7 +545,7 @@ mod tests {
     #[test]
     fn resumable_and_fraction() {
         let s = settings();
-        let mut st = ScanState::new(&s, 256, 2, 1);
+        let mut st = whole(&s, 1);
         assert!(st.resumable_with(&s));
         assert!(!st.has_progress());
         st.tcp_hosts_done = 128;
@@ -383,9 +559,76 @@ mod tests {
 
         let mut m = s.clone();
         m.mode = ScanMode::Masscan;
-        let mut ms = ScanState::new(&m, 256, 2, 7);
+        let mut ms = whole(&m, 7);
         ms.masscan_index = 128;
         assert!((ms.fraction() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn plan_skips_checked_ports_and_targets() {
+        let t = parse_targets("10.0.0.0/24").unwrap();
+        let first = parse_ports("80,3128,8080").unwrap();
+        let cov = vec![plan(&t, &first, &[])[0].coverage()];
+
+        // Те же адреса, больше портов → только новые порты.
+        let more = parse_ports("80,443,3128,8080,9090").unwrap();
+        let g = plan(&t, &more, &cov);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].ports, "443,9090");
+        assert_eq!(g[0].checks(), 256 * 2);
+
+        // Шире подсеть, те же порты → только новые адреса.
+        let wide = parse_targets("10.0.0.0/23").unwrap();
+        let g = plan(&wide, &first, &cov);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].targets, "10.0.1.0-10.0.1.255");
+
+        // И то и другое → два этапа: новые адреса × старые порты, все адреса × новые порты.
+        let g = plan(&wide, &more, &cov);
+        assert_eq!(g.len(), 2);
+        let total: u64 = g.iter().map(ScanGroup::checks).sum();
+        assert_eq!(total, 512 * 5 - 256 * 3);
+
+        // Всё уже проверено.
+        assert!(plan(&t, &first, &cov).is_empty());
+    }
+
+    #[test]
+    fn groups_progress_and_partial_coverage() {
+        let s = settings();
+        let t = parse_targets("10.0.0.0/23").unwrap();
+        let p = parse_ports("80,3128").unwrap();
+        let cov = vec![Coverage { targets: "10.0.0.0-10.0.0.255".into(), ports: "80".into() }];
+        let mut st = ScanState::new(&s, plan(&t, &p, &cov), 1);
+        // этап 1: 10.0.1.0/24 × 80 (256); этап 2: 10.0.0.0/23 × 3128 (512)
+        assert_eq!(st.groups.len(), 2);
+        assert_eq!(st.total_checks(), 768);
+        st.tcp_hosts_done = 128;
+        assert!((st.fraction() - 128.0 / 768.0).abs() < 1e-6);
+        let part = st.partial_coverage();
+        assert_eq!(part, vec![Coverage { targets: "10.0.1.0-10.0.1.127".into(), ports: "80".into() }]);
+
+        let done = st.group_done(0).unwrap();
+        assert_eq!(done.ports, "80");
+        assert_eq!(st.tcp_hosts_done, 0);
+        assert!(!st.finished);
+        assert!((st.fraction() - 256.0 / 768.0).abs() < 1e-6);
+        assert!((st.fraction_with(0.5) - 512.0 / 768.0).abs() < 1e-6);
+        st.group_done(1);
+        assert!(st.finished);
+        assert_eq!(st.fraction(), 1.0);
+    }
+
+    #[test]
+    fn legacy_state_gets_single_group() {
+        let json = r#"{"mode":"TcpConnect","targets":"10.0.0.0/24","ports":"80,3128","total_hosts":256,
+            "total_ports":2,"finished":false,"tcp_hosts_done":10,"masscan_seed":1,"masscan_index":0}"#;
+        let mut st: ScanState = serde_json::from_str(json).unwrap();
+        assert!(st.groups.is_empty());
+        st.ensure_groups();
+        assert_eq!(st.groups.len(), 1);
+        assert_eq!(st.groups[0].checks(), 512);
+        assert!(st.has_progress());
     }
 
     #[test]

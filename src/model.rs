@@ -307,6 +307,10 @@ pub enum AppEvent {
     Reference(Result<CertInfo, String>),
     /// Контрольная точка для продолжения прерванного сканирования.
     Checkpoint(Checkpoint),
+    /// Начат этап сканирования `k` из `n`.
+    GroupStarted(usize, usize),
+    /// Этап `k` завершён полностью.
+    GroupDone(usize),
     /// Этап обнаружения завершён.
     DiscoveryFinished(Result<String, String>),
 }
