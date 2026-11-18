@@ -633,7 +633,13 @@ impl App {
             reference: None,
             policy,
             block_marker: s.block_marker.trim().to_string(),
-            proxy_auth: probe::basic_auth(s.proxy_user.trim(), &s.proxy_pass),
+            creds: crate::auth::Credentials {
+                mode: s.auth_mode,
+                current_user: s.auth_current_user,
+                user: s.proxy_user.trim().to_string(),
+                password: s.proxy_pass.clone(),
+                domain: s.proxy_domain.trim().to_string(),
+            },
             retries: s.probe_retries.min(10),
             badcert_hosts: if s.inspect_quality {
                 probe::parse_host_list(&s.badcert_hosts, 443)
@@ -1717,15 +1723,44 @@ impl App {
                      (если прокси отдаёт её с кодом 200).",
                 );
                 ui.add(egui::TextEdit::singleline(&mut s.block_marker).desired_width(f32::INFINITY));
+                ui.add_space(4.0);
+                ui.strong("Аутентификация на прокси");
+                egui::ComboBox::from_id_salt("auth_mode")
+                    .selected_text(s.auth_mode.label())
+                    .show_ui(ui, |ui| {
+                        for &m in crate::auth::AuthMode::ALL {
+                            ui.selectable_value(&mut s.auth_mode, m, m.label());
+                        }
+                    });
+                if cfg!(windows) {
+                    ui.checkbox(&mut s.auth_current_user, "Под текущим пользователем Windows (без пароля)")
+                        .on_hover_text(
+                            "Kerberos/NTLM от имени вошедшего пользователя — как браузер.\n\
+                             Если указать логин и пароль ниже, будут использоваться они.",
+                        );
+                } else {
+                    ui.weak("В Linux доступны NTLM и Basic с логином и паролем; Kerberos — только в Windows.");
+                }
                 egui::Grid::new("probe_grid").num_columns(2).show(ui, |ui| {
-                    ui.label("Учётная запись (Basic)");
-                    ui.add(egui::TextEdit::singleline(&mut s.proxy_user).desired_width(140.0));
+                    ui.label("Пользователь").on_hover_text("ivan, CORP\\ivan или ivan@corp.local");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut s.proxy_user)
+                            .desired_width(160.0)
+                            .hint_text("CORP\\ivan"),
+                    );
                     ui.end_row();
-                    ui.label("Пароль");
+                    ui.label("Домен");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut s.proxy_domain)
+                            .desired_width(160.0)
+                            .hint_text("необязательно"),
+                    );
+                    ui.end_row();
+                    ui.label("Пароль").on_hover_text("На диск не сохраняется");
                     ui.add(
                         egui::TextEdit::singleline(&mut s.proxy_pass)
                             .password(true)
-                            .desired_width(140.0),
+                            .desired_width(160.0),
                     );
                     ui.end_row();
                     ui.label("Параллельных проверок");
@@ -1895,6 +1930,10 @@ impl App {
                 kv("Сервер", p.server.clone());
                 kv("Via", p.via.clone());
                 kv("Аутентификация", row.auth_label());
+                if !p.auth.is_empty() {
+                    kv("Схемы прокси", p.auth.join(", "));
+                }
+                kv("Вход", p.auth_used.clone().unwrap_or_default());
                 kv("CONNECT", row.connect_label());
                 kv("SSL-инспекция", row.ssl.label().to_string());
                 kv("Ошибка", p.error.clone().unwrap_or_default());

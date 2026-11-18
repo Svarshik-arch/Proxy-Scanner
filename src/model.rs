@@ -59,6 +59,11 @@ pub struct Settings {
     pub egress_dns: String,
     pub egress_domain: String,
     pub egress_timeout_ms: u64,
+    /// Режим аутентификации на прокси.
+    pub auth_mode: crate::auth::AuthMode,
+    /// Windows: входить под текущим пользователем (Kerberos/NTLM без пароля).
+    pub auth_current_user: bool,
+    pub proxy_domain: String,
     pub proxy_user: String,
     #[serde(skip)]
     pub proxy_pass: String,
@@ -97,6 +102,9 @@ impl Default for Settings {
             egress_dns: "8.8.8.8, 1.1.1.1, 77.88.8.8".into(),
             egress_domain: "example.com".into(),
             egress_timeout_ms: 3000,
+            auth_mode: crate::auth::AuthMode::Auto,
+            auth_current_user: true,
+            proxy_domain: String::new(),
             proxy_user: String::new(),
             proxy_pass: String::new(),
         }
@@ -268,6 +276,12 @@ pub struct ProbeResult {
     /// Схемы аутентификации (Basic, NTLM, Negotiate…), пусто — без аутентификации.
     pub auth: Vec<String>,
     pub auth_required: bool,
+    /// Какой схемой и под каким пользователем выполнялась аутентификация.
+    #[serde(default)]
+    pub auth_used: Option<String>,
+    /// Прошла ли аутентификация.
+    #[serde(default)]
+    pub auth_ok: Option<bool>,
     /// Результат CONNECT: `Some(код)`.
     pub connect_status: Option<u16>,
     pub ssl: Option<SslInspection>,
@@ -306,6 +320,10 @@ impl ProxyRow {
     }
 
     pub fn auth_label(&self) -> String {
+        if let (Some(used), Some(ok)) = (&self.probe.auth_used, self.probe.auth_ok) {
+            let scheme = used.split(' ').next().unwrap_or(used);
+            return format!("{scheme} {}", if ok { "✔ вход выполнен" } else { "✖ отказ" });
+        }
         if !self.probe.auth.is_empty() {
             self.probe.auth.join(", ")
         } else if self.probe.auth_required {

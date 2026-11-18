@@ -6,7 +6,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -153,8 +152,8 @@ pub struct ProbeConfig {
     pub reference: Option<CertInfo>,
     pub policy: Vec<PolicyRule>,
     pub block_marker: String,
-    /// Готовое значение заголовка `Proxy-Authorization`.
-    pub proxy_auth: Option<String>,
+    /// Аутентификация на прокси (Basic / NTLM / Negotiate).
+    pub creds: crate::auth::Credentials,
     /// Сколько раз повторять сетевую операцию при сбое (загруженный прокси
     /// часто отвечает не с первого раза).
     pub retries: u32,
@@ -198,14 +197,6 @@ fn transient(e: &str) -> bool {
 /// Пауза перед повтором: 300 мс, 600 мс, 900 мс…
 async fn backoff(attempt: u32) {
     tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
-}
-
-pub fn basic_auth(user: &str, pass: &str) -> Option<String> {
-    if user.is_empty() {
-        return None;
-    }
-    let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
-    Some(format!("Basic {token}"))
 }
 
 pub fn normalize_fp(s: &str) -> String {
@@ -360,6 +351,175 @@ fn connect_request(host: &str, port: u16, proxy_auth: Option<&str>) -> String {
     }
     r.push_str("Proxy-Connection: keep-alive\r\n\r\n");
     r
+}
+
+/// Запрос к прокси: обычный (абсолютный URI) или туннель CONNECT.
+#[derive(Clone, Copy)]
+enum Req<'a> {
+    Get(&'a Url),
+    Connect(&'a str, u16),
+}
+
+fn build_request(req: Req<'_>, auth: Option<&str>) -> String {
+    match req {
+        Req::Get(url) => {
+            let mut r = format!(
+                "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\n",
+                url.absolute(),
+                url.host_header()
+            );
+            if let Some(a) = auth {
+                r.push_str(&format!("Proxy-Authorization: {a}\r\n"));
+            }
+            // keep-alive нужен для NTLM/Negotiate: обмен токенами идёт в одном соединении.
+            r.push_str("Proxy-Connection: keep-alive\r\n\r\n");
+            r
+        }
+        Req::Connect(host, port) => connect_request(host, port, auth),
+    }
+}
+
+/// Отправка запроса и чтение ответа. Тело ответа 407 вычитывается полностью,
+/// чтобы следующий шаг аутентификации шёл по тому же соединению.
+async fn exchange(
+    s: &mut TcpStream,
+    request: &str,
+    timeout: Duration,
+    want_body: bool,
+) -> Result<HttpResp, String> {
+    with_timeout(timeout, s.write_all(request.as_bytes())).await?;
+    let head = with_timeout(timeout, read_head(s)).await?;
+    let mut resp = parse_head(&head).ok_or("ответ не является HTTP")?;
+    let is_connect_ok = request.starts_with("CONNECT") && (200..300).contains(&resp.status);
+    let cl = resp.header("Content-Length").and_then(|v| v.trim().parse::<usize>().ok());
+    if resp.status == 407 || (want_body && !is_connect_ok) {
+        let limit = match (resp.status, cl) {
+            (407, Some(n)) => n.min(1 << 20),
+            (407, None) => 0,
+            (_, Some(n)) => n.min(MAX_BODY),
+            (_, None) => MAX_BODY,
+        };
+        let deadline = Instant::now() + timeout.min(Duration::from_millis(1500));
+        let mut buf = [0u8; 4096];
+        while resp.body.len() < limit {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let want = (limit - resp.body.len()).min(buf.len());
+            match tokio::time::timeout(left, s.read(&mut buf[..want])).await {
+                Ok(Ok(n)) if n > 0 => resp.body.extend_from_slice(&buf[..n]),
+                _ => break,
+            }
+        }
+    }
+    Ok(resp)
+}
+
+fn closes(resp: &HttpResp) -> bool {
+    ["Connection", "Proxy-Connection"]
+        .iter()
+        .any(|h| resp.header(h).is_some_and(|v| v.to_ascii_lowercase().contains("close")))
+}
+
+/// Ответ прокси с учётом аутентификации.
+struct ProxyResponse {
+    stream: TcpStream,
+    /// Итоговый ответ (после аутентификации, если она была).
+    resp: HttpResp,
+    /// Первый ответ 407, если прокси потребовал аутентификацию.
+    first: Option<HttpResp>,
+    rtt_ms: u32,
+    /// (схема и пользователь, успешно ли).
+    auth: Option<(String, bool)>,
+}
+
+/// Запрос через прокси с автоматической аутентификацией (Basic, NTLM, Negotiate).
+async fn proxy_request(
+    addr: SocketAddr,
+    req: Req<'_>,
+    cfg: &ProbeConfig,
+    want_body: bool,
+) -> Result<ProxyResponse, String> {
+    use crate::auth::{AuthMode, Scheme};
+    let connect = || async {
+        with_timeout(cfg.timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|e| format!("подключение: {e}"))
+    };
+    let started = Instant::now();
+    let mut s = connect().await?;
+    let rtt_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    let creds = &cfg.creds;
+
+    // Basic отправляем сразу, если выбран явно.
+    let pre_basic = (creds.mode == AuthMode::Basic && creds.has_explicit())
+        .then(|| crate::auth::new_session(Scheme::Basic, creds, ""))
+        .transpose()?
+        .map(|mut sess| sess.step(None))
+        .transpose()?;
+    let resp = exchange(&mut s, &build_request(req, pre_basic.as_deref()), cfg.timeout, want_body).await?;
+    if resp.status != 407 {
+        let auth = pre_basic.map(|_| (Scheme::Basic.describe(creds), true));
+        return Ok(ProxyResponse { stream: s, resp, first: None, rtt_ms, auth });
+    }
+    if pre_basic.is_some() {
+        return Ok(ProxyResponse {
+            stream: s,
+            resp: resp.clone(),
+            first: Some(resp),
+            rtt_ms,
+            auth: Some((Scheme::Basic.describe(creds), false)),
+        });
+    }
+
+    let offered = auth_schemes(&resp);
+    let Some(scheme) = creds.choose(&offered) else {
+        return Ok(ProxyResponse { stream: s, resp: resp.clone(), first: Some(resp), rtt_ms, auth: None });
+    };
+    let desc = scheme.describe(creds);
+    let first = resp.clone();
+    let fail = |stream, r: HttpResp, why: String| ProxyResponse {
+        stream,
+        resp: r,
+        first: Some(first.clone()),
+        rtt_ms,
+        auth: Some((format!("{desc}: {why}"), false)),
+    };
+    let mut session = match crate::auth::new_session(scheme, creds, &addr.ip().to_string()) {
+        Ok(v) => v,
+        Err(e) => return Ok(fail(s, resp, e)),
+    };
+    let mut header = match session.step(None) {
+        Ok(h) => h,
+        Err(e) => return Ok(fail(s, resp, e)),
+    };
+    let mut stream = if closes(&resp) { connect().await? } else { s };
+    for _ in 0..4 {
+        let r = exchange(&mut stream, &build_request(req, Some(&header)), cfg.timeout, want_body).await?;
+        if r.status != 407 {
+            return Ok(ProxyResponse { stream, resp: r, first: Some(first), rtt_ms, auth: Some((desc, true)) });
+        }
+        let token = r.headers_all("Proxy-Authenticate").find_map(|v| {
+            let (name, tok) = v.trim().split_once(' ')?;
+            name.eq_ignore_ascii_case(scheme.header_name())
+                .then(|| crate::auth::b64_decode(tok))
+                .flatten()
+        });
+        match token {
+            Some(t) if scheme != Scheme::Basic => {
+                header = match session.step(Some(&t)) {
+                    Ok(h) => h,
+                    Err(e) => return Ok(fail(stream, r, e)),
+                };
+                if closes(&r) {
+                    stream = connect().await?;
+                }
+            }
+            _ => return Ok(fail(stream, r, "учётные данные отклонены".into())),
+        }
+    }
+    Err(format!("{desc}: слишком много шагов аутентификации"))
 }
 
 /// Схемы из заголовков `Proxy-Authenticate` / `WWW-Authenticate`.
@@ -696,16 +856,13 @@ async fn check_policy_rule(addr: SocketAddr, rule: &PolicyRule, cfg: &ProbeConfi
 }
 
 async fn check_policy_rule_once(addr: SocketAddr, rule: &PolicyRule, cfg: &ProbeConfig) -> PolicyResult {
-    let auth = cfg.proxy_auth.as_deref();
     let outcome: Result<(PolicyVerdict, String), String> = async {
-        let mut s = with_timeout(cfg.timeout, TcpStream::connect(addr)).await?;
         if !rule.url.https {
-            let req = get_request(&rule.url.absolute(), &rule.url.host_header(), auth);
-            let resp = http_exchange(&mut s, &req, cfg.timeout, true).await?;
-            return Ok(classify_policy(&resp, &cfg.block_marker));
+            let pr = proxy_request(addr, Req::Get(&rule.url), cfg, true).await?;
+            return Ok(classify_policy(&pr.resp, &cfg.block_marker));
         }
-        let req = connect_request(&rule.url.host, rule.url.port, auth);
-        let resp = http_exchange(&mut s, &req, cfg.timeout, false).await?;
+        let pr = proxy_request(addr, Req::Connect(&rule.url.host, rule.url.port), cfg, false).await?;
+        let (s, resp) = (pr.stream, pr.resp);
         if !(200..300).contains(&resp.status) {
             let (v, d) = classify_policy(&resp, &cfg.block_marker);
             return Ok((v, format!("CONNECT: {d}")));
@@ -783,9 +940,8 @@ async fn check_bad_cert_once(
     cfg: &ProbeConfig,
 ) -> (InspectVerdict, String) {
     let r: Result<(InspectVerdict, String), String> = async {
-        let mut s = with_timeout(cfg.timeout, TcpStream::connect(addr)).await?;
-        let req = connect_request(host, port, cfg.proxy_auth.as_deref());
-        let resp = http_exchange(&mut s, &req, cfg.timeout, false).await?;
+        let pr = proxy_request(addr, Req::Connect(host, port), cfg, false).await?;
+        let (s, resp) = (pr.stream, pr.resp);
         match resp.status {
             200..=299 => {}
             502..=504 => {
@@ -840,35 +996,19 @@ async fn check_bad_cert_once(
 pub async fn probe_endpoint(ip: Ipv4Addr, port: u16, cfg: &ProbeConfig) -> ProbeResult {
     let addr = SocketAddr::from((ip, port));
     let mut res = ProbeResult::default();
-    let auth = cfg.proxy_auth.as_deref();
 
     // 1–2. Подключение и HTTP-запрос с абсолютным URI (так обращаются к прокси).
     //      При сбое повторяем: загруженный прокси отвечает не с первого раза.
-    let req = get_request(&cfg.test_url.absolute(), &cfg.test_url.host_header(), auth);
     let mut attempt = 0;
     let http = loop {
-        let started = Instant::now();
-        let mut stream = match with_timeout(cfg.timeout, TcpStream::connect(addr)).await {
-            Ok(s) => s,
-            Err(e) if attempt < cfg.retries => {
-                attempt += 1;
-                backoff(attempt).await;
-                let _ = e;
-                continue;
-            }
-            Err(e) => {
-                res.error = Some(format!("подключение: {e} (попыток: {})", attempt + 1));
-                return res;
-            }
-        };
-        if res.rtt_ms.is_none() {
-            res.rtt_ms = Some(started.elapsed().as_millis().min(u32::MAX as u128) as u32);
-        }
-        let r = http_exchange(&mut stream, &req, cfg.timeout, false).await;
-        match r {
+        match proxy_request(addr, Req::Get(&cfg.test_url), cfg, false).await {
             Err(e) if transient(&e) && attempt < cfg.retries => {
                 attempt += 1;
                 backoff(attempt).await;
+            }
+            Err(e) if e.starts_with("подключение:") => {
+                res.error = Some(format!("{e} (попыток: {})", attempt + 1));
+                return res;
             }
             other => break other,
         }
@@ -878,18 +1018,30 @@ pub async fn probe_endpoint(ip: Ipv4Addr, port: u16, cfg: &ProbeConfig) -> Probe
     }
 
     match http {
-        Ok(resp) => {
+        Ok(pr) => {
+            let resp = pr.resp;
+            let first = pr.first.unwrap_or_else(|| resp.clone());
+            res.rtt_ms = Some(pr.rtt_ms);
             res.http_status = Some(resp.status);
-            res.raw_headers = resp.head.clone();
+            res.raw_headers = first.head.clone();
+            if pr.auth.is_some() {
+                res.raw_headers
+                    .push_str(&format!("\n\n--- после аутентификации ---\n{}", resp.head));
+            }
             res.server = resp
                 .header("Server")
                 .or_else(|| resp.header("Proxy-Agent"))
+                .or_else(|| first.header("Server"))
                 .unwrap_or("")
                 .to_string();
-            res.via = resp.header("Via").unwrap_or("").to_string();
-            res.auth = auth_schemes(&resp);
-            res.auth_required = resp.status == 407;
-            let mut is_proxy = resp.status == 407 || has_proxy_headers(&resp);
+            res.via = resp.header("Via").or_else(|| first.header("Via")).unwrap_or("").to_string();
+            res.auth = auth_schemes(&first);
+            res.auth_required = first.status == 407;
+            if let Some((who, ok)) = pr.auth {
+                res.auth_used = Some(who);
+                res.auth_ok = Some(ok);
+            }
+            let mut is_proxy = first.status == 407 || has_proxy_headers(&resp) || has_proxy_headers(&first);
             if matches!(resp.status, 502 | 504) {
                 is_proxy = true;
                 res.notes.push(format!(
@@ -960,28 +1112,36 @@ pub async fn probe_endpoint(ip: Ipv4Addr, port: u16, cfg: &ProbeConfig) -> Probe
 
 /// CONNECT к тестовому TLS-узлу; при успехе — чтение сертификата. Возвращает код ответа.
 async fn probe_connect(addr: SocketAddr, cfg: &ProbeConfig, res: &mut ProbeResult) -> Result<u16, String> {
-    let mut s = with_timeout(cfg.timeout, TcpStream::connect(addr)).await?;
-    let req = connect_request(&cfg.tls_host, cfg.tls_port, cfg.proxy_auth.as_deref());
-    let resp = http_exchange(&mut s, &req, cfg.timeout, false).await?;
-    res.connect_status = Some(resp.status);
-    if resp.status == 407 {
+    let pr = proxy_request(addr, Req::Connect(&cfg.tls_host, cfg.tls_port), cfg, false).await?;
+    let first_status = pr.first.as_ref().map_or(pr.resp.status, |f| f.status);
+    res.connect_status = Some(pr.resp.status);
+    if let Some(first) = &pr.first {
         res.auth_required = true;
-        for scheme in auth_schemes(&resp) {
+        for scheme in auth_schemes(first) {
             if !res.auth.iter().any(|a| a.eq_ignore_ascii_case(&scheme)) {
                 res.auth.push(scheme);
             }
         }
     }
+    if let Some((who, ok)) = &pr.auth
+        && res.auth_used.is_none()
+    {
+        res.auth_used = Some(who.clone());
+        res.auth_ok = Some(*ok);
+    }
+    let block = format!("\n\n--- CONNECT {}:{} ---\n{}", cfg.tls_host, cfg.tls_port, pr.resp.head);
     if res.raw_headers.is_empty() {
-        res.raw_headers = resp.head.clone();
+        res.raw_headers = pr.resp.head.clone();
     } else {
-        res.raw_headers
-            .push_str(&format!("\n\n--- CONNECT {}:{} ---\n{}", cfg.tls_host, cfg.tls_port, resp.head));
+        res.raw_headers.push_str(&block);
     }
-    if (200..300).contains(&resp.status) {
-        read_cert_through(s, cfg, res).await;
+    let status = pr.resp.status;
+    if (200..300).contains(&status) {
+        read_cert_through(pr.stream, cfg, res).await;
+        return Ok(status);
     }
-    Ok(resp.status)
+    // Если туннель так и не открылся, но прокси требовал аутентификацию — это тоже прокси.
+    Ok(if first_status == 407 { 407 } else { status })
 }
 
 /// TLS-рукопожатие через уже открытый туннель и вывод о SSL-инспекции.
@@ -1096,7 +1256,7 @@ mod tests {
             reference: None,
             policy: parse_policy_rules("+ http://ok.test/\n- http://bad.test/x").unwrap(),
             block_marker: String::new(),
-            proxy_auth: None,
+            creds: crate::auth::Credentials::default(),
             retries: 1,
             badcert_hosts: Vec::new(),
         }
@@ -1346,6 +1506,135 @@ mod tests {
         assert!(!name_matches(&names, "evil.com"));
         assert_eq!(parse_host_list("a.test\n# x\nb.test:8443 # c\n", 443).unwrap(),
             vec![("a.test".to_string(), 443), ("b.test".to_string(), 8443)]);
+    }
+
+    /// Прокси с NTLM: выдаёт вызов и сам проверяет NTLMv2-ответ по паролю `secret`.
+    async fn ntlm_proxy() -> u16 {
+        use crate::auth::{b64_decode, hmac_md5, ntowf_v2};
+        use base64::Engine as _;
+        let b64 = |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(d);
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { break };
+                tokio::spawn(async move {
+                    let server_ch = [9u8; 8];
+                    loop {
+                        let Ok(head) = read_request(&mut s).await else { return };
+                        if head.is_empty() {
+                            return;
+                        }
+                        let auth = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Proxy-Authorization: NTLM "))
+                            .and_then(|t| b64_decode(t.trim()));
+                        let reply: String = match auth {
+                            None => "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM\r\nProxy-Authenticate: Basic realm=\"x\"\r\nContent-Length: 5\r\n\r\ndeny!".into(),
+                            Some(m) if m.get(8) == Some(&1) => {
+                                let mut ch = b"NTLMSSP\0".to_vec();
+                                ch.extend(2u32.to_le_bytes());
+                                ch.extend([0, 0, 0, 0]);
+                                ch.extend(48u32.to_le_bytes());
+                                ch.extend(0x0088_8205u32.to_le_bytes());
+                                ch.extend(server_ch);
+                                ch.extend([0u8; 8]);
+                                let ti = [0u8, 0, 0, 0];
+                                ch.extend((ti.len() as u16).to_le_bytes());
+                                ch.extend((ti.len() as u16).to_le_bytes());
+                                ch.extend(48u32.to_le_bytes());
+                                ch.extend(ti);
+                                format!("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM {}\r\nContent-Length: 0\r\n\r\n", b64(&ch))
+                            }
+                            Some(m) => {
+                                let field = |i: usize| {
+                                    let len = u16::from_le_bytes([m[i], m[i + 1]]) as usize;
+                                    let off = u32::from_le_bytes([m[i + 4], m[i + 5], m[i + 6], m[i + 7]]) as usize;
+                                    m[off..off + len].to_vec()
+                                };
+                                let utf16 = |b: Vec<u8>| {
+                                    String::from_utf16_lossy(&b.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>())
+                                };
+                                let (nt, domain, user) = (field(20), utf16(field(28)), utf16(field(36)));
+                                let ntowf = ntowf_v2(&user, "secret", &domain);
+                                let ok = nt.len() > 16 && hmac_md5(&ntowf, &[&server_ch, &nt[16..]])[..] == nt[..16];
+                                if ok {
+                                    "HTTP/1.1 200 OK\r\nVia: 1.1 ntlm-proxy\r\nContent-Length: 0\r\n\r\n".into()
+                                } else {
+                                    "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM\r\nContent-Length: 0\r\n\r\n".into()
+                                }
+                            }
+                        };
+                        if s.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn ntlm_cfg(password: &str) -> ProbeConfig {
+        let mut c = cfg();
+        c.policy.clear();
+        c.creds = crate::auth::Credentials {
+            mode: crate::auth::AuthMode::Ntlm,
+            current_user: false,
+            user: "CORP\\ivan".into(),
+            password: password.into(),
+            domain: String::new(),
+        };
+        c
+    }
+
+    #[tokio::test]
+    async fn ntlm_authentication_succeeds_and_fails_correctly() {
+        let port = ntlm_proxy().await;
+        let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &ntlm_cfg("secret")).await;
+        assert_eq!(r.kind, Some(ProxyKind::HttpProxy));
+        assert!(r.auth_required);
+        assert_eq!(r.auth_ok, Some(true), "{:?} {:?}", r.auth_used, r.notes);
+        assert_eq!(r.http_status, Some(200));
+        assert!(r.auth_used.as_deref().unwrap().contains("CORP\\ivan"));
+        // CONNECT тоже проходит после NTLM.
+        assert_eq!(r.connect_status, Some(200), "{}", r.raw_headers);
+
+        let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &ntlm_cfg("wrong")).await;
+        assert_eq!(r.auth_ok, Some(false), "{:?}", r.auth_used);
+        assert_eq!(r.http_status, Some(407));
+    }
+
+    #[tokio::test]
+    async fn basic_authentication() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { break };
+                tokio::spawn(async move {
+                    let Ok(head) = read_request(&mut s).await else { return };
+                    // "ivan:pw" в base64
+                    let reply = if head.contains("Proxy-Authorization: Basic aXZhbjpwdw==") {
+                        "HTTP/1.1 200 OK\r\nVia: 1.1 b\r\nContent-Length: 0\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 407 X\r\nProxy-Authenticate: Basic realm=\"r\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let _ = s.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let mut c = cfg();
+        c.policy.clear();
+        c.creds = crate::auth::Credentials {
+            mode: crate::auth::AuthMode::Auto,
+            user: "ivan".into(),
+            password: "pw".into(),
+            ..Default::default()
+        };
+        let r = probe_endpoint(Ipv4Addr::LOCALHOST, port, &c).await;
+        assert_eq!(r.auth_ok, Some(true), "{:?}", r.auth_used);
+        assert_eq!(r.http_status, Some(200));
     }
 
     #[tokio::test]
