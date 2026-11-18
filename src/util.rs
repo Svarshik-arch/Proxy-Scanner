@@ -173,8 +173,19 @@ pub fn npcap_installed() -> bool {
     }
 }
 
-/// Поиск masscan: сначала как указано, затем рядом с исполняемым файлом приложения.
+/// Поиск masscan: как указано, рядом с программой, в PATH; если не найден —
+/// то же для имени по умолчанию этой ОС (например, `masscan64.exe` из
+/// настроек, перенесённых с Windows, на Linux превращается в `masscan`).
 pub fn resolve_masscan(path: &str) -> PathBuf {
+    let found = resolve_in_place(path);
+    if found.is_file() || path.trim() == MASSCAN_DEFAULT {
+        return found;
+    }
+    let fallback = resolve_in_place(MASSCAN_DEFAULT);
+    if fallback.is_file() { fallback } else { found }
+}
+
+fn resolve_in_place(path: &str) -> PathBuf {
     let p = PathBuf::from(path.trim());
     if p.is_absolute() || p.exists() {
         return p;
