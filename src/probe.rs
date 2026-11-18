@@ -1541,17 +1541,40 @@ mod tests {
                         let reply: String = match auth {
                             None => "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM\r\nProxy-Authenticate: Basic realm=\"x\"\r\nContent-Length: 5\r\n\r\ndeny!".into(),
                             Some(m) if m.get(8) == Some(&1) => {
+                                // Полноценный CHALLENGE, как у настоящего сервера (иначе SSPI его отвергает):
+                                // имя домена, AV_PAIR с именами и меткой времени, поле Version.
+                                let u16le = |s: &str| s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>();
+                                let target_name = u16le("CORP");
+                                let mut ti = Vec::new();
+                                for (id, val) in [(2u16, u16le("CORP")), (1, u16le("PROXY")), (4, u16le("corp.local")), (3, u16le("proxy.corp.local"))] {
+                                    ti.extend(id.to_le_bytes());
+                                    ti.extend((val.len() as u16).to_le_bytes());
+                                    ti.extend(val);
+                                }
+                                let ts = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() / 100
+                                    + 116_444_736_000_000_000) as u64;
+                                ti.extend(7u16.to_le_bytes());
+                                ti.extend(8u16.to_le_bytes());
+                                ti.extend(ts.to_le_bytes());
+                                ti.extend([0, 0, 0, 0]);
+                                // UNICODE | REQUEST_TARGET | NTLM | ALWAYS_SIGN | TARGET_TYPE_DOMAIN | ESS
+                                // | TARGET_INFO | VERSION | 128 | 56
+                                let flags: u32 = 0x1 | 0x4 | 0x200 | 0x8000 | 0x1_0000 | 0x8_0000 | 0x80_0000 | 0x200_0000 | 0x2000_0000 | 0x8000_0000;
+                                let name_off = 56u32;
+                                let ti_off = name_off + target_name.len() as u32;
                                 let mut ch = b"NTLMSSP\0".to_vec();
                                 ch.extend(2u32.to_le_bytes());
-                                ch.extend([0, 0, 0, 0]);
-                                ch.extend(48u32.to_le_bytes());
-                                ch.extend(0x0088_8205u32.to_le_bytes());
+                                ch.extend((target_name.len() as u16).to_le_bytes());
+                                ch.extend((target_name.len() as u16).to_le_bytes());
+                                ch.extend(name_off.to_le_bytes());
+                                ch.extend(flags.to_le_bytes());
                                 ch.extend(server_ch);
                                 ch.extend([0u8; 8]);
-                                let ti = [0u8, 0, 0, 0];
                                 ch.extend((ti.len() as u16).to_le_bytes());
                                 ch.extend((ti.len() as u16).to_le_bytes());
-                                ch.extend(48u32.to_le_bytes());
+                                ch.extend(ti_off.to_le_bytes());
+                                ch.extend([10, 0, 0x61, 0x4a, 0, 0, 0, 15]); // Version: Windows 10.0.19041, NTLM rev 15
+                                ch.extend(target_name);
                                 ch.extend(ti);
                                 format!("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: NTLM {}\r\nContent-Length: 0\r\n\r\n", b64(&ch))
                             }

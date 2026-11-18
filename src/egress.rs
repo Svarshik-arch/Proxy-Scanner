@@ -425,7 +425,8 @@ mod tests {
         let (ok, errors) = start_listener(&[port], cancel.clone()).await;
         assert_eq!(ok, vec![port], "{errors:?}");
 
-        let t = Duration::from_secs(2);
+        // Windows при отказе (RST) повторяет попытку около 2 с — даём запас.
+        let t = Duration::from_secs(6);
         let item = check_tcp(Ipv4Addr::LOCALHOST, port, "localhost", t).await;
         assert_eq!(item.status, EgressStatus::Open);
         assert!(item.confirmed, "{item:?}");
