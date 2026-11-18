@@ -970,9 +970,12 @@ impl App {
                 } else {
                     ("masscan (быстрый)", "TCP-connect (встроенный)")
                 };
-                ui.radio_value(&mut self.settings.mode, ScanMode::Masscan, m).on_hover_text(
-                    "Внешний masscan64.exe. Требуются установленный Npcap и права администратора.",
-                );
+                ui.radio_value(&mut self.settings.mode, ScanMode::Masscan, m).on_hover_text(format!(
+                    "Внешний {}. Требуются {} и права «{}».",
+                    util::MASSCAN_DEFAULT,
+                    util::PCAP_NAME,
+                    util::ADMIN_NAME
+                ));
                 ui.radio_value(&mut self.settings.mode, ScanMode::TcpConnect, t).on_hover_text(
                     "Встроенный асинхронный сканер. Не требует драйверов и прав администратора; \
                      подсети до /16.",
@@ -986,9 +989,18 @@ impl App {
                     .on_hover_text(hint);
             };
             if self.is_admin {
-                badge(ui, true, "администратор", "Программа запущена от имени администратора");
+                badge(ui, true, util::ADMIN_NAME, "Программа запущена с повышенными правами");
             } else {
-                badge(ui, false, "обычный пользователь", "Для режима masscan нужны права администратора");
+                badge(
+                    ui,
+                    false,
+                    "обычный пользователь",
+                    if cfg!(windows) {
+                        "Для режима masscan нужны права администратора"
+                    } else {
+                        "Для режима masscan запустите программу через sudo (или дайте masscan CAP_NET_RAW)"
+                    },
+                );
                 if cfg!(windows)
                     && ui
                         .small_button(if narrow { "⛨" } else { "Перезапустить от имени администратора" })
@@ -1002,12 +1014,17 @@ impl App {
                     }
                 }
             }
-            badge(
-                ui,
-                self.npcap,
-                if self.npcap { "Npcap" } else { "Npcap не найден" },
-                if self.npcap { "Npcap установлен" } else { "Npcap не найден: режим masscan недоступен" },
-            );
+            let pcap_text = if self.npcap {
+                util::PCAP_NAME.to_string()
+            } else {
+                format!("{} не найден", util::PCAP_NAME)
+            };
+            let pcap_hint = if self.npcap {
+                format!("{} установлен", util::PCAP_NAME)
+            } else {
+                format!("{} не найден: режим masscan недоступен", util::PCAP_NAME)
+            };
+            badge(ui, self.npcap, &pcap_text, &pcap_hint);
             ui.separator();
             self.menu_session(ui);
             self.menu_view(ui);
@@ -1149,11 +1166,12 @@ impl App {
                 ui.strong("masscan");
                 ui.horizontal(|ui| {
                     ui.label("Путь");
+                    let pick = || {
+                        let d = rfd::FileDialog::new().set_title(format!("Укажите {}", util::MASSCAN_DEFAULT));
+                        if cfg!(windows) { d.add_filter("Программы", &["exe"]) } else { d }.pick_file()
+                    };
                     if ui.button("Обзор…").clicked()
-                        && let Some(p) = rfd::FileDialog::new()
-                            .set_title("Укажите masscan64.exe")
-                            .add_filter("Программы", &["exe"])
-                            .pick_file()
+                        && let Some(p) = pick()
                     {
                         s.masscan_path = p.display().to_string();
                     }
@@ -1163,7 +1181,10 @@ impl App {
                 if !util::file_exists(&exe) {
                     ui.colored_label(
                         AMBER,
-                        "Файл не найден. Положите masscan64.exe рядом с программой или укажите путь.",
+                        format!(
+                            "Файл не найден. Положите {} рядом с программой или укажите путь.",
+                            util::MASSCAN_DEFAULT
+                        ),
                     );
                 }
                 egui::Grid::new("masscan_grid").num_columns(2).show(ui, |ui| {
@@ -1251,7 +1272,7 @@ impl App {
         ui.add(
             egui::TextEdit::singleline(&mut s.adapter)
                 .desired_width(f32::INFINITY)
-                .hint_text("\\Device\\NPF_{GUID}"),
+                .hint_text(if cfg!(windows) { "\\Device\\NPF_{GUID}" } else { "eth0" }),
         );
         if masscan_mode {
             ui.label("Дополнительные аргументы masscan");

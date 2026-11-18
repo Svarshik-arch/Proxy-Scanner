@@ -7,6 +7,13 @@ use std::process::{Command, Stdio};
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Имя исполняемого файла masscan по умолчанию.
+pub const MASSCAN_DEFAULT: &str = if cfg!(windows) { "masscan64.exe" } else { "masscan" };
+/// Библиотека захвата пакетов, нужная masscan.
+pub const PCAP_NAME: &str = if cfg!(windows) { "Npcap" } else { "libpcap" };
+/// Как называются повышенные права в этой ОС.
+pub const ADMIN_NAME: &str = if cfg!(windows) { "администратор" } else { "root" };
+
 /// Скрывает окно консоли у дочернего процесса (актуально только для Windows).
 pub fn hide_window(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
@@ -88,7 +95,15 @@ pub fn is_admin() -> bool {
     }
     #[cfg(not(windows))]
     {
-        false
+        // Действующий UID — второе поле строки `Uid:`.
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(2).map(|v| v == "0"))
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -123,11 +138,11 @@ pub fn relaunch_as_admin() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("доступно только в Windows".into())
+        Err("в Linux запустите программу через sudo".into())
     }
 }
 
-/// Установлен ли Npcap (или совместимый WinPcap).
+/// Установлен ли Npcap (Windows) или libpcap (Linux).
 pub fn npcap_installed() -> bool {
     #[cfg(windows)]
     {
@@ -142,7 +157,19 @@ pub fn npcap_installed() -> bool {
     }
     #[cfg(not(windows))]
     {
-        false
+        [
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/lib64",
+            "/usr/lib",
+            "/usr/local/lib",
+        ]
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with("libpcap.so"))
     }
 }
 
@@ -160,7 +187,18 @@ pub fn resolve_masscan(path: &str) -> PathBuf {
             return candidate;
         }
     }
-    p // будет найден через PATH, если он там есть
+    // Поиск в PATH.
+    if p.components().count() == 1
+        && let Some(paths) = std::env::var_os("PATH")
+    {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(&p);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    p
 }
 
 pub fn file_exists(path: &Path) -> bool {

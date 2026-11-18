@@ -8,7 +8,7 @@ use crate::netdetect::NetDetect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScanMode {
-    /// Внешний masscan64.exe (Npcap + права администратора).
+    /// Внешний masscan (Npcap/libpcap + права администратора/root).
     Masscan,
     /// Встроенный TCP-connect сканер на tokio.
     TcpConnect,
@@ -56,7 +56,7 @@ impl Default for Settings {
             mode: ScanMode::TcpConnect,
             targets: String::new(),
             ports: "80,808,1080,3128,3129,8000,8080,8081,8088,8118,8443,8888,9090".into(),
-            masscan_path: "masscan64.exe".into(),
+            masscan_path: crate::util::MASSCAN_DEFAULT.into(),
             rate: 1000,
             wait_secs: 5,
             source_ip: String::new(),

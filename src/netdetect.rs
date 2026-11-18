@@ -36,8 +36,14 @@ pub struct AdapterInfo {
 }
 
 impl AdapterInfo {
+    /// Имя устройства для `masscan --adapter`: в Windows — `\Device\NPF_{GUID}`,
+    /// в Linux — имя интерфейса (`eth0`).
     pub fn npf_device(&self) -> String {
-        format!("\\Device\\NPF_{}", self.guid)
+        if self.guid.is_empty() {
+            self.name.clone()
+        } else {
+            format!("\\Device\\NPF_{}", self.guid)
+        }
     }
 }
 
@@ -274,6 +280,11 @@ pub fn is_mac(s: &str) -> bool {
 }
 
 pub fn detect_router_mac(router: Ipv4Addr) -> Result<String, String> {
+    if !cfg!(windows) {
+        let arp = std::fs::read_to_string("/proc/net/arp").map_err(|e| format!("/proc/net/arp: {e}"))?;
+        return parse_proc_arp(&arp, router)
+            .ok_or_else(|| format!("в ARP-таблице нет записи для {router}"));
+    }
     let out = run_cmd("arp", &["-a", &router.to_string()])?;
     if let Some(mac) = parse_arp_mac(&out.stdout, router) {
         return Ok(mac);
@@ -296,7 +307,30 @@ pub fn parse_masscan_iflist(output: &str) -> Vec<IfaceEntry> {
     let lines: Vec<&str> = output.lines().collect();
     let mut result: Vec<IfaceEntry> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        let Some(pos) = line.find(MARK) else { continue };
+        let Some(pos) = line.find(MARK) else {
+            // Linux: ` 0  eth0 \t(описание)` — номер, имя устройства, описание.
+            let mut it = line.split_whitespace();
+            if let (Some(n), Some(dev)) = (it.next(), it.next())
+                && n.chars().all(|c| c.is_ascii_digit())
+                && !dev.starts_with('(')
+            {
+                let desc = line[line.find(dev).unwrap_or(0) + dev.len()..]
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .trim()
+                    .to_string();
+                let desc = if desc.eq_ignore_ascii_case("No description available") {
+                    String::new()
+                } else {
+                    desc
+                };
+                if !result.iter().any(|e| e.device == dev) {
+                    result.push(IfaceEntry { device: dev.to_string(), description: desc });
+                }
+            }
+            continue;
+        };
         let rest = &line[pos..];
         let end = rest
             .find(|c: char| c.is_whitespace() || c == '(')
@@ -355,6 +389,151 @@ fn guid_of_device(device: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Linux: ip addr, /proc/net/route, /proc/net/arp
+// ---------------------------------------------------------------------------
+
+/// Разбор `ip -o -4 addr show`: `2: eth0    inet 10.0.0.5/24 brd … scope global eth0`.
+pub fn parse_ip_addr(output: &str) -> PsNet {
+    let mut net = PsNet::default();
+    for line in output.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(idx), Some(name), Some(fam), Some(cidr)) = (it.next(), it.next(), it.next(), it.next())
+        else {
+            continue;
+        };
+        if fam != "inet" {
+            continue;
+        }
+        let Ok(if_index) = idx.trim_end_matches(':').parse::<i64>() else { continue };
+        let name = name.split('@').next().unwrap_or(name).to_string();
+        let (ip, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
+        net.addrs.push(PsAddr {
+            ip: ip.to_string(),
+            if_index,
+            alias: name.clone(),
+            prefix: prefix.parse().unwrap_or(32),
+        });
+        if !net.adapters.iter().any(|a| a.if_index == if_index) {
+            net.adapters.push(AdapterInfo {
+                name: name.clone(),
+                description: name,
+                if_index,
+                guid: String::new(),
+            });
+        }
+    }
+    net
+}
+
+/// Маршруты по умолчанию из `/proc/net/route` (адреса — 32-битные little-endian в hex).
+pub fn parse_proc_route(content: &str, net: &PsNet) -> Vec<PsRoute> {
+    let mut routes = Vec::new();
+    for line in content.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 8 || f[1] != "00000000" || f[7] != "00000000" {
+            continue;
+        }
+        let Ok(gw) = u32::from_str_radix(f[2], 16) else { continue };
+        let Some(if_index) = net
+            .adapters
+            .iter()
+            .find(|a| a.name == f[0])
+            .map(|a| a.if_index)
+        else {
+            continue;
+        };
+        routes.push(PsRoute {
+            if_index,
+            next_hop: Ipv4Addr::from(gw.to_le_bytes()).to_string(),
+            metric: f[6].parse().unwrap_or(0),
+        });
+    }
+    routes
+}
+
+/// MAC из `/proc/net/arp`: `10.0.0.1  0x1  0x2  aa:bb:cc:dd:ee:ff  *  eth0`.
+pub fn parse_proc_arp(content: &str, ip: Ipv4Addr) -> Option<String> {
+    let ip_s = ip.to_string();
+    content.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        (f.len() >= 4 && f[0] == ip_s && f[2] != "0x0" && is_mac(f[3]) && f[3] != "00:00:00:00:00:00")
+            .then(|| f[3].to_ascii_lowercase().replace(':', "-"))
+    })
+}
+
+/// Адреса без утилиты `ip`: интерфейсы из `/sys/class/net`, а адрес `source`
+/// привязывается к интерфейсу по прямому (без шлюза) маршруту из `/proc/net/route`.
+pub fn net_from_proc(route: &str, ifaces: &[(String, i64)], source: Option<Ipv4Addr>) -> PsNet {
+    let mut net = PsNet::default();
+    for (name, idx) in ifaces {
+        net.adapters.push(AdapterInfo {
+            name: name.clone(),
+            description: name.clone(),
+            if_index: *idx,
+            guid: String::new(),
+        });
+    }
+    if let Some(src) = source {
+        let v = u32::from(src);
+        let best = route
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 8 || f[2] != "00000000" {
+                    return None;
+                }
+                let dest = u32::from_be_bytes(u32::from_str_radix(f[1], 16).ok()?.to_le_bytes());
+                let mask = u32::from_be_bytes(u32::from_str_radix(f[7], 16).ok()?.to_le_bytes());
+                (mask != 0 && v & mask == dest).then_some((f[0].to_string(), mask.count_ones() as u8))
+            })
+            .max_by_key(|(_, prefix)| *prefix);
+        if let Some((name, prefix)) = best
+            && let Some(a) = net.adapters.iter().find(|a| a.name == name)
+        {
+            net.addrs.push(PsAddr {
+                ip: src.to_string(),
+                if_index: a.if_index,
+                alias: name,
+                prefix,
+            });
+        }
+    }
+    net.routes = parse_proc_route(route, &net);
+    net
+}
+
+fn sys_class_net() -> Vec<(String, i64)> {
+    let Ok(dir) = std::fs::read_dir("/sys/class/net") else { return Vec::new() };
+    let mut out: Vec<(String, i64)> = dir
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let idx = std::fs::read_to_string(e.path().join("ifindex")).ok()?.trim().parse().ok()?;
+            Some((name, idx))
+        })
+        .collect();
+    out.sort_by_key(|(_, i)| *i);
+    out
+}
+
+fn linux_net(source: Option<Ipv4Addr>) -> Result<PsNet, String> {
+    let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    if let Ok(out) = run_cmd("ip", &["-o", "-4", "addr", "show"]) {
+        let mut net = parse_ip_addr(&out.stdout);
+        if !net.addrs.is_empty() {
+            net.routes = parse_proc_route(&route, &net);
+            return Ok(net);
+        }
+    }
+    let net = net_from_proc(&route, &sys_class_net(), source);
+    if net.adapters.is_empty() {
+        return Err("не удалось получить список интерфейсов (нет `ip` и /sys/class/net)".into());
+    }
+    Ok(net)
+}
+
+// ---------------------------------------------------------------------------
 // Полное определение
 // ---------------------------------------------------------------------------
 
@@ -373,11 +552,16 @@ pub fn detect_all(target: Option<Ipv4Addr>, masscan: Option<&Path>, want_mac: bo
         Err(e) => d.log.push(format!("source-ip: не определён — {e}")),
     }
 
-    // 2. PowerShell: маршруты, адреса, адаптеры
-    let ps = match run_powershell(PS_NET_SCRIPT).and_then(|o| parse_ps_net(&o.stdout)) {
+    // 2. Маршруты, адреса, адаптеры: PowerShell в Windows, `ip` и /proc в Linux
+    let (ps, route_src) = if cfg!(windows) {
+        (run_powershell(PS_NET_SCRIPT).and_then(|o| parse_ps_net(&o.stdout)), "Get-NetRoute")
+    } else {
+        (linux_net(d.source_ip), "/proc/net/route")
+    };
+    let ps = match ps {
         Ok(ps) => Some(ps),
         Err(e) => {
-            d.log.push(format!("PowerShell: {e}"));
+            d.log.push(format!("сетевые интерфейсы: {e}"));
             None
         }
     };
@@ -413,19 +597,19 @@ pub fn detect_all(target: Option<Ipv4Addr>, masscan: Option<&Path>, want_mac: bo
                 if let Some(ad) = ps.adapters.iter().find(|n| n.if_index == a.if_index) {
                     d.log.push(format!(
                         "адаптер: «{}» ({}), ifIndex {}, {}",
-                        ad.name, ad.description, ad.if_index, ad.guid
+                        ad.name, ad.description, ad.if_index, ad.npf_device()
                     ));
                     d.npf_device = Some(ad.npf_device());
                     d.adapter = Some(ad.clone());
                 } else {
                     d.log.push(format!(
-                        "адаптер: для ifIndex {} нет записи Get-NetAdapter",
+                        "адаптер: для ifIndex {} нет сведений об адаптере",
                         a.if_index
                     ));
                 }
             } else {
                 d.log
-                    .push(format!("адаптер: адрес {src} не найден в Get-NetIPAddress"));
+                    .push(format!("адаптер: адрес {src} не найден среди адресов интерфейсов"));
             }
         }
         // Шлюз: предпочитаем маршрут через интерфейс source-ip.
@@ -439,13 +623,16 @@ pub fn detect_all(target: Option<Ipv4Addr>, masscan: Option<&Path>, want_mac: bo
             && let Ok(gw) = r.next_hop.parse::<Ipv4Addr>()
             && !gw.is_unspecified()
         {
-            d.log.push(format!("router-ip: {gw} (Get-NetRoute)"));
+            d.log.push(format!("router-ip: {gw} ({route_src})"));
             d.router_ip = Some(gw);
         }
     }
 
-    // 3. Запасной способ определения шлюза — ipconfig
-    if d.router_ip.is_none() {
+    // 3. Запасной способ определения шлюза (Windows) — ipconfig
+    if d.router_ip.is_none() && !cfg!(windows) {
+        d.log.push("router-ip: маршрут по умолчанию не найден".into());
+    }
+    if d.router_ip.is_none() && cfg!(windows) {
         match run_cmd("ipconfig", &[]) {
             Ok(out) => match parse_ipconfig_gateway(&out.stdout, d.source_ip) {
                 Some(gw) => {
@@ -462,7 +649,10 @@ pub fn detect_all(target: Option<Ipv4Addr>, masscan: Option<&Path>, want_mac: bo
     if want_mac && let Some(gw) = d.router_ip {
         match detect_router_mac(gw) {
             Ok(mac) => {
-                d.log.push(format!("router-mac: {mac} (arp -a)"));
+                d.log.push(format!(
+                    "router-mac: {mac} ({})",
+                    if cfg!(windows) { "arp -a" } else { "/proc/net/arp" }
+                ));
                 d.router_mac = Some(mac);
             }
             Err(e) => d.log.push(format!("router-mac: {e}")),
@@ -483,9 +673,11 @@ pub fn detect_all(target: Option<Ipv4Addr>, masscan: Option<&Path>, want_mac: bo
     if let Some(ps) = &ps {
         // Подставляем понятные описания и добавляем адаптеры, которых нет в списке masscan.
         for e in &mut d.ifaces {
-            if let Some(g) = guid_of_device(&e.device)
-                && let Some(ad) = ps.adapters.iter().find(|a| a.guid == g)
-            {
+            let ad = match guid_of_device(&e.device) {
+                Some(g) => ps.adapters.iter().find(|a| a.guid == g),
+                None => ps.adapters.iter().find(|a| a.guid.is_empty() && a.name == e.device),
+            };
+            if let Some(ad) = ad {
                 let ips: Vec<&str> = ps
                     .addrs
                     .iter()
@@ -592,6 +784,57 @@ mod tests {
         );
         assert_eq!(parse_arp_mac(out, Ipv4Addr::new(10, 1, 0, 255)), None);
         assert_eq!(parse_arp_mac(out, Ipv4Addr::new(10, 1, 0, 2)), None);
+    }
+
+    #[test]
+    fn linux_ip_route_arp() {
+        let ip = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n\
+                  2: eth0    inet 10.1.0.57/24 brd 10.1.0.255 scope global dynamic eth0\\       valid_lft 86000sec\n\
+                  5: veth1@if4    inet 172.17.0.1/16 brd 172.17.255.255 scope global veth1\n";
+        let net = parse_ip_addr(ip);
+        assert_eq!(net.addrs.len(), 3);
+        assert_eq!(net.addrs[1].ip, "10.1.0.57");
+        assert_eq!(net.addrs[1].prefix, 24);
+        assert_eq!(net.adapters[2].name, "veth1");
+        assert_eq!(net.adapters[1].npf_device(), "eth0");
+
+        let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     eth0\t00000000\t0100010A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+                     eth0\t0000010A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+        let routes = parse_proc_route(route, &net);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].next_hop, "10.1.0.1");
+        assert_eq!(routes[0].if_index, 2);
+
+        let arp = "IP address       HW type     Flags       HW address            Mask     Device\n\
+                   10.1.0.1         0x1         0x2         00:1A:2B:3C:4D:5E     *        eth0\n\
+                   10.1.0.9         0x1         0x0         00:00:00:00:00:00     *        eth0\n";
+        assert_eq!(parse_proc_arp(arp, Ipv4Addr::new(10, 1, 0, 1)).as_deref(), Some("00-1a-2b-3c-4d-5e"));
+        assert_eq!(parse_proc_arp(arp, Ipv4Addr::new(10, 1, 0, 9)), None);
+    }
+
+    #[test]
+    fn linux_without_ip_tool() {
+        let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     eth0\t00000000\t010200C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+                     eth0\t000200C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        let ifaces = vec![("lo".to_string(), 1), ("eth0".to_string(), 2)];
+        let net = net_from_proc(route, &ifaces, Some(Ipv4Addr::new(192, 0, 2, 2)));
+        assert_eq!(net.addrs.len(), 1);
+        assert_eq!(net.addrs[0].alias, "eth0");
+        assert_eq!(net.addrs[0].prefix, 24);
+        assert_eq!(net.routes.len(), 1);
+        assert_eq!(net.routes[0].next_hop, "192.0.2.1");
+    }
+
+    #[test]
+    fn iflist_linux_format() {
+        let out = "If list:\n 0  eth0 \t(No description available)\n 1  any \t(Pseudo-device that captures on all interfaces)\n 2  lo \t(No description available)\n";
+        let l = parse_masscan_iflist(out);
+        assert_eq!(l.len(), 3);
+        assert_eq!(l[0].device, "eth0");
+        assert_eq!(l[0].description, "");
+        assert_eq!(l[1].description, "Pseudo-device that captures on all interfaces");
     }
 
     #[test]
