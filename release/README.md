@@ -6,6 +6,7 @@
 | `masscan64.exe` | Windows 10/11 x64 | Внешний сканер для режима «masscan» |
 | `proxy-scanner` | Linux x86_64 | Proxy Scanner — сама программа |
 | `masscan` | Linux x86_64 | Внешний сканер для режима «masscan» |
+| `proxy-scanner.cmd`, `proxy-scanner.ps1` | Windows | Скрипт запуска: права администратора, Npcap, SmartScreen |
 | `proxy-scanner.sh` | Linux | Скрипт запуска: лимиты, libpcap, root и доступ к экрану |
 
 Скачайте программу и (при необходимости) masscan для своей ОС в одну папку —
@@ -17,8 +18,14 @@ Proxy Scanner найдёт masscan рядом с собой. Режим «TCP-co
 ## Windows
 
 - Работает без установки и без интернета, библиотеки вшиты (статический CRT).
-- Для режима «masscan» нужны [Npcap](https://npcap.com/) и запуск от имени администратора
-  (в программе есть кнопка перезапуска с повышением прав).
+- Скачайте `proxy-scanner.exe`, `masscan64.exe`, `proxy-scanner.cmd` и `proxy-scanner.ps1`
+  в одну папку и дважды щёлкните `proxy-scanner.cmd`. Скрипт запросит права администратора,
+  снимет с файлов «метку интернета» (SmartScreen), проверит Npcap (и запустит установщик
+  `npcap-*.exe`, если он лежит рядом) и запустит программу. `proxy-scanner.cmd -User` —
+  без прав администратора (только TCP-connect).
+- Для режима «masscan» нужны [Npcap](https://npcap.com/) и права администратора.
+- Подробно: [docs/WINDOWS.md](../docs/WINDOWS.md). Параметры для максимальной скорости:
+  [docs/TUNING.md](../docs/TUNING.md).
 
 ## Linux
 

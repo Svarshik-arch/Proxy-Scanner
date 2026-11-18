@@ -65,9 +65,11 @@ CRT линкуется статически (`+crt-static`, см. `.cargo/config
 ## Развёртывание в закрытом контуре
 
 Готовые программы лежат в папке [`release`](release): `proxy-scanner.exe` и `masscan64.exe` для Windows,
-`proxy-scanner` и `masscan` для Linux x86_64 (glibc 2.35+) и скрипт запуска `proxy-scanner.sh`.
+`proxy-scanner` и `masscan` для Linux x86_64 (glibc 2.35+), а также скрипты запуска
+`proxy-scanner.cmd` (Windows) и `proxy-scanner.sh` (Linux).
 Подробности и контрольные суммы — в [`release/README.md`](release/README.md).
 
+- Запуск на Windows (права администратора, Npcap, SmartScreen, скрипт): [docs/WINDOWS.md](docs/WINDOWS.md)
 - Запуск на Linux (root, libpcap, лимиты, скрипт): [docs/LINUX.md](docs/LINUX.md)
 - Параметры для максимальной скорости: [docs/TUNING.md](docs/TUNING.md)
 
