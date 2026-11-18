@@ -73,6 +73,20 @@ jobs:
             exit 1
           }
 
+      # string_s.h в 1.3.2 узнаёт только MSVC 2015 (_MSC_VER == 1900); более новые
+      # версии попадают в ветку "#warning unknown compiler", которую MSVC не понимает.
+      # Расширяем условие на все MSVC начиная с 2015 — других изменений в исходниках нет.
+      - name: Patch compiler detection for current MSVC
+        shell: pwsh
+        working-directory: masscan
+        run: |
+          $f = "src/string_s.h"
+          $old = '(_MSC_VER == 1900)'
+          $text = Get-Content -Raw $f
+          if (-not $text.Contains($old)) { Write-Error "pattern not found in $f"; exit 1 }
+          Set-Content -NoNewline $f $text.Replace($old, '(_MSC_VER >= 1900)')
+          git diff --stat
+
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
