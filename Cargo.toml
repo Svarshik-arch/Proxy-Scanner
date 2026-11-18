@@ -29,6 +29,8 @@ tokio-util = "0.7"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 x509-parser = "0.18"
+# JavaScript-движок для вычисления PAC-файлов (чистый Rust).
+boa_engine = { version = "0.22", default-features = false }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

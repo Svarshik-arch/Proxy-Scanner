@@ -64,6 +64,10 @@ pub struct Settings {
     /// Windows: входить под текущим пользователем (Kerberos/NTLM без пароля).
     pub auth_current_user: bool,
     pub proxy_domain: String,
+    // PAC/WPAD
+    pub pac_source: String,
+    pub pac_test_urls: String,
+    pub pac_client_ip: String,
     pub proxy_user: String,
     #[serde(skip)]
     pub proxy_pass: String,
@@ -105,6 +109,9 @@ impl Default for Settings {
             auth_mode: crate::auth::AuthMode::Auto,
             auth_current_user: true,
             proxy_domain: String::new(),
+            pac_source: String::new(),
+            pac_test_urls: "http://example.com/\nhttps://www.google.com/\nhttp://intranet/\nhttps://portal.corp.local/".into(),
+            pac_client_ip: String::new(),
             proxy_user: String::new(),
             proxy_pass: String::new(),
         }
@@ -395,6 +402,9 @@ impl ProxyRow {
     }
 }
 
+/// Ответы PAC по адресам (адрес, ответ или ошибка) либо общая ошибка движка.
+pub type PacEvaluation = Result<Vec<(String, Result<String, String>)>, String>;
+
 /// События от фоновых задач к интерфейсу.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -427,6 +437,17 @@ pub enum AppEvent {
     EgressDone,
     /// Слушатель запущен: занятые порты и ошибки.
     ListenerStarted(Vec<u16>, Vec<String>),
+    /// PAC/WPAD: системные настройки прокси и DNS-суффиксы.
+    PacSystem(Box<crate::pac::SystemInfo>),
+    /// PAC/WPAD: результат проверки одного адреса WPAD (текст PAC или ошибка).
+    PacWpad(String, Result<String, String>),
+    PacWpadDone,
+    /// PAC загружен (источник, текст или ошибка).
+    PacLoaded(String, Result<String, String>),
+    /// Результаты FindProxyForURL (URL, ответ или ошибка); общая ошибка движка.
+    PacEvaluated(PacEvaluation),
+    /// Прокси из PAC, разрешённые в адреса: (адрес, порт), ошибки.
+    PacTargets(Vec<(Ipv4Addr, u16)>, Vec<String>),
 }
 
 /// Место, с которого можно продолжить обнаружение.

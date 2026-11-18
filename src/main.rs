@@ -15,6 +15,7 @@ mod filters;
 mod graph;
 mod model;
 mod netdetect;
+mod pac;
 mod probe;
 mod scan;
 mod session;

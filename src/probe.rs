@@ -673,6 +673,15 @@ async fn tls_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     Ok((tls, info))
 }
 
+/// TLS-подключение без проверки сертификата (для загрузки PAC по https).
+pub async fn tls_connect(
+    stream: TcpStream,
+    host: &str,
+    timeout: Duration,
+) -> Result<TlsStream<TcpStream>, String> {
+    Ok(tls_handshake(stream, host, timeout).await?.0)
+}
+
 /// Сертификат тестового узла при прямом подключении (эталон для сравнения).
 pub async fn direct_reference(host: &str, port: u16, timeout: Duration) -> Result<CertInfo, String> {
     let stream = with_timeout(timeout, TcpStream::connect((host, port)))

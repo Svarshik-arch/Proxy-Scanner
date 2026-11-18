@@ -60,6 +60,7 @@ enum Section {
     #[default]
     Proxies,
     Egress,
+    Pac,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -201,6 +202,25 @@ pub struct App {
     egress_cancel: Option<CancellationToken>,
     /// Слушатель: отмена, занятые порты, ошибки.
     listener: Option<(CancellationToken, Vec<u16>, Vec<String>)>,
+    /// PAC/WPAD.
+    pac: PacState,
+}
+
+#[derive(Default)]
+struct PacState {
+    system: Option<crate::pac::SystemInfo>,
+    system_busy: bool,
+    wpad: Vec<(String, Result<usize, String>)>,
+    /// Найденные WPAD-файлы: URL → текст.
+    wpad_texts: Vec<(String, String)>,
+    wpad_busy: bool,
+    /// Загруженный PAC: источник и текст.
+    loaded: Option<(String, String)>,
+    load_error: Option<String>,
+    load_busy: bool,
+    results: Vec<(String, Result<String, String>)>,
+    eval_error: Option<String>,
+    eval_busy: bool,
 }
 
 /// Описание сессии, загруженной при запуске или из файла.
@@ -263,6 +283,7 @@ impl App {
             egress_items: Vec::new(),
             egress_cancel: None,
             listener: None,
+            pac: PacState::default(),
         };
         app.archive = session::list_archive(&app.session_path);
         // Незавершённая сессия рядом с программой (в том числе перенесённая с другого ПК).
@@ -1071,6 +1092,75 @@ impl App {
                         if cancelled { " (остановлено)" } else { "" }
                     ));
                     self.autosave();
+                }
+                AppEvent::PacSystem(info) => {
+                    self.pac.system_busy = false;
+                    self.pac.system = Some(*info);
+                }
+                AppEvent::PacWpad(url, r) => {
+                    let summary = r.as_ref().map(|t| t.len()).map_err(|e| e.clone());
+                    if let Ok(text) = r {
+                        self.pac.wpad_texts.push((url.clone(), text));
+                    }
+                    self.pac.wpad.push((url, summary));
+                }
+                AppEvent::PacWpadDone => self.pac.wpad_busy = false,
+                AppEvent::PacLoaded(src, r) => {
+                    self.pac.load_busy = false;
+                    match r {
+                        Ok(text) => {
+                            self.push_log(format!("PAC: загружен {src} ({} байт)", text.len()));
+                            self.pac.loaded = Some((src, text));
+                            self.pac.load_error = None;
+                            self.pac.results.clear();
+                        }
+                        Err(e) => self.pac.load_error = Some(e),
+                    }
+                }
+                AppEvent::PacEvaluated(r) => {
+                    self.pac.eval_busy = false;
+                    match r {
+                        Ok(v) => {
+                            self.pac.results = v;
+                            self.pac.eval_error = None;
+                        }
+                        Err(e) => self.pac.eval_error = Some(e),
+                    }
+                }
+                AppEvent::PacTargets(found, errors) => {
+                    for e in errors {
+                        self.push_log(format!("PAC: {e}"));
+                    }
+                    if found.is_empty() {
+                        self.error = Some("В ответах PAC нет прокси, которые удалось разрешить в адреса".into());
+                    } else {
+                        let mut t = self.settings.targets.trim().to_string();
+                        let mut p = self.settings.ports.trim().to_string();
+                        let (mut added_t, mut added_p) = (0, 0);
+                        for (ip, port) in &found {
+                            let ip_s = ip.to_string();
+                            if !t.split([',', ' ', '\n', ';']).any(|x| x.trim() == ip_s) {
+                                if !t.is_empty() {
+                                    t.push_str(", ");
+                                }
+                                t.push_str(&ip_s);
+                                added_t += 1;
+                            }
+                            let ps = port.to_string();
+                            if !p.split([',', ' ']).any(|x| x.trim() == ps) {
+                                if !p.is_empty() {
+                                    p.push(',');
+                                }
+                                p.push_str(&ps);
+                                added_p += 1;
+                            }
+                        }
+                        self.settings.targets = t;
+                        self.settings.ports = p;
+                        self.status = format!(
+                            "Из PAC добавлено адресов: {added_t}, портов: {added_p}. Нажмите «Сканировать» или «Дополнить»."
+                        );
+                    }
                 }
                 AppEvent::ListenerStarted(ok, errors) => {
                     if let Some(l) = &mut self.listener {
@@ -2043,12 +2133,311 @@ impl App {
             };
             ui.selectable_value(&mut self.view.section, Section::Egress, label)
                 .on_hover_text("Можно ли с этой рабочей станции выйти наружу напрямую, мимо прокси");
+            ui.selectable_value(&mut self.view.section, Section::Pac, RichText::new("PAC/WPAD").strong())
+                .on_hover_text("Настройки прокси в системе, поиск WPAD, проверка PAC-файла");
         });
         ui.separator();
         match self.view.section {
             Section::Proxies => self.ui_results(ui),
             Section::Egress => self.ui_egress(ui),
+            Section::Pac => self.ui_pac(ui),
         }
+    }
+
+    fn pac_detect_system(&mut self, ctx: &egui::Context) {
+        self.pac.system_busy = true;
+        let tx = self.tx(ctx);
+        self.rt.spawn_blocking(move || tx.send(AppEvent::PacSystem(Box::new(crate::pac::system_info()))));
+    }
+
+    fn pac_search_wpad(&mut self, ctx: &egui::Context) {
+        let suffixes = self.pac.system.as_ref().map(|s| s.suffixes.clone()).unwrap_or_default();
+        let urls = crate::pac::wpad_candidates(&suffixes);
+        self.pac.wpad.clear();
+        self.pac.wpad_texts.clear();
+        self.pac.wpad_busy = true;
+        let tx = self.tx(ctx);
+        self.rt.spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            for url in urls {
+                let tx = tx.clone();
+                set.spawn(async move {
+                    let r = crate::pac::fetch(&url, Duration::from_secs(4)).await;
+                    tx.send(AppEvent::PacWpad(url, r));
+                });
+            }
+            while set.join_next().await.is_some() {}
+            tx.send(AppEvent::PacWpadDone);
+        });
+    }
+
+    fn pac_load(&mut self, ctx: &egui::Context, source: String) {
+        if source.trim().is_empty() {
+            self.pac.load_error = Some("Укажите адрес PAC-файла или путь к файлу".into());
+            return;
+        }
+        self.settings.pac_source = source.clone();
+        self.pac.load_busy = true;
+        let tx = self.tx(ctx);
+        self.rt.spawn(async move {
+            let r = crate::pac::fetch(&source, Duration::from_secs(6)).await;
+            tx.send(AppEvent::PacLoaded(source, r));
+        });
+    }
+
+    fn pac_evaluate(&mut self, ctx: &egui::Context) {
+        let Some((_, text)) = self.pac.loaded.clone() else { return };
+        let urls: Vec<String> = self
+            .settings
+            .pac_test_urls
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect();
+        let my_ip = if !self.settings.pac_client_ip.trim().is_empty() {
+            self.settings.pac_client_ip.trim().to_string()
+        } else if !self.settings.source_ip.trim().is_empty() {
+            self.settings.source_ip.trim().to_string()
+        } else {
+            "127.0.0.1".to_string()
+        };
+        self.pac.eval_busy = true;
+        let tx = self.tx(ctx);
+        self.rt.spawn_blocking(move || {
+            let r = crate::pac::PacEngine::new(&text, &my_ip).map(|mut engine| {
+                urls.iter().map(|u| (u.clone(), engine.find(u))).collect::<Vec<_>>()
+            });
+            tx.send(AppEvent::PacEvaluated(r));
+        });
+    }
+
+    fn pac_add_targets(&mut self, ctx: &egui::Context) {
+        let mut proxies: Vec<crate::pac::PacProxy> = Vec::new();
+        for (_, r) in &self.pac.results {
+            if let Ok(s) = r {
+                for p in crate::pac::parse_result(s) {
+                    if !proxies.contains(&p) {
+                        proxies.push(p);
+                    }
+                }
+            }
+        }
+        let tx = self.tx(ctx);
+        self.rt.spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            let (mut found, mut errors) = (Vec::new(), Vec::new());
+            for p in proxies {
+                let ip = p.host.parse::<Ipv4Addr>().ok().or_else(|| {
+                    (p.host.as_str(), p.port)
+                        .to_socket_addrs()
+                        .ok()
+                        .and_then(|mut it| it.find(|a| a.is_ipv4()))
+                        .map(|a| match a.ip() {
+                            std::net::IpAddr::V4(v) => v,
+                            std::net::IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                        })
+                });
+                match ip {
+                    Some(ip) if !found.contains(&(ip, p.port)) => found.push((ip, p.port)),
+                    Some(_) => {}
+                    None => errors.push(format!("не удалось разрешить «{}»", p.host)),
+                }
+            }
+            tx.send(AppEvent::PacTargets(found, errors));
+        });
+    }
+
+    fn ui_pac(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if self.pac.system.is_none() && !self.pac.system_busy {
+            self.pac_detect_system(&ctx);
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // 1. Системные настройки.
+            ui.horizontal(|ui| {
+                ui.strong("Настройки прокси в системе");
+                if ui.small_button("Обновить").clicked() {
+                    self.pac_detect_system(&ctx);
+                }
+                if self.pac.system_busy {
+                    ui.spinner();
+                }
+            });
+            let mut open_pac: Option<String> = None;
+            if let Some(info) = &self.pac.system {
+                if info.settings.is_empty() {
+                    ui.weak("Явных настроек прокси не найдено (прокси может задаваться через WPAD или DHCP).");
+                }
+                for st in &info.settings {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(RichText::new(format!("{}:", st.source)).strong()).extend());
+                        if let Some(u) = &st.pac_url
+                            && ui.small_button("Открыть PAC").clicked()
+                        {
+                            open_pac = Some(u.clone());
+                        }
+                        ui.add(egui::Label::new(RichText::new(&st.value).monospace()).truncate())
+                            .on_hover_text(&st.value);
+                    });
+                }
+                if !info.suffixes.is_empty() {
+                    ui.weak(format!("DNS-суффиксы: {}", info.suffixes.join(", ")));
+                }
+            }
+
+            // 2. WPAD.
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.strong("Поиск WPAD");
+                if ui
+                    .add_enabled(!self.pac.wpad_busy, egui::Button::new("Искать"))
+                    .on_hover_text("Пробует http://wpad.<суффикс>/wpad.dat для всех DNS-суффиксов")
+                    .clicked()
+                {
+                    self.pac_search_wpad(&ctx);
+                }
+                if self.pac.wpad_busy {
+                    ui.spinner();
+                }
+            });
+            if !self.pac.wpad.is_empty() {
+                egui::Grid::new("pac_wpad").num_columns(3).striped(true).show(ui, |ui| {
+                    for (url, r) in &self.pac.wpad {
+                        ui.label(RichText::new(url).monospace());
+                        match r {
+                            Ok(n) => {
+                                ui.colored_label(GREEN, format!("найден ({n} байт)"));
+                                if ui.small_button("Открыть PAC").clicked() {
+                                    open_pac = Some(url.clone());
+                                }
+                            }
+                            Err(e) => {
+                                ui.weak(format!("нет: {e}"));
+                                ui.label("");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+                if !self.pac.wpad_busy && self.pac.wpad_texts.is_empty() {
+                    ui.weak("WPAD не найден. Адрес PAC может раздаваться по DHCP (опция 252) — укажите его вручную.");
+                }
+            }
+            if let Some(u) = open_pac {
+                self.pac_load(&ctx, u);
+            }
+
+            // 3. PAC-файл.
+            ui.add_space(8.0);
+            ui.strong("PAC-файл");
+            let mut load: Option<String> = None;
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.pac_source)
+                        .desired_width((ui.available_width() - 190.0).max(160.0))
+                        .hint_text("http://wpad.corp.local/wpad.dat или путь к файлу"),
+                );
+                if ui.add_enabled(!self.pac.load_busy, egui::Button::new("Загрузить")).clicked() {
+                    load = Some(self.settings.pac_source.clone());
+                }
+                if ui.button("Файл…").clicked()
+                    && let Some(p) = rfd::FileDialog::new()
+                        .set_title("PAC-файл")
+                        .add_filter("PAC", &["pac", "dat", "js", "txt"])
+                        .pick_file()
+                {
+                    load = Some(p.display().to_string());
+                }
+                if self.pac.load_busy {
+                    ui.spinner();
+                }
+            });
+            if let Some(src) = load {
+                self.pac_load(&ctx, src);
+            }
+            if let Some(e) = &self.pac.load_error {
+                ui.colored_label(RED, e);
+            }
+            if let Some((src, text)) = &self.pac.loaded {
+                ui.colored_label(GREEN, format!("Загружен: {src} ({} байт)", text.len()));
+                egui::CollapsingHeader::new("Текст PAC-файла").default_open(false).show(ui, |ui| {
+                    let mut t = text.as_str();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut t)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(10)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            }
+
+            // 4. Проверка URL.
+            ui.add_space(8.0);
+            ui.strong("Какой прокси будет выбран для адреса");
+            ui.label("Адреса для проверки (по одному в строке)");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.settings.pac_test_urls)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal(|ui| {
+                ui.label("IP клиента (myIpAddress)").on_hover_text(
+                    "От адреса клиента правила PAC часто зависят (филиалы, сегменты).\n\
+                     Пусто — source-ip этой рабочей станции.",
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.pac_client_ip)
+                        .desired_width(140.0)
+                        .hint_text(if self.settings.source_ip.is_empty() { "127.0.0.1" } else { &self.settings.source_ip }),
+                );
+                let can = self.pac.loaded.is_some() && !self.pac.eval_busy;
+                if ui
+                    .add_enabled(can, egui::Button::new(RichText::new("▶ Вычислить").strong()))
+                    .on_disabled_hover_text("Сначала загрузите PAC-файл")
+                    .clicked()
+                {
+                    self.pac_evaluate(&ctx);
+                }
+                if self.pac.eval_busy {
+                    ui.spinner();
+                }
+            });
+            if let Some(e) = &self.pac.eval_error {
+                ui.colored_label(RED, e);
+            }
+            if !self.pac.results.is_empty() {
+                egui::Grid::new("pac_results").num_columns(2).striped(true).show(ui, |ui| {
+                    ui.strong("Адрес");
+                    ui.strong("Ответ FindProxyForURL");
+                    ui.end_row();
+                    for (url, r) in &self.pac.results {
+                        ui.label(RichText::new(url).monospace());
+                        match r {
+                            Ok(v) if v.trim().eq_ignore_ascii_case("DIRECT") => {
+                                ui.colored_label(AMBER, RichText::new(v).monospace())
+                                    .on_hover_text("Напрямую, без прокси");
+                            }
+                            Ok(v) => {
+                                ui.label(RichText::new(v).monospace());
+                            }
+                            Err(e) => {
+                                ui.colored_label(RED, e);
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(4.0);
+                if ui
+                    .button("Добавить прокси из PAC в цели сканирования")
+                    .on_hover_text("Адреса и порты прокси из ответов PAC добавятся в поля «Цели» и «Порты»")
+                    .clicked()
+                {
+                    self.pac_add_targets(&ctx);
+                }
+            }
+        });
     }
 
     fn start_egress(&mut self, ctx: &egui::Context) {
