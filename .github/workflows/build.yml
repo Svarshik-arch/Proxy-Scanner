@@ -57,7 +57,7 @@ jobs:
           if (($host_json | ConvertFrom-Json).interfaces.Count -lt 1) { throw 'host: no interfaces' }
           $ping = & $cli ping 127.0.0.1 --set cycles=2 --set interval_ms=100 --json -q | Out-String | ConvertFrom-Json
           if ($ping.hops[0].recv -lt 1) { throw "ICMP ping to 127.0.0.1 failed: $($ping | ConvertTo-Json -Depth 5)" }
-          & $cli dns example.com A @8.8.8.8 -q; if ($LASTEXITCODE) { throw "dns: $LASTEXITCODE" }
+          & $cli dns example.com A '@8.8.8.8' -q; if ($LASTEXITCODE) { throw "dns: $LASTEXITCODE" }
 
       # Скрипт запуска в режиме проверки под Windows PowerShell 5.1
       # (программа не запускается, проверяется разбор аргументов и проверки окружения).
