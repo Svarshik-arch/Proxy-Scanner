@@ -4,12 +4,15 @@
 //! пресетов и параметров командной строки), асинхронной функции `run`, которая шлёт
 //! события в [`Sink`], и итогового отчёта (сериализуется в JSON).
 
+pub mod ad;
+pub mod audit;
 pub mod dns;
 pub mod dnsproto;
 pub mod discovery;
 pub mod hostinfo;
 pub mod http;
 pub mod icmp;
+pub mod monitor;
 pub mod mtr;
 pub mod oui;
 pub mod tls;

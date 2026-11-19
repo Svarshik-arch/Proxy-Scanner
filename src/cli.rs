@@ -28,6 +28,10 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("services", "services", "сканер сервисов и версий (TCP и UDP)"),
     ("tls", "tls", "TLS-аудит: версии, шифры, сертификаты"),
     ("proxy", "proxy", "поиск и диагностика прокси (TCP-connect + проверки)"),
+    ("ad", "ad", "проверка домена AD: контроллеры, Kerberos, LDAP, время, SMB"),
+    ("audit", "audit", "аудит небезопасных настроек в сети"),
+    ("monitor", "monitor", "мониторинг: проверки из файла или --set checks=…, по расписанию"),
+    ("report", "", "HTML-отчёт по файлу сессии: report сессия.json -o отчёт.html"),
     ("presets", "", "список пресетов: presets [инструмент]"),
     ("help", "", "справка"),
 ];
@@ -306,6 +310,10 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "services" | "scan" => cmd_services(&o, &store),
         "tls" => cmd_tls(&o, &store),
         "proxy" => cmd_proxy(&o, &store),
+        "ad" => cmd_ad(&o, &store),
+        "audit" => cmd_audit(&o, &store),
+        "monitor" => cmd_monitor(&o, &store),
+        "report" => cmd_report(&o),
         other => Err(format!("неизвестная команда «{other}»; см. help")),
     };
     match res {
@@ -504,6 +512,102 @@ fn cmd_tls(o: &Opts, store: &Store) -> Result<(), String> {
     })?;
     report.targets.sort_by(|a, b| (a.host.as_str(), a.port).cmp(&(b.host.as_str(), b.port)));
     emit(o, &report, tlsaudit::render_text)
+}
+
+fn cmd_ad(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::ad;
+    if o.fields {
+        print!("{}", fields::<ad::Config>());
+        return Ok(());
+    }
+    let cfg: ad::Config = configure("ad", o, store, targets_json("domain", o))?;
+    let mut report = None;
+    let quiet = o.quiet;
+    drive(o, |s, c| ad::run(cfg, s, c), |e| match e {
+        ad::Event::Log(m) => eprint_line(quiet, &m),
+        ad::Event::Report(r) => report = Some(*r),
+    })?;
+    let report = report.ok_or("проверка не выполнена")?;
+    emit(o, &report, ad::render_text)
+}
+
+fn cmd_audit(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::audit;
+    if o.fields {
+        print!("{}", fields::<audit::Config>());
+        return Ok(());
+    }
+    let mut primary = targets_json("targets", o);
+    if let Some(p) = &o.ports {
+        presets::merge(&mut primary, &json!({ "tcp_ports": p }));
+    }
+    let cfg: audit::Config = configure("audit", o, store, primary)?;
+    let mut report = audit::Report::default();
+    let quiet = o.quiet;
+    let mut total = 0;
+    drive(o, |s, c| audit::run(cfg, s, c), |e| match e {
+        audit::Event::Log(m) => eprint_line(quiet, &m),
+        audit::Event::Total(t) => total = t,
+        audit::Event::Progress(n) => {
+            if !quiet {
+                eprint!("\r{n}/{total}");
+            }
+        }
+        audit::Event::Service(s) => report.services.push(*s),
+        audit::Event::Issue(i) => report.issues.push(*i),
+    })?;
+    eprint_line(quiet, "");
+    audit::sort(&mut report);
+    emit(o, &report, audit::render_text)
+}
+
+/// Мониторинг: изменения состояния печатаются сразу, итог — после Ctrl+C или N циклов.
+fn cmd_monitor(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::monitor;
+    if o.fields {
+        print!("{}", fields::<monitor::Config>());
+        return Ok(());
+    }
+    // Позиционный аргумент — файл со списком проверок.
+    let primary = match o.positional.first() {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            json!({ "checks": text })
+        }
+        None => json!({}),
+    };
+    let cfg: monitor::Config = configure("monitor", o, store, primary)?;
+    let keep = cfg.history.max(10);
+    let mut report = monitor::Report::default();
+    let quiet = o.quiet;
+    drive(o, |s, c| monitor::run(cfg, s, c), |e| {
+        if let monitor::Event::Log(m) = &e {
+            eprint_line(quiet, m);
+        }
+        if let Some(ch) = monitor::fold(&mut report, e, keep) {
+            println!(
+                "{} {:<9} {} ({})",
+                crate::session::format_time(ch.at),
+                ch.to.label(),
+                ch.line,
+                ch.detail
+            );
+        }
+    })?;
+    emit(o, &report, monitor::render_text)
+}
+
+fn cmd_report(o: &Opts) -> Result<(), String> {
+    let path = o.positional.first().ok_or("укажите файл сессии: report proxy-scanner-session.json -o отчёт.html")?;
+    let s = crate::session::load(std::path::Path::new(path))?;
+    let html = crate::report::html(&s, &format!("Сетевая диагностика — {}", s.computer));
+    match &o.out {
+        Some(p) => std::fs::write(p, html).map_err(|e| format!("{p}: {e}")),
+        None => {
+            print!("{html}");
+            Ok(())
+        }
+    }
 }
 
 /// Поиск прокси без окна: TCP-connect по целям, затем диагностика каждого открытого порта.

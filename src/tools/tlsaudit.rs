@@ -437,7 +437,7 @@ fn offered_for(version: u16) -> Vec<u16> {
 }
 
 /// Поддержка версии и (по желанию) перебор шифров.
-async fn check_version(addr: SocketAddr, version: u16, sni: Option<&str>, enum_ciphers: bool, timeout: Duration) -> VersionSupport {
+pub async fn check_version(addr: SocketAddr, version: u16, sni: Option<&str>, enum_ciphers: bool, timeout: Duration) -> VersionSupport {
     let mut vs = VersionSupport {
         version: version_name(version).into(),
         ..Default::default()

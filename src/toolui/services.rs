@@ -74,17 +74,19 @@ impl Panel {
         super::multiline(ui, &mut c.tcp_ports, 2, "22,80,443,445,3389");
         ui.label("UDP-порты");
         super::singleline(ui, &mut c.udp_ports, "53,123,137,161,1900");
-        ui.horizontal(|ui| {
-            ui.label("SNMP community");
-            ui.add(egui::TextEdit::singleline(&mut c.snmp_community).desired_width(120.0).hint_text("пусто — не опрашивать"));
+        super::advanced(ui, "svc_adv", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("SNMP community");
+                ui.add(egui::TextEdit::singleline(&mut c.snmp_community).desired_width(120.0).hint_text("пусто — не опрашивать"));
+            });
+            egui::Grid::new("svc_grid").num_columns(2).show(ui, |ui| {
+                super::labeled(ui, "Подключение, мс", |ui| ui.add(egui::DragValue::new(&mut c.connect_timeout_ms).range(100..=30_000)));
+                super::labeled(ui, "Ожидание ответа, мс", |ui| ui.add(egui::DragValue::new(&mut c.read_timeout_ms).range(100..=30_000)));
+                super::labeled(ui, "Параллельно", |ui| ui.add(egui::DragValue::new(&mut c.concurrency).range(1..=4000)));
+            });
+            ui.checkbox(&mut c.active_probes, "Активные пробы (HTTP, TLS, SMB, RDP, СУБД)");
+            ui.checkbox(&mut c.show_udp_silent, "Показывать молчащие UDP-порты (open|filtered)");
         });
-        egui::Grid::new("svc_grid").num_columns(2).show(ui, |ui| {
-            super::labeled(ui, "Подключение, мс", |ui| ui.add(egui::DragValue::new(&mut c.connect_timeout_ms).range(100..=30_000)));
-            super::labeled(ui, "Ожидание ответа, мс", |ui| ui.add(egui::DragValue::new(&mut c.read_timeout_ms).range(100..=30_000)));
-            super::labeled(ui, "Параллельно", |ui| ui.add(egui::DragValue::new(&mut c.concurrency).range(1..=4000)));
-        });
-        ui.checkbox(&mut c.active_probes, "Активные пробы (HTTP, TLS, SMB, RDP, СУБД)");
-        ui.checkbox(&mut c.show_udp_silent, "Показывать молчащие UDP-порты (open|filtered)");
         let checks = crate::tools::HostList::parse(&c.targets).ok().map(|h| {
             let n = |s: &str| crate::targets::parse_ports(s).map(|p| p.len() as u64).unwrap_or(0);
             h.len() * (n(&c.tcp_ports) + n(&c.udp_ports))

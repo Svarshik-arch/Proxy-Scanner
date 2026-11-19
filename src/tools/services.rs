@@ -514,7 +514,7 @@ async fn tls_probe(addr: SocketAddr, host: &str, cfg: &Config, svc: &mut Service
     true
 }
 
-async fn scan_tcp(ip: Ipv4Addr, port: u16, cfg: Arc<Config>) -> Option<Service> {
+pub async fn scan_tcp(ip: Ipv4Addr, port: u16, cfg: Arc<Config>) -> Option<Service> {
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
     let ct = Duration::from_millis(cfg.connect_timeout_ms.max(100));
     let rt = Duration::from_millis(cfg.read_timeout_ms.max(200));
@@ -695,7 +695,7 @@ fn unix_now() -> f64 {
         .unwrap_or(0.0)
 }
 
-async fn scan_udp(ip: Ipv4Addr, port: u16, cfg: Arc<Config>) -> Option<Service> {
+pub async fn scan_udp(ip: Ipv4Addr, port: u16, cfg: Arc<Config>) -> Option<Service> {
     let timeout = Duration::from_millis(cfg.read_timeout_ms.max(200));
     let id = super::dns::rand_id();
     let payload: Vec<u8> = match port {

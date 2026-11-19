@@ -75,23 +75,25 @@ impl Panel {
             }
             _ => {}
         }
-        ui.label("Методы");
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut c.icmp, "ICMP");
-            ui.checkbox(&mut c.arp, "ARP");
-            ui.checkbox(&mut c.netbios, "NetBIOS");
-            ui.checkbox(&mut c.mdns, "mDNS");
-            ui.checkbox(&mut c.ssdp, "SSDP");
-            ui.checkbox(&mut c.reverse_dns, "обратный DNS");
+        super::advanced(ui, "disc_adv", |ui| {
+            ui.label("Методы");
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut c.icmp, "ICMP");
+                ui.checkbox(&mut c.arp, "ARP");
+                ui.checkbox(&mut c.netbios, "NetBIOS");
+                ui.checkbox(&mut c.mdns, "mDNS");
+                ui.checkbox(&mut c.ssdp, "SSDP");
+                ui.checkbox(&mut c.reverse_dns, "обратный DNS");
+            });
+            ui.label("TCP-порты (открыт или RST — узел жив)");
+            super::singleline(ui, &mut c.tcp_ports, "22,80,135,139,443,445,3389");
+            egui::Grid::new("disc_grid").num_columns(2).show(ui, |ui| {
+                super::labeled(ui, "Таймаут, мс", |ui| ui.add(egui::DragValue::new(&mut c.timeout_ms).range(100..=10_000)));
+                super::labeled(ui, "Параллельно узлов", |ui| ui.add(egui::DragValue::new(&mut c.concurrency).range(1..=1024)));
+                super::labeled(ui, "Повторов ICMP", |ui| ui.add(egui::DragValue::new(&mut c.retries).range(0..=5)));
+            });
+            ui.checkbox(&mut c.show_dead, "Показывать узлы без ответа");
         });
-        ui.label("TCP-порты (открыт или RST — узел жив)");
-        super::singleline(ui, &mut c.tcp_ports, "22,80,135,139,443,445,3389");
-        egui::Grid::new("disc_grid").num_columns(2).show(ui, |ui| {
-            super::labeled(ui, "Таймаут, мс", |ui| ui.add(egui::DragValue::new(&mut c.timeout_ms).range(100..=10_000)));
-            super::labeled(ui, "Параллельно узлов", |ui| ui.add(egui::DragValue::new(&mut c.concurrency).range(1..=1024)));
-            super::labeled(ui, "Повторов ICMP", |ui| ui.add(egui::DragValue::new(&mut c.retries).range(0..=5)));
-        });
-        ui.checkbox(&mut c.show_dead, "Показывать узлы без ответа");
         ui.add_space(6.0);
         let (start, stop) = super::run_button(ui, self.busy(), "Искать узлы");
         if start {

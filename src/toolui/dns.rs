@@ -83,23 +83,25 @@ impl Panel {
         });
         ui.label("Серверы");
         super::multiline(ui, &mut c.servers, 2, "system, 10.0.0.53, tls://1.1.1.1, https://dns.example/dns-query");
-        ui.horizontal(|ui| {
-            ui.label("Транспорт по умолчанию");
-            egui::ComboBox::from_id_salt("dns_tr").selected_text(c.transport.label()).show_ui(ui, |ui| {
-                for t in Transport::ALL {
-                    ui.selectable_value(&mut c.transport, t, t.label());
-                }
+        ui.checkbox(&mut c.dnssec, "DNSSEC");
+        super::advanced(ui, "dns_adv", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Транспорт по умолчанию");
+                egui::ComboBox::from_id_salt("dns_tr").selected_text(c.transport.label()).show_ui(ui, |ui| {
+                    for t in Transport::ALL {
+                        ui.selectable_value(&mut c.transport, t, t.label());
+                    }
+                });
             });
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut c.recursion, "Рекурсия (RD)");
-            ui.checkbox(&mut c.dnssec, "DNSSEC (DO)");
-            ui.checkbox(&mut c.checking_disabled, "CD");
-            ui.checkbox(&mut c.nsid, "NSID");
-        });
-        egui::Grid::new("dns_grid").num_columns(2).show(ui, |ui| {
-            super::labeled(ui, "Таймаут, мс", |ui| ui.add(egui::DragValue::new(&mut c.timeout_ms).range(100..=30_000)));
-            super::labeled(ui, "Повторов", |ui| ui.add(egui::DragValue::new(&mut c.retries).range(0..=5)));
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut c.recursion, "Рекурсия (RD)");
+                ui.checkbox(&mut c.checking_disabled, "CD");
+                ui.checkbox(&mut c.nsid, "NSID");
+            });
+            egui::Grid::new("dns_grid").num_columns(2).show(ui, |ui| {
+                super::labeled(ui, "Таймаут, мс", |ui| ui.add(egui::DragValue::new(&mut c.timeout_ms).range(100..=30_000)));
+                super::labeled(ui, "Повторов", |ui| ui.add(egui::DragValue::new(&mut c.retries).range(0..=5)));
+            });
         });
         ui.add_space(6.0);
         let (start, stop) = super::run_button(ui, self.busy(), "Запросить");

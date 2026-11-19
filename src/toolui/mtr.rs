@@ -78,19 +78,25 @@ impl Panel {
                 });
             }
             super::labeled(ui, "Циклов (0 — до остановки)", |ui| ui.add(egui::DragValue::new(&mut c.cycles).range(0..=100_000)));
-            super::labeled(ui, "Интервал, мс", |ui| ui.add(egui::DragValue::new(&mut c.interval_ms).range(50..=60_000)));
-            super::labeled(ui, "Таймаут, мс", |ui| ui.add(egui::DragValue::new(&mut c.timeout_ms).range(50..=30_000)));
-            if c.mode != Mode::Tcp {
-                super::labeled(ui, "Первый хоп", |ui| ui.add(egui::DragValue::new(&mut c.first_hop).range(1..=64)));
-                super::labeled(ui, "Максимум хопов", |ui| ui.add(egui::DragValue::new(&mut c.max_hops).range(1..=64)));
-                super::labeled(ui, "Данных в пробе, байт", |ui| ui.add(egui::DragValue::new(&mut c.payload).range(0..=65000)));
-            }
         });
         if c.mode != Mode::Tcp {
-            ui.checkbox(&mut c.df, "Запрет фрагментации (DF)");
-            ui.checkbox(&mut c.resolve_names, "Имена хопов (обратный DNS)");
             ui.checkbox(&mut c.pmtu, "Найти MTU пути перед трассировкой");
         }
+        super::advanced(ui, "mtr_adv", |ui| {
+            egui::Grid::new("mtr_grid2").num_columns(2).show(ui, |ui| {
+                super::labeled(ui, "Интервал, мс", |ui| ui.add(egui::DragValue::new(&mut c.interval_ms).range(50..=60_000)));
+                super::labeled(ui, "Таймаут, мс", |ui| ui.add(egui::DragValue::new(&mut c.timeout_ms).range(50..=30_000)));
+                if c.mode != Mode::Tcp {
+                    super::labeled(ui, "Первый хоп", |ui| ui.add(egui::DragValue::new(&mut c.first_hop).range(1..=64)));
+                    super::labeled(ui, "Максимум хопов", |ui| ui.add(egui::DragValue::new(&mut c.max_hops).range(1..=64)));
+                    super::labeled(ui, "Данных в пробе, байт", |ui| ui.add(egui::DragValue::new(&mut c.payload).range(0..=65000)));
+                }
+            });
+            if c.mode != Mode::Tcp {
+                ui.checkbox(&mut c.df, "Запрет фрагментации (DF)");
+                ui.checkbox(&mut c.resolve_names, "Имена хопов (обратный DNS)");
+            }
+        });
         ui.add_space(6.0);
         let (start, stop) = super::run_button(ui, self.busy(), "Трассировать");
         if (start || (enter && !self.busy())) && !self.cfg.target.trim().is_empty() {

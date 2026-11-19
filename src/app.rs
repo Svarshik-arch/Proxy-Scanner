@@ -66,6 +66,69 @@ enum Section {
     Tool(Tool),
 }
 
+/// Группа разделов (верхний ряд вкладок).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    Proxy,
+    Network,
+    Services,
+    Audit,
+    Monitor,
+}
+
+impl Group {
+    const ALL: [Group; 5] = [Group::Proxy, Group::Network, Group::Services, Group::Audit, Group::Monitor];
+
+    fn title(self) -> &'static str {
+        match self {
+            Group::Proxy => "Прокси",
+            Group::Network => "Сеть",
+            Group::Services => "Службы",
+            Group::Audit => "Аудит",
+            Group::Monitor => "Мониторинг",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Group::Proxy => "Поиск и проверка прокси, обход прокси, PAC/WPAD",
+            Group::Network => "Эта машина, трассировка, узлы в сети",
+            Group::Services => "DNS, HTTP, сервисы и версии, TLS, домен AD",
+            Group::Audit => Tool::Audit.hint(),
+            Group::Monitor => Tool::Monitor.hint(),
+        }
+    }
+
+    fn sections(self) -> &'static [Section] {
+        match self {
+            Group::Proxy => &[Section::Proxies, Section::Egress, Section::Pac],
+            Group::Network => &[Section::Tool(Tool::Host), Section::Tool(Tool::Mtr), Section::Tool(Tool::Discovery)],
+            Group::Services => &[
+                Section::Tool(Tool::Dns),
+                Section::Tool(Tool::Http),
+                Section::Tool(Tool::Services),
+                Section::Tool(Tool::Tls),
+                Section::Tool(Tool::Ad),
+            ],
+            Group::Audit => &[Section::Tool(Tool::Audit)],
+            Group::Monitor => &[Section::Tool(Tool::Monitor)],
+        }
+    }
+
+    fn of(s: Section) -> Group {
+        Group::ALL.into_iter().find(|g| g.sections().contains(&s)).unwrap_or(Group::Proxy)
+    }
+}
+
+fn section_title(s: Section) -> (&'static str, &'static str) {
+    match s {
+        Section::Proxies => ("Поиск прокси", "Обнаружение и диагностика прокси-серверов"),
+        Section::Egress => ("Обход прокси", "Можно ли с этой рабочей станции выйти наружу напрямую, мимо прокси"),
+        Section::Pac => ("PAC/WPAD", "Настройки прокси в системе, поиск WPAD, проверка PAC-файла"),
+        Section::Tool(t) => (t.title(), t.hint()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 enum ResultsView {
     #[default]
@@ -109,6 +172,8 @@ struct ViewPrefs {
     results_view: ResultsView,
     graph: GraphSettings,
     section: Section,
+    /// Последний открытый подраздел каждой группы.
+    last_sections: Vec<Section>,
 }
 
 impl Default for ViewPrefs {
@@ -123,6 +188,7 @@ impl Default for ViewPrefs {
             results_view: ResultsView::Table,
             graph: GraphSettings::default(),
             section: Section::Proxies,
+            last_sections: Vec::new(),
         }
     }
 }
@@ -1404,6 +1470,9 @@ impl App {
             }
 
             self.menu_session(ui);
+            if ui.button("Отчёт").on_hover_text("Сводный отчёт HTML по всем разделам — для заявки или акта").clicked() {
+                self.save_report();
+            }
             self.menu_profile(ui);
             self.menu_view(ui);
             if !narrow {
@@ -1479,6 +1548,28 @@ impl App {
         };
         badge(ui, self.npcap, &pcap_text, &pcap_hint);
         ui.separator();
+    }
+
+    /// Сводный отчёт HTML по текущей сессии.
+    fn save_report(&mut self) {
+        let name = format!("proxy-scanner-report-{}.html", session::computer_name());
+        let Some(path) = rfd::FileDialog::new().add_filter("HTML", &["html"]).set_file_name(name).save_file() else {
+            return;
+        };
+        let html = crate::report::html(&self.session_snapshot(), &format!("Сетевая диагностика — {}", session::computer_name()));
+        self.status = match std::fs::write(&path, html) {
+            Ok(()) => {
+                let p = path.display().to_string();
+                if cfg!(windows) {
+                    let _ = util::run_cmd("explorer.exe", &[&p]);
+                } else {
+                    let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+                }
+                format!("Отчёт сохранён: {p}")
+            }
+            Err(e) => format!("Отчёт не сохранён: {e}"),
+        };
+        self.push_log(self.status.clone());
     }
 
     fn menu_session(&mut self, ui: &mut egui::Ui) {
@@ -2134,31 +2225,74 @@ impl App {
     }
 
     fn ui_central(&mut self, ui: &mut egui::Ui) {
+        let current = Group::of(self.view.section);
+        // Разделы.
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.view.section, Section::Proxies, RichText::new("Прокси").strong());
-            let leaks = self.egress_items.iter().filter(|i| i.status.is_leak()).count();
-            let label = if leaks > 0 {
-                RichText::new(format!("Обход прокси ({leaks})")).strong().color(RED)
-            } else {
-                RichText::new("Обход прокси").strong()
-            };
-            ui.selectable_value(&mut self.view.section, Section::Egress, label)
-                .on_hover_text("Можно ли с этой рабочей станции выйти наружу напрямую, мимо прокси");
-            ui.selectable_value(&mut self.view.section, Section::Pac, RichText::new("PAC/WPAD").strong())
-                .on_hover_text("Настройки прокси в системе, поиск WPAD, проверка PAC-файла");
-            ui.separator();
-            for t in Tool::ALL {
-                let mut text = t.title().to_string();
-                if let Some(b) = self.bench.badge(t) {
-                    text = format!("{text} ({b})");
+            for g in Group::ALL {
+                let busy = g.sections().iter().any(|s| match s {
+                    Section::Tool(t) => self.bench.busy(*t),
+                    Section::Proxies => self.busy(),
+                    _ => false,
+                });
+                let mut text = RichText::new(format!("{}{}", g.title(), if busy { " ⏳" } else { "" })).strong();
+                let alert = match g {
+                    Group::Proxy => self.egress_items.iter().any(|i| i.status.is_leak()),
+                    Group::Monitor => self.bench.badge(Tool::Monitor).is_some_and(|b| b.starts_with('⚠')),
+                    _ => false,
+                };
+                if alert {
+                    text = text.color(RED);
                 }
-                if self.bench.busy(t) {
-                    text = format!("{text} ⏳");
+                if ui.selectable_label(current == g, text).on_hover_text(g.hint()).clicked() && current != g {
+                    self.view.section = self
+                        .view
+                        .last_sections
+                        .iter()
+                        .copied()
+                        .find(|s| Group::of(*s) == g)
+                        .unwrap_or(g.sections()[0]);
                 }
-                ui.selectable_value(&mut self.view.section, Section::Tool(t), RichText::new(text).strong())
-                    .on_hover_text(t.hint());
             }
         });
+        // Подразделы, если их несколько.
+        let subs = current.sections();
+        if subs.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                for s in subs {
+                    let (title, hint) = section_title(*s);
+                    let mut text = title.to_string();
+                    let mut color = None;
+                    match s {
+                        Section::Tool(t) => {
+                            if let Some(b) = self.bench.badge(*t) {
+                                text = format!("{text} ({b})");
+                            }
+                            if self.bench.busy(*t) {
+                                text.push_str(" ⏳");
+                            }
+                        }
+                        Section::Egress => {
+                            let leaks = self.egress_items.iter().filter(|i| i.status.is_leak()).count();
+                            if leaks > 0 {
+                                text = format!("{text} ({leaks})");
+                                color = Some(RED);
+                            }
+                        }
+                        Section::Proxies if !self.rows.is_empty() => text = format!("{text} ({})", self.rows.len()),
+                        _ => {}
+                    }
+                    let mut rt = RichText::new(text);
+                    if let Some(c) = color {
+                        rt = rt.color(c);
+                    }
+                    ui.selectable_value(&mut self.view.section, *s, rt).on_hover_text(hint);
+                }
+            });
+        }
+        // Запоминаем подраздел группы.
+        let sec = self.view.section;
+        self.view.last_sections.retain(|s| Group::of(*s) != Group::of(sec));
+        self.view.last_sections.push(sec);
         ui.separator();
         match self.view.section {
             Section::Proxies => self.ui_results(ui),
@@ -3329,6 +3463,9 @@ impl eframe::App for App {
         self.handle_events(ctx);
         if self.bench.poll() {
             self.dirty = true;
+        }
+        if self.bench.take_attention() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
         }
         self.view.zoom = ctx.zoom_factor();
         if self.busy() && self.dirty && self.last_autosave.elapsed() >= AUTOSAVE_EVERY {

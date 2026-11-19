@@ -14,6 +14,7 @@ pub mod model;
 pub mod netdetect;
 pub mod pac;
 pub mod presets;
+pub mod report;
 pub mod probe;
 pub mod scan;
 pub mod session;

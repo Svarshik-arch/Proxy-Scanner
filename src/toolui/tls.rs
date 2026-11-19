@@ -71,14 +71,16 @@ impl Panel {
         super::multiline(ui, &mut c.targets, 2, "portal.corp.local, 10.0.0.0/24");
         ui.label("Порты");
         super::singleline(ui, &mut c.ports, "443,8443,636");
-        ui.label("SNI (необязательно)");
-        super::singleline(ui, &mut c.sni, "имя для IP-адресов");
-        ui.checkbox(&mut c.versions, "Проверять версии протокола (SSL 3.0 … TLS 1.3)");
-        ui.add_enabled(c.versions, egui::Checkbox::new(&mut c.ciphers, "Перебирать наборы шифров"));
-        egui::Grid::new("tls_grid").num_columns(2).show(ui, |ui| {
-            super::labeled(ui, "Таймаут, мс", |ui| ui.add(egui::DragValue::new(&mut c.timeout_ms).range(300..=60_000)));
-            super::labeled(ui, "Параллельно узлов", |ui| ui.add(egui::DragValue::new(&mut c.concurrency).range(1..=256)));
-            super::labeled(ui, "Предупреждать за, дней", |ui| ui.add(egui::DragValue::new(&mut c.expiry_warn_days).range(0..=365)));
+        ui.checkbox(&mut c.ciphers, "Перебирать наборы шифров (дольше)");
+        super::advanced(ui, "tls_adv", |ui| {
+            ui.label("SNI для IP-адресов");
+            super::singleline(ui, &mut c.sni, "portal.corp.local");
+            ui.checkbox(&mut c.versions, "Проверять версии протокола (SSL 3.0 … TLS 1.3)");
+            egui::Grid::new("tls_grid").num_columns(2).show(ui, |ui| {
+                super::labeled(ui, "Таймаут, мс", |ui| ui.add(egui::DragValue::new(&mut c.timeout_ms).range(300..=60_000)));
+                super::labeled(ui, "Параллельно узлов", |ui| ui.add(egui::DragValue::new(&mut c.concurrency).range(1..=256)));
+                super::labeled(ui, "Предупреждать за, дней", |ui| ui.add(egui::DragValue::new(&mut c.expiry_warn_days).range(0..=365)));
+            });
         });
         ui.add_space(6.0);
         let (start, stop) = super::run_button(ui, self.busy(), "Проверить");
@@ -96,7 +98,7 @@ impl Panel {
         for l in &self.log {
             ui.colored_label(RED, l);
         }
-        ui.weak(format!("Корневых сертификатов в системе: {}", crate::tools::tls::roots().len()));
+        ui.weak(format!("Проверка доверия — по {} корневым сертификатам системы.", crate::tools::tls::roots().len()));
     }
 
     pub fn results_ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {

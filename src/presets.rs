@@ -25,6 +25,9 @@ pub const TOOLS: &[(&str, &str)] = &[
     ("http", "HTTP"),
     ("services", "Сервисы"),
     ("tls", "TLS-аудит"),
+    ("ad", "Домен AD"),
+    ("audit", "Аудит"),
+    ("monitor", "Мониторинг"),
 ];
 
 /// Поля, которые никогда не попадают в пользовательский пресет: они описывают
@@ -44,7 +47,9 @@ pub fn target_fields(tool: &str) -> &'static [&'static str] {
         "mtr" => &["target"],
         "dns" => &["names"],
         "http" => &["url"],
-        "discovery" | "services" | "tls" => &["targets"],
+        "discovery" | "services" | "tls" | "audit" => &["targets"],
+        "ad" => &["domain", "dcs"],
+        "monitor" => &["checks"],
         _ => &[],
     }
 }
@@ -219,6 +224,24 @@ pub fn builtin() -> Vec<Preset> {
         p("tls", "Полный аудит", "Версии, все шифры, цепочка", json!({ "versions": true, "ciphers": true })),
         p("tls", "Быстро: только версии", "По одному рукопожатию на версию", json!({ "versions": true, "ciphers": false })),
         p("tls", "Только сертификаты", "Сроки и доверие по всей сети", json!({ "versions": false, "ciphers": false, "concurrency": 64 })),
+        // --- AD ---
+        p("ad", "Обычная проверка", "Домен этой машины, системные DNS", json!({ "domain": "", "dcs": "", "dns_servers": "system", "check_ldaps": true })),
+        p("ad", "Медленная сеть (филиал, VPN)", "Таймаут 8 с", json!({ "timeout_ms": 8000 })),
+        // --- Аудит ---
+        p("audit", "Полный аудит", "Все порты и дополнительные проверки", json!({
+            "tcp_ports": crate::tools::audit::DEFAULT_TCP, "udp_ports": "53,123,161,1434", "ftp_anonymous": true, "tls_versions": true
+        })),
+        p("audit", "Быстро: Windows-сеть", "SMB, RDP, Telnet, SNMP, LDAP", json!({ "tcp_ports": "23,139,445,389,3389,5985", "udp_ports": "161", "tls_versions": false })),
+        p("audit", "Серверы и СУБД", "СУБД, кэши, Docker, Elasticsearch", json!({ "tcp_ports": "1433,2375,3306,5432,6379,9200,11211,27017", "udp_ports": "1434" })),
+        p("audit", "Сетевое оборудование", "Telnet, SSH, веб-интерфейсы, SNMP", json!({ "tcp_ports": "22,23,80,443,8080,8443", "udp_ports": "161" })),
+        p("audit", "Без входа на FTP", "Не пробовать вход anonymous", json!({ "ftp_anonymous": false })),
+        // --- Мониторинг ---
+        p("monitor", "Каждую минуту", "", json!({ "interval_s": 60 })),
+        p("monitor", "Часто: каждые 10 с", "Для разбора инцидента", json!({ "interval_s": 10, "warn_ms": 300 })),
+        p("monitor", "Редко: раз в 15 минут", "Сертификаты и доступность сервисов", json!({ "interval_s": 900 })),
+        p("monitor", "Основные службы домена", "{domain} — DNS-суффикс этой машины; добавьте свои адреса", json!({
+            "checks": "dns _ldap._tcp.dc._msdcs.{domain} type=SRV\ntcp {domain}:389\ntcp {domain}:88"
+        })),
         p("tls", "Все TLS-порты", "443, 465, 636, 853, 993, 995, 3269, 5986, 8443, 9443", json!({ "ports": "443,465,636,853,993,995,3269,5986,8443,9443" })),
     ]
 }
@@ -457,6 +480,9 @@ mod tests {
                 "http" => check::<crate::tools::http::Config>(v, what),
                 "services" => check::<crate::tools::services::Config>(v, what),
                 "tls" => check::<crate::tools::tlsaudit::Config>(v, what),
+                "ad" => check::<crate::tools::ad::Config>(v, what),
+                "audit" => check::<crate::tools::audit::Config>(v, what),
+                "monitor" => check::<crate::tools::monitor::Config>(v, what),
                 other => panic!("{what}: неизвестный инструмент {other}"),
             }
         }

@@ -1,10 +1,13 @@
 //! Интерфейс инструментов диагностики: панели параметров и результатов, пресеты,
 //! палитра команд (Ctrl+K) и передача узлов между инструментами.
 
+mod ad;
+mod audit;
 mod discovery;
 mod dns;
 mod host;
 mod http;
+mod monitor;
 mod mtr;
 mod services;
 mod tls;
@@ -30,10 +33,24 @@ pub enum Tool {
     Http,
     Services,
     Tls,
+    Ad,
+    Audit,
+    Monitor,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 7] = [Tool::Host, Tool::Mtr, Tool::Discovery, Tool::Dns, Tool::Http, Tool::Services, Tool::Tls];
+    pub const ALL: [Tool; 10] = [
+        Tool::Host,
+        Tool::Mtr,
+        Tool::Discovery,
+        Tool::Dns,
+        Tool::Http,
+        Tool::Services,
+        Tool::Tls,
+        Tool::Ad,
+        Tool::Audit,
+        Tool::Monitor,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -44,6 +61,9 @@ impl Tool {
             Tool::Http => "HTTP",
             Tool::Services => "Сервисы",
             Tool::Tls => "TLS",
+            Tool::Ad => "Домен AD",
+            Tool::Audit => "Аудит",
+            Tool::Monitor => "Мониторинг",
         }
     }
 
@@ -56,6 +76,9 @@ impl Tool {
             Tool::Http => "Запрос как curl -v: заголовки, время по фазам, прокси, сертификаты",
             Tool::Services => "Сервисы и версии: баннеры, HTTP, TLS, SMB, RDP, СУБД, UDP",
             Tool::Tls => "TLS-аудит: версии, шифры, цепочка, оценка",
+            Tool::Ad => "Почему не входит в домен: контроллеры, Kerberos, LDAP, время, SMB",
+            Tool::Audit => "Небезопасные настройки в сети: SMBv1, Telnet, RDP без NLA, SNMP public…",
+            Tool::Monitor => "Проверки по расписанию: ping, порты, сайты, DNS, сертификаты",
         }
     }
 
@@ -68,6 +91,9 @@ impl Tool {
             Tool::Http => "http",
             Tool::Services => "services",
             Tool::Tls => "tls",
+            Tool::Ad => "ad",
+            Tool::Audit => "audit",
+            Tool::Monitor => "monitor",
         }
     }
 }
@@ -105,6 +131,9 @@ pub struct Prefs {
     pub http: crate::tools::http::Config,
     pub services: crate::tools::services::Config,
     pub tls: crate::tools::tlsaudit::Config,
+    pub ad: crate::tools::ad::Config,
+    pub audit: crate::tools::audit::Config,
+    pub monitor: crate::tools::monitor::Config,
 }
 
 /// Результаты инструментов для файла сессии.
@@ -118,6 +147,9 @@ pub struct Results {
     pub http: Option<crate::tools::http::Report>,
     pub services: Option<crate::tools::services::Report>,
     pub tls: Option<crate::tools::tlsaudit::Report>,
+    pub ad: Option<crate::tools::ad::Report>,
+    pub audit: Option<crate::tools::audit::Report>,
+    pub monitor: Option<crate::tools::monitor::Report>,
 }
 
 pub struct Workbench {
@@ -132,6 +164,9 @@ pub struct Workbench {
     http: http::Panel,
     services: services::Panel,
     tls: tls::Panel,
+    ad: ad::Panel,
+    audit: audit::Panel,
+    monitor: monitor::Panel,
     palette: Palette,
 }
 
@@ -165,6 +200,9 @@ impl Workbench {
             http: http::Panel::new(prefs.http),
             services: services::Panel::new(prefs.services),
             tls: tls::Panel::new(prefs.tls),
+            ad: ad::Panel::new(prefs.ad),
+            audit: audit::Panel::new(prefs.audit),
+            monitor: monitor::Panel::new(prefs.monitor),
             palette: Palette::default(),
         }
     }
@@ -177,6 +215,9 @@ impl Workbench {
             http: self.http.cfg.clone(),
             services: self.services.cfg.clone(),
             tls: self.tls.cfg.clone(),
+            ad: self.ad.cfg.clone(),
+            audit: self.audit.cfg.clone(),
+            monitor: self.monitor.cfg.clone(),
         }
     }
 
@@ -189,6 +230,9 @@ impl Workbench {
             http: (!self.http.report.runs.is_empty()).then(|| self.http.report.clone()),
             services: (!self.services.report.services.is_empty()).then(|| self.services.report.clone()),
             tls: (!self.tls.report.targets.is_empty()).then(|| self.tls.report.clone()),
+            ad: self.ad.report.clone(),
+            audit: (!self.audit.report.services.is_empty()).then(|| self.audit.report.clone()),
+            monitor: (!self.monitor.report.states.is_empty()).then(|| self.monitor.report.clone()),
         }
     }
 
@@ -214,6 +258,15 @@ impl Workbench {
         if let Some(v) = r.tls {
             self.tls.report = v;
         }
+        if r.ad.is_some() {
+            self.ad.report = r.ad;
+        }
+        if let Some(v) = r.audit {
+            self.audit.report = v;
+        }
+        if let Some(v) = r.monitor {
+            self.monitor.report = v;
+        }
     }
 
     pub fn clear_results(&mut self) {
@@ -225,6 +278,9 @@ impl Workbench {
         self.http.report = Default::default();
         self.services.report = Default::default();
         self.tls.report = Default::default();
+        self.ad.report = None;
+        self.audit.report = Default::default();
+        self.monitor.report = Default::default();
     }
 
     /// Обработка событий фоновых задач (каждый кадр). true — что-то изменилось.
@@ -237,7 +293,15 @@ impl Workbench {
         changed |= self.http.poll();
         changed |= self.services.poll();
         changed |= self.tls.poll();
+        changed |= self.ad.poll();
+        changed |= self.audit.poll();
+        changed |= self.monitor.poll(&mut self.message);
         changed
+    }
+
+    /// Мониторинг зафиксировал сбой (один раз).
+    pub fn take_attention(&mut self) -> bool {
+        std::mem::take(&mut self.monitor.attention)
     }
 
     pub fn busy(&self, t: Tool) -> bool {
@@ -249,6 +313,9 @@ impl Workbench {
             Tool::Http => self.http.busy(),
             Tool::Services => self.services.busy(),
             Tool::Tls => self.tls.busy(),
+            Tool::Ad => self.ad.busy(),
+            Tool::Audit => self.audit.busy(),
+            Tool::Monitor => self.monitor.busy(),
         }
     }
 
@@ -266,6 +333,15 @@ impl Workbench {
             Tool::Http => self.http.report.runs.len(),
             Tool::Services => self.services.report.services.len(),
             Tool::Tls => self.tls.report.targets.len(),
+            Tool::Ad => self.ad.report.as_ref().map(|r| r.dcs.len()).unwrap_or(0),
+            Tool::Audit => self.audit.report.issues.len(),
+            Tool::Monitor => {
+                let fail = self.monitor.report.states.iter().filter(|s| s.status == crate::tools::monitor::Status::Fail).count();
+                if fail > 0 {
+                    return Some(format!("⚠{fail}"));
+                }
+                self.monitor.report.states.len()
+            }
         };
         (n > 0).then(|| n.to_string())
     }
@@ -329,6 +405,9 @@ impl Workbench {
             Tool::Http => self.http.settings_ui(ui, &mut env),
             Tool::Services => self.services.settings_ui(ui, &mut env),
             Tool::Tls => self.tls.settings_ui(ui, &mut env),
+            Tool::Ad => self.ad.settings_ui(ui, &mut env),
+            Tool::Audit => self.audit.settings_ui(ui, &mut env),
+            Tool::Monitor => self.monitor.settings_ui(ui, &mut env),
         }
         nav
     }
@@ -354,6 +433,9 @@ impl Workbench {
             Tool::Http => self.http.results_ui(ui, &mut env),
             Tool::Services => self.services.results_ui(ui, &mut env),
             Tool::Tls => self.tls.results_ui(ui, &mut env),
+            Tool::Ad => self.ad.results_ui(ui, &mut env),
+            Tool::Audit => self.audit.results_ui(ui, &mut env),
+            Tool::Monitor => self.monitor.results_ui(ui, &mut env),
         }
         nav
     }
@@ -385,6 +467,9 @@ impl Workbench {
             Tool::Http => presets::apply(&mut self.http.cfg, &p.values),
             Tool::Services => presets::apply(&mut self.services.cfg, &p.values),
             Tool::Tls => presets::apply(&mut self.tls.cfg, &p.values),
+            Tool::Ad => presets::apply(&mut self.ad.cfg, &p.values),
+            Tool::Audit => presets::apply(&mut self.audit.cfg, &p.values),
+            Tool::Monitor => presets::apply(&mut self.monitor.cfg, &p.values),
         };
         self.message = Some(match r {
             Ok(()) => format!("применён пресет «{}»", p.name),
@@ -405,6 +490,23 @@ impl Workbench {
                 self.http.cfg.url = if host.contains("://") { host.to_string() } else { format!("http://{host}/") };
             }
             Tool::Services => self.services.cfg.targets = host.to_string(),
+            Tool::Ad => self.ad.cfg.dcs = host.to_string(),
+            Tool::Audit => self.audit.cfg.targets = host.to_string(),
+            Tool::Monitor => {
+                let line = if host.contains("://") {
+                    format!("http {host}")
+                } else if host.contains(':') {
+                    format!("tcp {host}")
+                } else {
+                    format!("ping {host}")
+                };
+                if !self.monitor.cfg.checks.lines().any(|l| l.trim() == line) {
+                    if !self.monitor.cfg.checks.is_empty() && !self.monitor.cfg.checks.ends_with('\n') {
+                        self.monitor.cfg.checks.push('\n');
+                    }
+                    self.monitor.cfg.checks.push_str(&line);
+                }
+            }
             Tool::Tls => {
                 if let Some((h, p)) = host.rsplit_once(':')
                     && p.parse::<u16>().is_ok()
@@ -439,6 +541,15 @@ impl Workbench {
         }
         if let Some(v) = get("tls") {
             presets::apply(&mut self.tls.cfg, &v)?;
+        }
+        if let Some(v) = get("ad") {
+            presets::apply(&mut self.ad.cfg, &v)?;
+        }
+        if let Some(v) = get("audit") {
+            presets::apply(&mut self.audit.cfg, &v)?;
+        }
+        if let Some(v) = get("monitor") {
+            presets::apply(&mut self.monitor.cfg, &v)?;
         }
         Ok(())
     }
@@ -670,7 +781,7 @@ pub fn send_menu(ui: &mut egui::Ui, host: &str, nav: &mut Option<Nav>, except: T
         ui.close();
     }
     ui.separator();
-    for t in [Tool::Mtr, Tool::Dns, Tool::Http, Tool::Services, Tool::Tls, Tool::Discovery] {
+    for t in [Tool::Mtr, Tool::Dns, Tool::Http, Tool::Services, Tool::Tls, Tool::Audit, Tool::Monitor] {
         if t == except {
             continue;
         }
@@ -781,6 +892,11 @@ pub fn sparkline(ui: &mut egui::Ui, values: &[Option<f64>], width: f32) {
             }
         }
     }
+}
+
+/// Свёрнутый блок с редко нужными параметрами.
+pub fn advanced(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new("Дополнительно").id_salt(id).default_open(false).show(ui, add);
 }
 
 pub fn labeled<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
