@@ -2596,6 +2596,14 @@ impl App {
             })
         })();
         let cfg = match cfg {
+            Ok(c) if c.target.is_empty() && c.dns_servers.is_empty() && c.test_domain.is_empty() => {
+                self.error = Some(
+                    "Нечего проверять: укажите узел-слушатель, DNS-серверы или тестовый сайт \
+                     (в закрытом контуре — свои узлы за периметром)"
+                        .into(),
+                );
+                return;
+            }
             Ok(c) => c,
             Err(e) => {
                 self.error = Some(e);
