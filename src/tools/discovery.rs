@@ -186,10 +186,8 @@ pub fn parse_nbstat(r: &[u8]) -> Option<NetbiosInfo> {
             }
             (0x1B, false) => info.roles.push("главный обозреватель домена".into()),
             (0x1D, false) => info.roles.push("главный обозреватель сегмента".into()),
-            (0x20, false) => {
-                if !info.roles.iter().any(|r| r == "файловый сервер") {
-                    info.roles.push("файловый сервер".into());
-                }
+            (0x20, false) if !info.roles.iter().any(|r| r == "файловый сервер") => {
+                info.roles.push("файловый сервер".into());
             }
             _ => {}
         }

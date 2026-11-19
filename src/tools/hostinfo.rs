@@ -363,10 +363,10 @@ mod platform {
             for fd in fds.flatten() {
                 if let Ok(link) = std::fs::read_link(fd.path()) {
                     let l = link.to_string_lossy();
-                    if let Some(inode) = l.strip_prefix("socket:[").and_then(|x| x.strip_suffix(']')) {
-                        if let Ok(i) = inode.parse() {
-                            out.entry(i).or_insert((pid, comm.clone()));
-                        }
+                    if let Some(inode) = l.strip_prefix("socket:[").and_then(|x| x.strip_suffix(']'))
+                        && let Ok(i) = inode.parse()
+                    {
+                        out.entry(i).or_insert((pid, comm.clone()));
                     }
                 }
             }

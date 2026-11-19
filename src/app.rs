@@ -27,10 +27,12 @@ use crate::probe::{self, ProbeConfig};
 use crate::scan::{self, MasscanConfig, TcpScanConfig, Tx};
 use crate::session::{self, ArchiveEntry, Coverage, ScanState, Session};
 use crate::targets::{self, TCP_SCAN_MAX_HOSTS};
+use crate::toolui::{self, Nav, PaletteItem, Tool, Workbench};
 use crate::util;
 
 const SETTINGS_KEY: &str = "settings";
 const VIEW_KEY: &str = "view";
+const TOOLS_KEY: &str = "tools";
 const MAX_LOG_LINES: usize = 2000;
 /// Как часто сохранять сессию во время сканирования.
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(15);
@@ -61,6 +63,7 @@ enum Section {
     Proxies,
     Egress,
     Pac,
+    Tool(Tool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -204,6 +207,10 @@ pub struct App {
     listener: Option<(CancellationToken, Vec<u16>, Vec<String>)>,
     /// PAC/WPAD.
     pac: PacState,
+    /// Инструменты диагностики (MTR, DNS, HTTP, сервисы, TLS…).
+    bench: Workbench,
+    /// Подсеть рабочей станции (из автоопределения).
+    local_cidr: Option<String>,
 }
 
 #[derive(Default)]
@@ -241,6 +248,10 @@ impl App {
             .and_then(|s| eframe::get_value(s, VIEW_KEY))
             .unwrap_or_default();
         apply_view(&cc.egui_ctx, &view);
+        let tool_prefs: toolui::Prefs = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, TOOLS_KEY))
+            .unwrap_or_default();
         let session_path = session::default_path();
         let (tx, rx) = channel();
         let mut app = Self {
@@ -284,6 +295,8 @@ impl App {
             egress_cancel: None,
             listener: None,
             pac: PacState::default(),
+            bench: Workbench::new(tool_prefs),
+            local_cidr: None,
         };
         app.archive = session::list_archive(&app.session_path);
         // Незавершённая сессия рядом с программой (в том числе перенесённая с другого ПК).
@@ -328,6 +341,7 @@ impl App {
         }
         self.coverage = s.coverage;
         self.egress_items = s.egress;
+        self.bench.restore_results(s.tools);
         // Сессии старых версий: завершённое сканирование целиком считается проверенным.
         if self.coverage.is_empty()
             && let Some(st) = &self.scan_state
@@ -372,6 +386,7 @@ impl App {
         let mut s = Session::new(&self.settings, self.scan_state.clone(), rows);
         s.coverage = self.coverage.clone();
         s.egress = self.egress_items.clone();
+        s.tools = self.bench.results();
         s
     }
 
@@ -477,6 +492,7 @@ impl App {
         self.scan_state = None;
         self.coverage.clear();
         self.egress_items.clear();
+        self.bench.clear_results();
         self.append_preview = None;
         self.restored = None;
         self.progress = 0.0;
@@ -623,6 +639,9 @@ impl App {
             && (overwrite || self.settings.adapter.trim().is_empty() || !known)
         {
             self.settings.adapter = dev;
+        }
+        if let (Some(ip), Some(prefix)) = (d.source_ip, d.prefix_len) {
+            self.local_cidr = Some(targets::network_cidr(ip, prefix.clamp(16, 32)));
         }
         if self.settings.targets.trim().is_empty()
             && let (Some(ip), Some(prefix)) = (d.source_ip, d.prefix_len)
@@ -1365,82 +1384,101 @@ impl App {
             ui.separator();
             if compact {
                 ui.selectable_value(&mut self.compact_tab, CompactTab::Settings, "Параметры");
+                let count = match self.view.section {
+                    Section::Tool(t) => self.bench.badge(t),
+                    _ => Some(self.rows.len().to_string()),
+                };
                 ui.selectable_value(
                     &mut self.compact_tab,
                     CompactTab::Results,
-                    format!("Результаты ({})", self.rows.len()),
+                    match count {
+                        Some(n) => format!("Результаты ({n})"),
+                        None => "Результаты".to_string(),
+                    },
                 );
                 ui.separator();
             }
-            if !narrow {
-                ui.label("Режим:");
+            // Режим сканера и признаки прав нужны только в разделах прокси.
+            if !matches!(self.view.section, Section::Tool(_)) {
+                self.ui_scanner_badges(ui, narrow);
             }
-            let busy = self.busy();
-            ui.add_enabled_ui(!busy, |ui| {
-                let (m, t) = if narrow {
-                    ("masscan", "TCP")
-                } else {
-                    ("masscan (быстрый)", "TCP-connect (встроенный)")
-                };
-                ui.radio_value(&mut self.settings.mode, ScanMode::Masscan, m).on_hover_text(format!(
-                    "Внешний {}. Требуются {} и права «{}».",
-                    util::MASSCAN_DEFAULT,
-                    util::PCAP_NAME,
-                    util::ADMIN_NAME
-                ));
-                ui.radio_value(&mut self.settings.mode, ScanMode::TcpConnect, t).on_hover_text(
-                    "Встроенный асинхронный сканер. Не требует драйверов и прав администратора; \
-                     подсети до /16.",
-                );
-            });
-            ui.separator();
-            let badge = |ui: &mut egui::Ui, ok: bool, full: &str, hint: &str| {
-                let color = if ok { GREEN } else { AMBER };
-                let text = if narrow { "●".to_string() } else { format!("● {full}") };
-                ui.add(egui::Label::new(RichText::new(text).color(color)).extend())
-                    .on_hover_text(hint);
-            };
-            if self.is_admin {
-                badge(ui, true, util::ADMIN_NAME, "Программа запущена с повышенными правами");
+
+            self.menu_session(ui);
+            self.menu_profile(ui);
+            self.menu_view(ui);
+            if !narrow {
+                ui.weak("Ctrl+K — переход");
+            }
+        });
+    }
+
+    fn ui_scanner_badges(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        if !narrow {
+            ui.label("Режим:");
+        }
+        let busy = self.busy();
+        ui.add_enabled_ui(!busy, |ui| {
+            let (m, t) = if narrow {
+                ("masscan", "TCP")
             } else {
-                badge(
-                    ui,
-                    false,
-                    "обычный пользователь",
-                    if cfg!(windows) {
-                        "Для режима masscan нужны права администратора"
-                    } else {
-                        "Для режима masscan запустите программу через sudo (или дайте masscan CAP_NET_RAW)"
-                    },
-                );
-                if cfg!(windows)
-                    && ui
-                        .small_button(if narrow { "⛨" } else { "Перезапустить от имени администратора" })
-                        .on_hover_text("Перезапустить программу с правами администратора")
-                        .clicked()
-                {
-                    self.autosave();
-                    match util::relaunch_as_admin() {
-                        Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
-                        Err(e) => self.error = Some(e),
-                    }
+                ("masscan (быстрый)", "TCP-connect (встроенный)")
+            };
+            ui.radio_value(&mut self.settings.mode, ScanMode::Masscan, m).on_hover_text(format!(
+                "Внешний {}. Требуются {} и права «{}».",
+                util::MASSCAN_DEFAULT,
+                util::PCAP_NAME,
+                util::ADMIN_NAME
+            ));
+            ui.radio_value(&mut self.settings.mode, ScanMode::TcpConnect, t).on_hover_text(
+                "Встроенный асинхронный сканер. Не требует драйверов и прав администратора; \
+                 подсети до /16.",
+            );
+        });
+        ui.separator();
+        let badge = |ui: &mut egui::Ui, ok: bool, full: &str, hint: &str| {
+            let color = if ok { GREEN } else { AMBER };
+            let text = if narrow { "●".to_string() } else { format!("● {full}") };
+            ui.add(egui::Label::new(RichText::new(text).color(color)).extend())
+                .on_hover_text(hint);
+        };
+        if self.is_admin {
+            badge(ui, true, util::ADMIN_NAME, "Программа запущена с повышенными правами");
+        } else {
+            badge(
+                ui,
+                false,
+                "обычный пользователь",
+                if cfg!(windows) {
+                    "Для режима masscan нужны права администратора"
+                } else {
+                    "Для режима masscan запустите программу через sudo (или дайте masscan CAP_NET_RAW)"
+                },
+            );
+            if cfg!(windows)
+                && ui
+                    .small_button(if narrow { "⛨" } else { "Перезапустить от имени администратора" })
+                    .on_hover_text("Перезапустить программу с правами администратора")
+                    .clicked()
+            {
+                self.autosave();
+                match util::relaunch_as_admin() {
+                    Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.error = Some(e),
                 }
             }
-            let pcap_text = if self.npcap {
-                util::PCAP_NAME.to_string()
-            } else {
-                format!("{} не найден", util::PCAP_NAME)
-            };
-            let pcap_hint = if self.npcap {
-                format!("{} установлен", util::PCAP_NAME)
-            } else {
-                format!("{} не найден: режим masscan недоступен", util::PCAP_NAME)
-            };
-            badge(ui, self.npcap, &pcap_text, &pcap_hint);
-            ui.separator();
-            self.menu_session(ui);
-            self.menu_view(ui);
-        });
+        }
+        let pcap_text = if self.npcap {
+            util::PCAP_NAME.to_string()
+        } else {
+            format!("{} не найден", util::PCAP_NAME)
+        };
+        let pcap_hint = if self.npcap {
+            format!("{} установлен", util::PCAP_NAME)
+        } else {
+            format!("{} не найден: режим masscan недоступен", util::PCAP_NAME)
+        };
+        badge(ui, self.npcap, &pcap_text, &pcap_hint);
+        ui.separator();
     }
 
     fn menu_session(&mut self, ui: &mut egui::Ui) {
@@ -2096,7 +2134,7 @@ impl App {
     }
 
     fn ui_central(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.view.section, Section::Proxies, RichText::new("Прокси").strong());
             let leaks = self.egress_items.iter().filter(|i| i.status.is_leak()).count();
             let label = if leaks > 0 {
@@ -2108,12 +2146,139 @@ impl App {
                 .on_hover_text("Можно ли с этой рабочей станции выйти наружу напрямую, мимо прокси");
             ui.selectable_value(&mut self.view.section, Section::Pac, RichText::new("PAC/WPAD").strong())
                 .on_hover_text("Настройки прокси в системе, поиск WPAD, проверка PAC-файла");
+            ui.separator();
+            for t in Tool::ALL {
+                let mut text = t.title().to_string();
+                if let Some(b) = self.bench.badge(t) {
+                    text = format!("{text} ({b})");
+                }
+                if self.bench.busy(t) {
+                    text = format!("{text} ⏳");
+                }
+                ui.selectable_value(&mut self.view.section, Section::Tool(t), RichText::new(text).strong())
+                    .on_hover_text(t.hint());
+            }
         });
         ui.separator();
         match self.view.section {
             Section::Proxies => self.ui_results(ui),
             Section::Egress => self.ui_egress(ui),
             Section::Pac => self.ui_pac(ui),
+            Section::Tool(t) => {
+                let handle = self.rt.handle().clone();
+                let nav = self.bench.results_ui(t, ui, &handle);
+                self.navigate(nav);
+            }
+        }
+    }
+
+    /// Переход между инструментами (передача узла).
+    fn navigate(&mut self, nav: Option<Nav>) {
+        match nav {
+            Some(Nav::Send(t, host)) => {
+                self.bench.receive(t, &host);
+                self.view.section = Section::Tool(t);
+                self.view.settings_open = true;
+                self.compact_tab = CompactTab::Settings;
+            }
+            Some(Nav::Proxy(host)) => {
+                if !self.busy() {
+                    self.settings.targets = host;
+                }
+                self.view.section = Section::Proxies;
+                self.compact_tab = CompactTab::Settings;
+            }
+            None => {}
+        }
+    }
+
+    /// Левая панель: параметры прокси-сканера или выбранного инструмента.
+    fn ui_left(&mut self, ui: &mut egui::Ui) {
+        match self.view.section {
+            Section::Tool(t) => {
+                let handle = self.rt.handle().clone();
+                let open: Vec<(Ipv4Addr, u16)> = self.rows.iter().map(|r| (r.ip, r.port)).collect();
+                let nav = self.bench.settings_ui(t, ui, &handle, self.local_cidr.clone(), open);
+                self.navigate(nav);
+            }
+            _ => {
+                if !self.busy() {
+                    let handle = self.rt.handle().clone();
+                    self.bench.preset_bar_for(ui, &handle, "proxy", &mut self.settings);
+                }
+                self.ui_settings(ui);
+            }
+        }
+    }
+
+    /// Общий пресет («контур») ко всем инструментам и к прокси-сканеру.
+    fn menu_profile(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Контур ▾", |ui| {
+            ui.set_min_width(320.0);
+            let list: Vec<crate::presets::Preset> =
+                self.bench.store.for_tool(crate::presets::ALL_TOOLS).into_iter().cloned().collect();
+            for p in list {
+                if ui.button(&p.name).on_hover_text(&p.description).clicked() {
+                    self.apply_common_preset(&p);
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Открытый или закрытый контур: настройки сразу для всех инструментов");
+    }
+
+    fn apply_common_preset(&mut self, p: &crate::presets::Preset) {
+        let mut res = Ok(());
+        if let Some(v) = p.values.get("proxy")
+            && !self.busy()
+        {
+            res = crate::presets::apply(&mut self.settings, v);
+        }
+        let res = res.and_then(|_| self.bench.apply_common(p));
+        self.status = match res {
+            Ok(()) => format!("Применён пресет «{}»", p.name),
+            Err(e) => format!("Пресет «{}»: {e}", p.name),
+        };
+        self.push_log(self.status.clone());
+    }
+
+    /// Ctrl+K: инструменты, пресеты, узлы.
+    fn ui_palette(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K))) {
+            self.bench.palette_open();
+        }
+        let tool_id = match self.view.section {
+            Section::Tool(t) => t.preset_id(),
+            _ => "proxy",
+        };
+        let mut hosts: Vec<String> = self.rows.iter().map(|r| format!("{}:{}", r.ip, r.port)).collect();
+        hosts.dedup();
+        match self.bench.palette_ui(ctx, tool_id, &hosts) {
+            Some(PaletteItem::Tool(t)) => self.view.section = Section::Tool(t),
+            Some(PaletteItem::Proxy) => self.view.section = Section::Proxies,
+            Some(PaletteItem::Preset(tool, p)) => {
+                if p.tool == crate::presets::ALL_TOOLS {
+                    self.apply_common_preset(&p);
+                } else if tool == "proxy" {
+                    if !self.busy() {
+                        self.status = match crate::presets::apply(&mut self.settings, &p.values) {
+                            Ok(()) => format!("Применён пресет «{}»", p.name),
+                            Err(e) => e,
+                        };
+                    }
+                } else if let Section::Tool(t) = self.view.section {
+                    self.bench.apply_tool_preset(t, &p);
+                }
+            }
+            Some(PaletteItem::Host(h)) => {
+                let t = match self.view.section {
+                    Section::Tool(t) if t != Tool::Host => t,
+                    _ => Tool::Services,
+                };
+                self.navigate(Some(Nav::Send(t, h)));
+            }
+            None => {}
         }
     }
 
@@ -3154,6 +3319,9 @@ fn cell(ui: &mut egui::Ui, r: &ProxyRow, col: Col) {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
+        if self.bench.poll() {
+            self.dirty = true;
+        }
         self.view.zoom = ctx.zoom_factor();
         if self.busy() && self.dirty && self.last_autosave.elapsed() >= AUTOSAVE_EVERY {
             self.autosave();
@@ -3180,6 +3348,13 @@ impl eframe::App for App {
         }
 
         self.ui_confirm_new_scan(&ui.ctx().clone());
+        self.ui_palette(&ui.ctx().clone());
+        self.bench.windows(&ui.ctx().clone());
+        if let Some(m) = self.bench.message.take() {
+            self.status = m.clone();
+            self.push_log(m);
+        }
+        let selected = if self.view.section == Section::Proxies { self.selected } else { None };
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
@@ -3191,7 +3366,7 @@ impl eframe::App for App {
         let settings_scroll = |app: &mut App, ui: &mut egui::Ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| app.ui_settings(ui));
+                .show(ui, |ui| app.ui_left(ui));
         };
 
         if compact {
@@ -3200,7 +3375,7 @@ impl eframe::App for App {
                     egui::CentralPanel::default().show(ui, |ui| settings_scroll(self, ui));
                 }
                 CompactTab::Results => {
-                    if let Some(key) = self.selected {
+                    if let Some(key) = selected {
                         egui::Panel::bottom("details_bottom")
                             .resizable(true)
                             .default_size(full.height() * 0.42)
@@ -3224,7 +3399,7 @@ impl eframe::App for App {
                 .show(ui, |ui| settings_scroll(self, ui));
             settings_w = r.response.rect.width();
         }
-        if let Some(key) = self.selected {
+        if let Some(key) = selected {
             let details_w = 380.0;
             if full.width() - settings_w - details_w >= DETAILS_SIDE_MIN_TABLE {
                 egui::Panel::right("details_side")
@@ -3248,6 +3423,7 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
         eframe::set_value(storage, VIEW_KEY, &self.view);
+        eframe::set_value(storage, TOOLS_KEY, &self.bench.prefs());
         // Вызывается при закрытии программы и периодически.
         if self.dirty {
             self.autosave();

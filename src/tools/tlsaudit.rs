@@ -755,12 +755,14 @@ mod tests {
 
     #[test]
     fn grading() {
-        let mut t = Target::default();
-        t.versions = vec![
+        let mut t = Target {
+            versions: vec![
             VersionSupport { version: "TLS 1.3".into(), supported: true, ciphers: vec![("TLS_AES_128_GCM_SHA256".into(), Strength::Strong)], note: None },
             VersionSupport { version: "TLS 1.2".into(), supported: true, ciphers: vec![], note: None },
-        ];
-        t.chain = vec![CertDetail { days_left: 200, key: "EC P-256".into(), key_bits: 256, signature: "ecdsa-with-SHA256".into(), ..Default::default() }];
+            ],
+            chain: vec![CertDetail { days_left: 200, key: "EC P-256".into(), key_bits: 256, signature: "ecdsa-with-SHA256".into(), ..Default::default() }],
+            ..Default::default()
+        };
         evaluate(&mut t, 30);
         assert_eq!(t.grade, "A");
         t.versions.push(VersionSupport { version: "TLS 1.0".into(), supported: true, ciphers: vec![], note: None });

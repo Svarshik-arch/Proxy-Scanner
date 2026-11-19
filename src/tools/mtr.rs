@@ -449,9 +449,9 @@ pub async fn run(cfg: Config, sink: Sink<Event>, cancel: CancellationToken) {
     }
 }
 
-async fn futures_join_all<F: std::future::Future>(futs: Vec<F>) -> Vec<F::Output>
+async fn futures_join_all<F>(futs: Vec<F>) -> Vec<F::Output>
 where
-    F: Send + 'static,
+    F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
     let handles: Vec<_> = futs.into_iter().map(tokio::spawn).collect();

@@ -271,7 +271,7 @@ pub fn match_banner(data: &[u8], port: u16, svc: &mut Service) -> bool {
     }
     if first.starts_with("+OK") {
         svc.service = "pop3".into();
-        svc.version = first[3..].trim().to_string();
+        svc.version = first.trim_start_matches("+OK").trim().to_string();
         return true;
     }
     if first.starts_with("* OK") || first.starts_with("* PREAUTH") {
@@ -301,9 +301,9 @@ pub fn match_banner(data: &[u8], port: u16, svc: &mut Service) -> bool {
         }
         return true;
     }
-    if first.starts_with("VERSION ") {
+    if let Some(v) = first.strip_prefix("VERSION ") {
         svc.service = "memcached".into();
-        svc.version = first[8..].to_string();
+        svc.version = v.to_string();
         return true;
     }
     if first.starts_with("HTTP/") {
@@ -533,7 +533,8 @@ async fn scan_tcp(ip: Ipv4Addr, port: u16, cfg: Arc<Config>) -> Option<Service> 
         return Some(svc);
     }
     // Порт-специфичные пробы.
-    let special: Option<(Vec<u8>, fn(&[u8], &mut Service) -> bool)> = match port {
+    type Parser = fn(&[u8], &mut Service) -> bool;
+    let special: Option<(Vec<u8>, Parser)> = match port {
         445 | 139 => Some((smb_negotiate(), parse_smb)),
         3389 => Some((rdp_request(), parse_rdp)),
         1433 => Some((mssql_prelogin(), parse_mssql)),
@@ -594,10 +595,8 @@ async fn scan_tcp(ip: Ipv4Addr, port: u16, cfg: Arc<Config>) -> Option<Service> 
             // TLS-сервер на нестандартном порту отвечает на HTTP алертом или ошибкой.
             let looks_tls = data[0] == 0x15 && data.get(1) == Some(&0x03);
             let text = String::from_utf8_lossy(&data).to_ascii_lowercase();
-            if looks_tls || text.contains("plain http request was sent to https") {
-                if tls_probe(addr, &host, &cfg, &mut svc).await {
-                    return Some(svc);
-                }
+            if (looks_tls || text.contains("plain http request was sent to https")) && tls_probe(addr, &host, &cfg, &mut svc).await {
+                return Some(svc);
             }
             if match_banner(&data, port, &mut svc) {
                 return Some(svc);

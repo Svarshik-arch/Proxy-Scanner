@@ -260,6 +260,9 @@ pub struct Session {
     /// Результаты последней проверки обхода прокси.
     #[serde(default)]
     pub egress: Vec<crate::egress::EgressItem>,
+    /// Результаты инструментов диагностики (MTR, DNS, TLS…).
+    #[serde(default)]
+    pub tools: crate::toolui::Results,
 }
 
 impl Session {
@@ -274,6 +277,7 @@ impl Session {
             rows,
             coverage: Vec::new(),
             egress: Vec::new(),
+            tools: Default::default(),
         }
     }
 

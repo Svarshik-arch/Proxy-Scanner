@@ -155,7 +155,10 @@ impl Versions {
 }
 
 /// Клиентская конфигурация с записывающим верификатором.
-pub fn client_config(versions: Versions, alpn: &[&str]) -> Result<(ClientConfig, Arc<Mutex<Option<String>>>), String> {
+/// Ошибка проверки цепочки, записанная верификатором.
+pub type TrustSlot = Arc<Mutex<Option<String>>>;
+
+pub fn client_config(versions: Versions, alpn: &[&str]) -> Result<(ClientConfig, TrustSlot), String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let vers: &[&'static rustls::SupportedProtocolVersion] = match versions {
         Versions::Auto => rustls::DEFAULT_VERSIONS,

@@ -18,5 +18,6 @@ pub mod probe;
 pub mod scan;
 pub mod session;
 pub mod targets;
+pub mod toolui;
 pub mod tools;
 pub mod util;

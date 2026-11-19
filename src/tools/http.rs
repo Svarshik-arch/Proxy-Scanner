@@ -545,7 +545,7 @@ async fn fetch_inner(cfg: &Config, url: &Url, method: &str, body: &str, hop: &mu
         } else {
             let head = request_text(cfg, url, method, true, body);
             let build = |auth: Option<&str>| finish_request(head.clone(), auth, body);
-            hop.request = build(None);
+            hop.request = finish_request(head.clone(), None, body);
             let (_conn, resp, ttfb, size, trunc, auth) =
                 with_proxy_auth(Box::pin(s), &build, cfg, &proxy_ip, &mut redial, method, false).await?;
             hop.proxy_auth = auth;

@@ -12,6 +12,7 @@ pub struct Ipv4Range {
 }
 
 impl Ipv4Range {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(self) -> u64 {
         (self.end as u64) - (self.start as u64) + 1
     }

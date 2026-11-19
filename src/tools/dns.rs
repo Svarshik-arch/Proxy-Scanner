@@ -479,7 +479,13 @@ pub fn expand_servers(cfg: &Config) -> Result<Vec<Server>, String> {
             out.push(Server::parse(&s, cfg.transport)?);
         }
     }
-    out.dedup();
+    let mut uniq: Vec<Server> = Vec::new();
+    for s in out {
+        if !uniq.iter().any(|u| u.label == s.label && u.transport == s.transport) {
+            uniq.push(s);
+        }
+    }
+    let out = uniq;
     if out.is_empty() {
         return Err("не задан ни один DNS-сервер".into());
     }
@@ -551,7 +557,9 @@ pub fn compare(answers: &[Answer]) -> Vec<((String, String), Vec<&Answer>, bool)
             None => groups.push((key, vec![a], false)),
         }
     }
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
     for g in &mut groups {
+        g.1.sort_by(|a, b| a.server.cmp(&b.server));
         let first = g.1.first().map(|a| a.signature());
         g.2 = g.1.iter().any(|a| Some(a.signature()) != first);
     }
@@ -588,6 +596,47 @@ pub fn render_text(r: &Report) -> String {
         s.push('\n');
     }
     s
+}
+
+/// Обратное разрешение (PTR) через DNS-серверы системы, с кэшем.
+pub async fn reverse_lookup(ip: IpAddr, timeout: Duration) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<IpAddr, Option<String>>>> = OnceLock::new();
+    static SERVERS: OnceLock<Vec<IpAddr>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&ip) {
+        return v.clone();
+    }
+    let servers = match SERVERS.get() {
+        Some(s) => s.clone(),
+        None => {
+            let s = tokio::task::spawn_blocking(system_servers).await.unwrap_or_default();
+            let _ = SERVERS.set(s.clone());
+            s
+        }
+    };
+    let mut result = None;
+    for s in servers.iter().take(2) {
+        let server = Server {
+            label: s.to_string(),
+            transport: Transport::Udp,
+            host: s.to_string(),
+            port: 53,
+            path: String::new(),
+        };
+        let a = query(&server, &Query::new(rand_id(), &dnsproto::reverse_name(ip), 12), timeout, 0).await;
+        if a.error.is_none() {
+            result = a
+                .answers
+                .iter()
+                .find(|r| r.rtype == "PTR")
+                .map(|r| r.data.trim_end_matches('.').to_string());
+            break;
+        }
+    }
+    cache.lock().unwrap().insert(ip, result.clone());
+    result
 }
 
 #[cfg(test)]
@@ -719,45 +768,4 @@ mod tests {
         let diff = [mk("a", "1.1.1.1"), mk("b", "2.2.2.2")];
         assert!(compare(&diff)[0].2);
     }
-}
-
-/// Обратное разрешение (PTR) через DNS-серверы системы, с кэшем.
-pub async fn reverse_lookup(ip: IpAddr, timeout: Duration) -> Option<String> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<IpAddr, Option<String>>>> = OnceLock::new();
-    static SERVERS: OnceLock<Vec<IpAddr>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(v) = cache.lock().unwrap().get(&ip) {
-        return v.clone();
-    }
-    let servers = match SERVERS.get() {
-        Some(s) => s.clone(),
-        None => {
-            let s = tokio::task::spawn_blocking(system_servers).await.unwrap_or_default();
-            let _ = SERVERS.set(s.clone());
-            s
-        }
-    };
-    let mut result = None;
-    for s in servers.iter().take(2) {
-        let server = Server {
-            label: s.to_string(),
-            transport: Transport::Udp,
-            host: s.to_string(),
-            port: 53,
-            path: String::new(),
-        };
-        let a = query(&server, &Query::new(rand_id(), &dnsproto::reverse_name(ip), 12), timeout, 0).await;
-        if a.error.is_none() {
-            result = a
-                .answers
-                .iter()
-                .find(|r| r.rtype == "PTR")
-                .map(|r| r.data.trim_end_matches('.').to_string());
-            break;
-        }
-    }
-    cache.lock().unwrap().insert(ip, result.clone());
-    result
 }
