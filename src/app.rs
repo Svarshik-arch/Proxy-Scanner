@@ -23,7 +23,7 @@ use crate::model::{
     Settings, SslInspection,
 };
 use crate::netdetect::{self, IfaceEntry};
-use crate::probe::{self, ProbeConfig, Url};
+use crate::probe::{self, ProbeConfig};
 use crate::scan::{self, MasscanConfig, TcpScanConfig, Tx};
 use crate::session::{self, ArchiveEntry, Coverage, ScanState, Session};
 use crate::targets::{self, TCP_SCAN_MAX_HOSTS};
@@ -637,38 +637,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn build_probe_cfg(&self) -> Result<ProbeConfig, String> {
-        let s = &self.settings;
-        let test_url = Url::parse(&s.test_http_url).map_err(|e| format!("Тестовый URL: {e}"))?;
-        if test_url.https {
-            return Err("Тестовый URL должен быть http:// (для HTTPS служит поле «TLS-узел»)".into());
-        }
-        let (tls_host, tls_port) =
-            probe::split_host_port(&s.test_tls_host, 443).map_err(|e| format!("TLS-узел: {e}"))?;
-        let policy =
-            probe::parse_policy_rules(&s.policy_rules).map_err(|e| format!("Политики: {e}"))?;
-        Ok(ProbeConfig {
-            timeout: Duration::from_millis(s.probe_timeout_ms.clamp(200, 60_000)),
-            test_url,
-            tls_host,
-            tls_port,
-            reference: None,
-            policy,
-            block_marker: s.block_marker.trim().to_string(),
-            creds: crate::auth::Credentials {
-                mode: s.auth_mode,
-                current_user: s.auth_current_user,
-                user: s.proxy_user.trim().to_string(),
-                password: s.proxy_pass.clone(),
-                domain: s.proxy_domain.trim().to_string(),
-            },
-            retries: s.probe_retries.min(10),
-            badcert_hosts: if s.inspect_quality {
-                probe::parse_host_list(&s.badcert_hosts, 443)
-                    .map_err(|e| format!("Узлы с плохими сертификатами: {e}"))?
-            } else {
-                Vec::new()
-            },
-        })
+        probe::probe_config(&self.settings)
     }
 
     fn new_job(&mut self, with_probe: bool) -> Result<Job, String> {

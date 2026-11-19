@@ -259,7 +259,7 @@ pub fn parse_head(head: &[u8]) -> Option<HttpResp> {
 }
 
 /// Читает заголовки ответа побайтно (чтобы не «съесть» данные после них — это важно для CONNECT).
-async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Vec<u8>> {
+pub async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(512);
     let mut b = [0u8; 1];
     loop {
@@ -422,6 +422,41 @@ fn closes(resp: &HttpResp) -> bool {
         .any(|h| resp.header(h).is_some_and(|v| v.to_ascii_lowercase().contains("close")))
 }
 
+/// Параметры диагностики из настроек (общие для интерфейса и командной строки).
+pub fn probe_config(s: &crate::model::Settings) -> Result<ProbeConfig, String> {
+    let test_url = Url::parse(&s.test_http_url).map_err(|e| format!("Тестовый URL: {e}"))?;
+    if test_url.https {
+        return Err("Тестовый URL должен быть http:// (для HTTPS служит поле «TLS-узел»)".into());
+    }
+    let (tls_host, tls_port) =
+        split_host_port(&s.test_tls_host, 443).map_err(|e| format!("TLS-узел: {e}"))?;
+    let policy =
+        parse_policy_rules(&s.policy_rules).map_err(|e| format!("Политики: {e}"))?;
+    Ok(ProbeConfig {
+        timeout: Duration::from_millis(s.probe_timeout_ms.clamp(200, 60_000)),
+        test_url,
+        tls_host,
+        tls_port,
+        reference: None,
+        policy,
+        block_marker: s.block_marker.trim().to_string(),
+        creds: crate::auth::Credentials {
+            mode: s.auth_mode,
+            current_user: s.auth_current_user,
+            user: s.proxy_user.trim().to_string(),
+            password: s.proxy_pass.clone(),
+            domain: s.proxy_domain.trim().to_string(),
+        },
+        retries: s.probe_retries.min(10),
+        badcert_hosts: if s.inspect_quality {
+            parse_host_list(&s.badcert_hosts, 443)
+                .map_err(|e| format!("Узлы с плохими сертификатами: {e}"))?
+        } else {
+            Vec::new()
+        },
+    })
+}
+
 /// Ответ прокси с учётом аутентификации.
 struct ProxyResponse {
     stream: TcpStream,
@@ -570,7 +605,7 @@ fn has_proxy_headers(resp: &HttpResp) -> bool {
 /// который предъявляет узел, а не доверять ему. По такому каналу отправляются
 /// только тестовые GET-запросы из списка политик, без учётных данных.
 #[derive(Debug)]
-struct AcceptAnyCert;
+pub struct AcceptAnyCert;
 
 impl ServerCertVerifier for AcceptAnyCert {
     fn verify_server_cert(
@@ -609,7 +644,7 @@ impl ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-fn tls_connector() -> Result<TlsConnector, String> {
+pub fn tls_connector() -> Result<TlsConnector, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

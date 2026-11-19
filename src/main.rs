@@ -6,21 +6,7 @@
 // В релизной сборке не открываем окно консоли.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod app;
-mod auth;
-mod columns;
-mod egress;
-mod export;
-mod filters;
-mod graph;
-mod model;
-mod netdetect;
-mod pac;
-mod probe;
-mod scan;
-mod session;
-mod targets;
-mod util;
+use proxy_scanner::{app, cli};
 
 use eframe::Renderer;
 
@@ -47,6 +33,11 @@ fn run(renderer: Renderer) -> eframe::Result {
 }
 
 fn main() {
+    // Подкоманды (`proxy-scanner dns example.com`, `proxy-scanner mtr 10.0.0.1` …)
+    // выполняются без окна.
+    if let Some(code) = cli::dispatch_from_gui_binary() {
+        std::process::exit(code);
+    }
     // Порядок графических бэкендов: по умолчанию wgpu (DirectX 12 / Vulkan),
     // при неудаче — OpenGL. Можно задать явно: `--renderer glow` или `--renderer wgpu`.
     let args: Vec<String> = std::env::args().collect();
