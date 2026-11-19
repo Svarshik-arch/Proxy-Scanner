@@ -35,13 +35,29 @@ jobs:
       - name: Verify the executable is self-contained
         shell: pwsh
         run: |
-          $exe = "target/${{ env.TARGET }}/release/proxy-scanner.exe"
-          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
-          if ($text -match '(?i)vcruntime\d+\.dll|msvcp\d+\.dll|api-ms-win-crt') {
-            Write-Error "CRT linked dynamically: $($Matches[0])"
-            exit 1
+          foreach ($name in 'proxy-scanner.exe', 'proxy-scanner-cli.exe') {
+            $exe = "target/${{ env.TARGET }}/release/$name"
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+            if ($text -match '(?i)vcruntime\d+\.dll|msvcp\d+\.dll|api-ms-win-crt') {
+              Write-Error "CRT linked dynamically in ${name}: $($Matches[0])"
+              exit 1
+            }
+            "{0}: {1:N1} MB, CRT linked statically" -f $exe, ((Get-Item $exe).Length / 1MB)
           }
-          "{0}: {1:N1} MB, CRT linked statically" -f $exe, ((Get-Item $exe).Length / 1MB)
+
+      # Командная строка: справка, пресеты, сведения о хосте, ICMP через IcmpSendEcho, DNS.
+      - name: CLI smoke test
+        shell: pwsh
+        run: |
+          $cli = "target/${{ env.TARGET }}/release/proxy-scanner-cli.exe"
+          & $cli help; if ($LASTEXITCODE) { throw "help: $LASTEXITCODE" }
+          & $cli presets dns; if ($LASTEXITCODE) { throw "presets: $LASTEXITCODE" }
+          $host_json = & $cli host --json -q | Out-String
+          if ($LASTEXITCODE) { throw "host: $LASTEXITCODE" }
+          if (($host_json | ConvertFrom-Json).interfaces.Count -lt 1) { throw 'host: no interfaces' }
+          $ping = & $cli ping 127.0.0.1 --set cycles=2 --set interval_ms=100 --json -q | Out-String | ConvertFrom-Json
+          if ($ping.hops[0].recv -lt 1) { throw "ICMP ping to 127.0.0.1 failed: $($ping | ConvertTo-Json -Depth 5)" }
+          & $cli dns example.com A @8.8.8.8 -q; if ($LASTEXITCODE) { throw "dns: $LASTEXITCODE" }
 
       # Скрипт запуска в режиме проверки под Windows PowerShell 5.1
       # (программа не запускается, проверяется разбор аргументов и проверки окружения).
@@ -59,7 +75,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: proxy-scanner-windows-x64
-          path: target/${{ env.TARGET }}/release/proxy-scanner.exe
+          path: |
+            target/${{ env.TARGET }}/release/proxy-scanner.exe
+            target/${{ env.TARGET }}/release/proxy-scanner-cli.exe
           if-no-files-found: error
 
   # masscan64.exe из официальных исходников (github.com/robertdavidgraham/masscan).
@@ -165,10 +183,23 @@ jobs:
           ldd "$f" || true
           objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
 
+      - name: CLI smoke test
+        run: |
+          cli=target/$LINUX_TARGET/release/proxy-scanner-cli
+          $cli help
+          $cli presets
+          $cli host -q | head -20
+          # UDP-трассировка работает без прав (IP_RECVERR).
+          $cli mtr 127.0.0.1 --set mode=Udp --set cycles=2 --set interval_ms=100 --json -q > mtr.json
+          python3 -c "import json; r=json.load(open('mtr.json')); assert r['hops'][0]['recv'] >= 1, r"
+          $cli dns example.com A @8.8.8.8 -q
+
       - uses: actions/upload-artifact@v4
         with:
           name: proxy-scanner-linux-x64
-          path: target/${{ env.LINUX_TARGET }}/release/proxy-scanner
+          path: |
+            target/${{ env.LINUX_TARGET }}/release/proxy-scanner
+            target/${{ env.LINUX_TARGET }}/release/proxy-scanner-cli
           if-no-files-found: error
 
   # masscan для Linux из тех же официальных исходников 1.3.2.
