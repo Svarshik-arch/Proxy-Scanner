@@ -139,6 +139,16 @@ impl Group {
     }
 }
 
+/// Ключ вкладки для предисловий.
+fn section_key(s: Section) -> String {
+    match s {
+        Section::Proxies => "proxies".into(),
+        Section::Egress => "egress".into(),
+        Section::Pac => "pac".into(),
+        Section::Tool(t) => t.preset_id().into(),
+    }
+}
+
 fn section_title(s: Section) -> (&'static str, &'static str) {
     match s {
         Section::Proxies => ("Поиск прокси", "Обнаружение и диагностика прокси-серверов"),
@@ -195,6 +205,8 @@ struct ViewPrefs {
     last_sections: Vec<Section>,
     /// Текущий проект (пусто — основной).
     project: String,
+    /// Вкладки, у которых скрыто предисловие.
+    hidden_intros: Vec<String>,
 }
 
 impl Default for ViewPrefs {
@@ -211,6 +223,7 @@ impl Default for ViewPrefs {
             section: Section::Proxies,
             last_sections: Vec::new(),
             project: String::new(),
+            hidden_intros: Vec::new(),
         }
     }
 }
@@ -2361,6 +2374,9 @@ impl App {
 
     fn ui_central(&mut self, ui: &mut egui::Ui) {
         let current = Group::of(self.view.section);
+        let intro_key = section_key(self.view.section);
+        let intro_hidden = self.view.hidden_intros.contains(&intro_key);
+        let mut show_intro = false;
         // Разделы.
         ui.horizontal_wrapped(|ui| {
             for g in Group::ALL {
@@ -2387,6 +2403,9 @@ impl App {
                         .find(|s| Group::of(*s) == g)
                         .unwrap_or(g.sections()[0]);
                 }
+            }
+            if current.sections().len() <= 1 && intro_hidden && ui.small_button("?").on_hover_text("Показать описание вкладки").clicked() {
+                show_intro = true;
             }
         });
         // Подразделы, если их несколько.
@@ -2422,7 +2441,37 @@ impl App {
                     }
                     ui.selectable_value(&mut self.view.section, *s, rt).on_hover_text(hint);
                 }
+                if intro_hidden && ui.small_button("?").on_hover_text("Показать описание вкладки").clicked() {
+                    show_intro = true;
+                }
             });
+        }
+        if show_intro {
+            self.view.hidden_intros.retain(|k| *k != intro_key);
+        }
+        // Предисловие: что можно делать на этой вкладке.
+        if section_key(self.view.section) == intro_key
+            && !self.view.hidden_intros.contains(&intro_key)
+            && let Some((summary, points)) = crate::intro::intro(&intro_key)
+        {
+            let mut hide = false;
+            egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(RichText::new(summary).strong()).wrap());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui.small_button("✖").on_hover_text("Скрыть описание (вернуть — кнопка «?»)").clicked() {
+                            hide = true;
+                        }
+                    });
+                });
+                for p in points {
+                    ui.add(egui::Label::new(RichText::new(format!("• {p}")).weak()).wrap());
+                }
+            });
+            if hide {
+                self.view.hidden_intros.push(intro_key.clone());
+            }
         }
         // Запоминаем подраздел группы.
         let sec = self.view.section;
