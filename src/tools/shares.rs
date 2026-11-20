@@ -880,7 +880,7 @@ mod tests {
         let s = |b: &mut Vec<u8>, x: &str| {
             b.extend_from_slice(&(x.len() as u32).to_be_bytes());
             b.extend_from_slice(x.as_bytes());
-            while b.len() % 4 != 0 {
+            while !b.len().is_multiple_of(4) {
                 b.push(0);
             }
         };

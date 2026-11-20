@@ -70,6 +70,8 @@ impl Default for GraphSettings {
 pub struct GraphOutput {
     /// Выбрать строку (открыть подробности).
     pub select: Option<RowKey>,
+    /// Двойной щелчок по узлу карты: его подпись.
+    pub map_activate: Option<String>,
     /// Оставить в фильтре только эту подсеть.
     pub filter_subnet: Option<String>,
     /// Найти по тексту (издатель, адрес).
@@ -86,6 +88,42 @@ enum NodeKind {
     Host,
     Service(ProxyKind),
     Issuer,
+    Map(MapKind),
+}
+
+/// Тип узла карты сети.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MapKind {
+    /// Эта машина.
+    Me,
+    /// Шлюз.
+    Router,
+    /// Промежуточный хоп трассировки.
+    Hop,
+    Subnet,
+    Host,
+    /// Узел с найденными сервисами.
+    Server,
+    /// Контроллер домена.
+    Dc,
+    /// Прокси-сервер.
+    Proxy,
+}
+
+/// Узел карты сети (вход для [`GraphView::ui_map`]).
+#[derive(Debug, Clone, Hash)]
+pub struct MapNode {
+    pub key: String,
+    pub kind: MapKind,
+    pub label: String,
+    pub detail: Vec<String>,
+    /// Узел, к которому он «подвешен» (ребро).
+    pub parent: Option<String>,
+    /// Дополнительные связи.
+    pub links: Vec<String>,
+    /// Проблема (красное кольцо) и предупреждение (оранжевое).
+    pub problem: bool,
+    pub warning: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -143,6 +181,8 @@ pub struct GraphView {
     alpha_target: f32,
     // Взаимодействие
     hovered: Option<usize>,
+    /// Карта сети (другая легенда и подсказки).
+    map_mode: bool,
     dragging: Option<usize>,
     lens: f32,
     settings_open: bool,
@@ -164,6 +204,7 @@ impl Default for GraphView {
             dragging: None,
             lens: 0.0,
             settings_open: false,
+            map_mode: false,
         }
     }
 }
@@ -330,6 +371,42 @@ impl GraphView {
         if sig == self.signature && !self.nodes.is_empty() == !rows.is_empty() {
             return;
         }
+        let (specs, pending_edges) = specs(rows, s);
+        self.rebuild(sig, specs, pending_edges, s);
+    }
+
+    /// Карта сети: узлы задаются снаружи.
+    fn sync_map(&mut self, nodes: &[MapNode], s: &GraphSettings) {
+        let sig = hash_of(&nodes) ^ 0x6d61_7000;
+        if sig == self.signature && !self.nodes.is_empty() == !nodes.is_empty() {
+            return;
+        }
+        let mut edges = Vec::new();
+        let specs = nodes
+            .iter()
+            .map(|n| {
+                for l in &n.links {
+                    edges.push((n.key.clone(), l.clone()));
+                }
+                Spec {
+                    key: n.key.clone(),
+                    kind: NodeKind::Map(n.kind),
+                    label: n.label.clone(),
+                    detail: n.detail.clone(),
+                    row: None,
+                    flags: Flags {
+                        ssl: n.problem,
+                        violations: n.warning,
+                        ..Default::default()
+                    },
+                    parent: n.parent.clone(),
+                }
+            })
+            .collect();
+        self.rebuild(sig, specs, edges, s);
+    }
+
+    fn rebuild(&mut self, sig: u64, specs: Vec<Spec>, mut pending_edges: Vec<(String, String)>, s: &GraphSettings) {
         self.signature = sig;
 
         let old: HashMap<String, (Vec2, Vec2, f32)> = self
@@ -339,7 +416,6 @@ impl GraphView {
             .collect();
         let had_nodes = !self.nodes.is_empty();
 
-        let (specs, mut pending_edges) = specs(rows, s);
         let mut nodes: Vec<Node> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
 
@@ -556,8 +632,25 @@ impl GraphView {
         selected: Option<RowKey>,
         s: &mut GraphSettings,
     ) -> GraphOutput {
-        let mut out = GraphOutput::default();
         self.sync(rows, s);
+        self.map_mode = false;
+        let empty = if rows.is_empty() {
+            "Нет узлов для отображения. Запустите сканирование или ослабьте фильтры."
+        } else {
+            "Нет узлов для отображения."
+        };
+        self.draw(ui, selected, s, empty)
+    }
+
+    /// Карта сети из узлов [`MapNode`].
+    pub fn ui_map(&mut self, ui: &mut Ui, nodes: &[MapNode], s: &mut GraphSettings) -> GraphOutput {
+        self.sync_map(nodes, s);
+        self.map_mode = true;
+        self.draw(ui, None, s, "Карта пуста: соберите сведения о хосте, запустите трассировку или поиск узлов.")
+    }
+
+    fn draw(&mut self, ui: &mut Ui, selected: Option<RowKey>, s: &mut GraphSettings, empty: &str) -> GraphOutput {
+        let mut out = GraphOutput::default();
 
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
@@ -571,11 +664,7 @@ impl GraphView {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                if rows.is_empty() {
-                    "Нет узлов для отображения. Запустите сканирование или ослабьте фильтры."
-                } else {
-                    "Нет узлов для отображения."
-                },
+                empty,
                 FontId::proportional(14.0),
                 pal.muted,
             );
@@ -627,6 +716,15 @@ impl GraphView {
                 NodeKind::Issuer => 5.5,
                 NodeKind::Host => 3.6,
                 NodeKind::Service(_) => 3.0,
+                NodeKind::Map(k) => match k {
+                    MapKind::Me => 7.5,
+                    MapKind::Router => 6.0,
+                    MapKind::Subnet => 6.5,
+                    MapKind::Dc => 5.5,
+                    MapKind::Server | MapKind::Proxy => 4.2,
+                    MapKind::Hop => 3.8,
+                    MapKind::Host => 3.2,
+                },
             };
             s.node_size * (k + 1.3 * (n.degree as f32).sqrt())
         };
@@ -695,6 +793,7 @@ impl GraphView {
                 NodeKind::Issuer => out.filter_text = Some(n.label.clone()),
                 NodeKind::Host => out.filter_subnet = Some(n.label.clone()),
                 NodeKind::Service(_) => {}
+                NodeKind::Map(_) => out.map_activate = Some(n.label.clone()),
             }
         }
 
@@ -862,6 +961,8 @@ impl GraphView {
             NodeKind::Service(_) => "щелчок — подробности",
             NodeKind::Subnet | NodeKind::Host => "двойной щелчок — фильтр по адресу",
             NodeKind::Issuer => "двойной щелчок — поиск по издателю",
+            NodeKind::Map(MapKind::Subnet) => "двойной щелчок — поиск узлов в подсети",
+            NodeKind::Map(_) => "двойной щелчок — трассировка до узла",
         };
         let hint = painter.layout_no_wrap(hint.into(), FontId::proportional(11.0), pal.muted);
         let w = lines
@@ -895,6 +996,17 @@ impl GraphView {
             return;
         }
         let painter = ui.painter_at(rect);
+        let map_items: [(Color32, &str, bool); 9] = [
+            (pal.node(NodeKind::Map(MapKind::Me)), "эта машина", false),
+            (pal.node(NodeKind::Map(MapKind::Router)), "шлюз", false),
+            (pal.node(NodeKind::Map(MapKind::Hop)), "хоп трассировки", false),
+            (pal.node(NodeKind::Map(MapKind::Subnet)), "подсеть", false),
+            (pal.node(NodeKind::Map(MapKind::Server)), "сервер (сервисы)", false),
+            (pal.node(NodeKind::Map(MapKind::Dc)), "контроллер домена", false),
+            (pal.node(NodeKind::Map(MapKind::Proxy)), "прокси", false),
+            (pal.danger, "проблема", true),
+            (pal.warn, "предупреждение", true),
+        ];
         let items: [(Color32, &str, bool); 8] = [
             (pal.node(NodeKind::Subnet), "подсеть", false),
             (pal.node(NodeKind::Host), "узел", false),
@@ -905,11 +1017,12 @@ impl GraphView {
             (pal.danger, "SSL-инспекция", true),
             (pal.warn, "нарушение политик", true),
         ];
+        let items: &[(Color32, &str, bool)] = if self.map_mode { &map_items } else { &items };
         let font = FontId::proportional(11.5);
         let line_h = 17.0;
         let mut y = rect.bottom() - 12.0 - items.len() as f32 * line_h;
         let x = rect.left() + 14.0;
-        for (color, label, ring) in items {
+        for &(color, label, ring) in items {
             let c = pos2(x + 5.0, y + line_h / 2.0);
             if ring {
                 painter.circle_stroke(c, 4.5, Stroke::new(1.4, color));
@@ -1114,6 +1227,16 @@ impl Palette {
             NodeKind::Service(ProxyKind::Socks5 | ProxyKind::Socks4) => self.socks,
             NodeKind::Service(ProxyKind::HttpServer) => self.web,
             NodeKind::Service(_) => self.grey.gamma_multiply(0.7),
+            NodeKind::Map(k) => match k {
+                MapKind::Me => self.accent,
+                MapKind::Router => self.warn,
+                MapKind::Hop => self.grey.gamma_multiply(0.8),
+                MapKind::Subnet => self.subnet,
+                MapKind::Host => self.grey,
+                MapKind::Server => self.web,
+                MapKind::Dc => self.issuer,
+                MapKind::Proxy => self.proxy,
+            },
         }
     }
 }

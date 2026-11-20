@@ -9,6 +9,7 @@ mod discovery;
 mod dns;
 mod host;
 mod http;
+mod map;
 mod matrix;
 mod monitor;
 mod mtr;
@@ -46,10 +47,11 @@ pub enum Tool {
     Compare,
     UrlCheck,
     Shares,
+    Map,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 15] = [
+    pub const ALL: [Tool; 16] = [
         Tool::Host,
         Tool::Mtr,
         Tool::Discovery,
@@ -65,6 +67,7 @@ impl Tool {
         Tool::Compare,
         Tool::UrlCheck,
         Tool::Shares,
+        Tool::Map,
     ];
 
     pub fn title(self) -> &'static str {
@@ -84,6 +87,7 @@ impl Tool {
             Tool::Compare => "Сравнение сессий",
             Tool::UrlCheck => "Проверка URL",
             Tool::Shares => "Общие ресурсы",
+            Tool::Map => "Карта",
         }
     }
 
@@ -104,6 +108,7 @@ impl Tool {
             Tool::Compare => "Что изменилось между двумя проверками",
             Tool::UrlCheck => "Список адресов через прокси: пропущен, заблокирован, подменён сертификат",
             Tool::Shares => "SMB-шары и NFS-экспорты на узлах; доступ без пароля",
+            Tool::Map => "Карта сети из собранных данных: шлюзы, путь, подсети, серверы, контроллеры",
         }
     }
 
@@ -124,6 +129,7 @@ impl Tool {
             Tool::Compare => "compare",
             Tool::UrlCheck => "urlcheck",
             Tool::Shares => "shares",
+            Tool::Map => "map",
         }
     }
 }
@@ -211,6 +217,7 @@ pub struct Workbench {
     compare: compare::Panel,
     urlcheck: urlcheck::Panel,
     shares: shares::Panel,
+    map: map::Panel,
     /// Снимок текущей сессии и архив — для сертификатов и сравнения.
     current: Option<crate::session::Session>,
     archive: Vec<(String, std::path::PathBuf)>,
@@ -255,6 +262,7 @@ impl Workbench {
             compare: compare::Panel::default(),
             urlcheck: urlcheck::Panel::new(prefs.urlcheck),
             shares: shares::Panel::new(prefs.shares),
+            map: map::Panel::default(),
             current: None,
             archive: Vec::new(),
             palette: Palette::default(),
@@ -375,6 +383,7 @@ impl Workbench {
     /// Контекст для «Сертификатов» и «Сравнения»: снимок сессии и архив.
     pub fn set_context(&mut self, current: crate::session::Session, archive: Vec<(String, std::path::PathBuf)>) {
         self.certs.certs = crate::tools::certs::collect(&current);
+        self.map.refresh(&current);
         self.current = Some(current);
         self.archive = archive;
     }
@@ -419,6 +428,7 @@ impl Workbench {
             Tool::Certs | Tool::Compare => false,
             Tool::UrlCheck => self.urlcheck.busy(),
             Tool::Shares => self.shares.busy(),
+            Tool::Map => false,
         }
     }
 
@@ -468,6 +478,7 @@ impl Workbench {
                 self.urlcheck.report.rows.len()
             }
             Tool::Shares => self.shares.report.shares.len(),
+            Tool::Map => return None,
         };
         (n > 0).then(|| n.to_string())
     }
@@ -542,6 +553,7 @@ impl Workbench {
             Tool::Compare => self.compare.settings_ui(ui, self.current.as_ref(), &self.archive),
             Tool::UrlCheck => self.urlcheck.settings_ui(ui, &mut env),
             Tool::Shares => self.shares.settings_ui(ui, &mut env),
+            Tool::Map => self.map.settings_ui(ui, &mut env),
         }
         nav
     }
@@ -575,6 +587,7 @@ impl Workbench {
             Tool::Compare => self.compare.results_ui(ui, &mut env),
             Tool::UrlCheck => self.urlcheck.results_ui(ui, &mut env),
             Tool::Shares => self.shares.results_ui(ui, &mut env),
+            Tool::Map => self.map.results_ui(ui, &mut env),
         }
         nav
     }
@@ -610,7 +623,7 @@ impl Workbench {
             Tool::Audit => presets::apply(&mut self.audit.cfg, &p.values),
             Tool::Monitor => presets::apply(&mut self.monitor.cfg, &p.values),
             Tool::Matrix => presets::apply(&mut self.matrix.cfg, &p.values),
-            Tool::Certs | Tool::Compare => Ok(()),
+            Tool::Certs | Tool::Compare | Tool::Map => Ok(()),
             Tool::UrlCheck => presets::apply(&mut self.urlcheck.cfg, &p.values),
             Tool::Shares => presets::apply(&mut self.shares.cfg, &p.values),
         };
@@ -657,7 +670,7 @@ impl Workbench {
                 }
                 self.matrix.cfg.rules.push_str(&line);
             }
-            Tool::Certs | Tool::Compare => {}
+            Tool::Certs | Tool::Compare | Tool::Map => {}
             Tool::Shares => self.shares.cfg.targets = host.split(':').next().unwrap_or(host).to_string(),
             Tool::UrlCheck => {
                 let line = if host.contains("://") { host.to_string() } else { format!("https://{host}/") };

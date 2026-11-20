@@ -103,7 +103,7 @@ impl Group {
     fn hint(self) -> &'static str {
         match self {
             Group::Proxy => "Поиск и проверка прокси, проверка адресов через прокси, обход прокси, PAC/WPAD",
-            Group::Network => "Эта машина, трассировка, узлы в сети, проверка доступности портов",
+            Group::Network => "Эта машина, трассировка, узлы в сети, доступность портов, карта сети",
             Group::Services => "DNS, HTTP, сервисы и версии, TLS, домен AD, общие ресурсы",
             Group::Audit => "Небезопасные настройки, сертификаты, сравнение с прошлой проверкой",
             Group::Monitor => Tool::Monitor.hint(),
@@ -118,6 +118,7 @@ impl Group {
                 Section::Tool(Tool::Mtr),
                 Section::Tool(Tool::Discovery),
                 Section::Tool(Tool::Matrix),
+                Section::Tool(Tool::Map),
             ],
             Group::Services => &[
                 Section::Tool(Tool::Dns),
@@ -3604,7 +3605,7 @@ impl eframe::App for App {
             self.dirty = true;
         }
         // «Сертификаты» и «Сравнение» работают со снимком всей сессии.
-        if matches!(self.view.section, Section::Tool(Tool::Certs) | Section::Tool(Tool::Compare))
+        if matches!(self.view.section, Section::Tool(Tool::Certs | Tool::Compare | Tool::Map))
             && self.last_context.is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
         {
             let archive = self.archive.iter().map(|a| (a.label(), a.path.clone())).collect();

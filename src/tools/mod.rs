@@ -17,6 +17,7 @@ pub mod icmp;
 pub mod matrix;
 pub mod monitor;
 pub mod mtr;
+pub mod netmap;
 pub mod notify;
 pub mod service;
 pub mod shares;
