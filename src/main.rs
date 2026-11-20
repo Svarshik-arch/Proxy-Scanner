@@ -19,6 +19,10 @@ fn run(renderer: Renderer) -> eframe::Result {
         renderer,
         ..Default::default()
     };
+    // Строго по обновлению экрана: вместе с ровной отрисовкой активного окна
+    // (см. App::logic) частота кадров постоянна и адаптивная синхронизация не скачет.
+    options.wgpu_options.surface.present_mode = eframe::wgpu::PresentMode::Fifo;
+    options.glow_options.vsync = true;
     // Экономичная (встроенная) видеокарта: запрос «высокопроизводительной» на ноутбуках
     // и ПК с двумя видеокартами переключает вывод между ними — монитор гаснет и мигает.
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut options.wgpu_options.wgpu_setup {
