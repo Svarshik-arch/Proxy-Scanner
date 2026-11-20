@@ -57,10 +57,10 @@ Proxy Scanner найдёт masscan рядом с собой. Режим «TCP-co
 
 | Файл | Исходники | Сборка | SHA-256 |
 |---|---|---|---|
-| `proxy-scanner.exe` | этот репозиторий, коммит `7186df2` | `cargo build --release --target x86_64-pc-windows-msvc`, `+crt-static` | `e2251b4820a42d436a4f4da6c2a520da487083edb2b61d8ff2634b926f43be66` |
-| `proxy-scanner-cli.exe` | этот репозиторий, коммит `7186df2` | то же | `de03e35425f45ea8ba6dd1f9ce31b65dcd0681d28c8cc7b26b26bc8a866b0ac1` |
-| `proxy-scanner` | этот репозиторий, коммит `7186df2` | `cargo build --release --target x86_64-unknown-linux-gnu`, Ubuntu 22.04 | `4cd3cbc378dd1e9c191947bc5f24bc131a3eb533b36f8539ad323618d7bf646b` |
-| `proxy-scanner-cli` | этот репозиторий, коммит `7186df2` | то же | `bee1d5592dd270426d80cb7520b31e74ff77e393dde32094cf4d8ca278bdcba1` |
+| `proxy-scanner.exe` | этот репозиторий, коммит `c2ca244` | `cargo build --release --target x86_64-pc-windows-msvc`, `+crt-static` | `64eccfb053a85268398fc6e5aa2f359ebbd28349612acfc8e79ecd475e9e0c7d` |
+| `proxy-scanner-cli.exe` | этот репозиторий, коммит `c2ca244` | то же | `27cbb2a1cfd5076189aa53f896ce243bdbdb9e999c54190d40bce0b0a26c821a` |
+| `proxy-scanner` | этот репозиторий, коммит `c2ca244` | `cargo build --release --target x86_64-unknown-linux-gnu`, Ubuntu 22.04 | `b2092d59a62cb33500b1a96022369a6713608fdc6a713ccbeadd81bcb03f3f90` |
+| `proxy-scanner-cli` | этот репозиторий, коммит `c2ca244` | то же | `80bb043454c5606a5da54fa85d34f64bea7eaa7446da0d4b981fccb1237ce378` |
 | `masscan64.exe` | masscan 1.3.2, коммит `06902c40d149` | MSVC `/O2 /MT` | `20af5c993dd2cf5db34945dad063d440ad124cbe92de2a3bed970122371e602e` |
 | `masscan` | masscan 1.3.2, коммит `06902c40d149` | `make`, Ubuntu 22.04 | `a1402e717a1bad5b6710dfcf2dc49b8c6501de03ede4e04a421452fdabf0a4ce` |
 
