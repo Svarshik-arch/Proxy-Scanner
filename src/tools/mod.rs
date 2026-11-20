@@ -19,6 +19,7 @@ pub mod monitor;
 pub mod mtr;
 pub mod notify;
 pub mod service;
+pub mod shares;
 pub mod oui;
 pub mod tls;
 pub mod urlcheck;

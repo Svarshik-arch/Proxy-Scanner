@@ -210,11 +210,10 @@ async fn check(proxy: &str, rule: &UrlRule, cfg: &Config, direct_issuer: Option<
             }
         }
     }
-    row.mismatch = match (rule.expect, row.outcome) {
-        (Some(true), Outcome::Blocked | Outcome::Error) => true,
-        (Some(false), Outcome::Allowed) => true,
-        _ => false,
-    };
+    row.mismatch = matches!(
+        (rule.expect, row.outcome),
+        (Some(true), Outcome::Blocked | Outcome::Error) | (Some(false), Outcome::Allowed)
+    );
     row
 }
 

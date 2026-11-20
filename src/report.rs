@@ -144,6 +144,14 @@ pub fn findings(s: &Session) -> Vec<(Severity, String, String)> {
             }
         }
     }
+    if let Some(sh) = &s.tools.shares {
+        for x in sh.shares.iter().filter(|x| x.accessible == Some(true) && (x.login == "анонимно" || x.login == "гостем")) {
+            out.push((Severity::Medium, format!("\\\\{}\\{}", x.host, x.name), format!("шара доступна {} (без пароля)", x.login)));
+        }
+        for x in sh.shares.iter().filter(|x| x.kind == "NFS" && x.clients.starts_with("все")) {
+            out.push((Severity::Medium, format!("{}:{}", x.host, x.name), "NFS-экспорт открыт для всех".into()));
+        }
+    }
     if let Some(u) = &s.tools.urlcheck {
         for r in u.rows.iter().filter(|r| r.mismatch) {
             out.push((

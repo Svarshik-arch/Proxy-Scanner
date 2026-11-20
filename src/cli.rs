@@ -33,6 +33,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("monitor", "monitor", "мониторинг: проверки из файла или --set checks=…, по расписанию"),
     ("matrix", "matrix", "матрица доступности: matrix правила.txt (узел:порт open|closed)"),
     ("urls", "urlcheck", "проверка списка адресов через прокси: urls список.txt --set proxies=10.0.0.10:3128"),
+    ("shares", "shares", "SMB-шары и NFS-экспорты: shares УЗЛЫ [--set login=Account --set user=…]"),
     ("listen", "", "слушатель для проверки доступа сюда: listen 443,1433"),
     ("certs", "", "сертификаты из файла сессии: certs сессия.json [-o certs.csv]"),
     ("compare", "", "сравнение сессий: compare было.json стало.json"),
@@ -322,6 +323,7 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "report" => cmd_report(&o),
         "matrix" => cmd_matrix(&o, &store),
         "urls" => cmd_urls(&o, &store),
+        "shares" => cmd_shares(&o, &store),
         "listen" => cmd_listen(&o),
         "certs" => cmd_certs(&o),
         "compare" => cmd_compare(&o),
@@ -659,6 +661,29 @@ fn cmd_urls(o: &Opts, store: &Store) -> Result<(), String> {
     })?;
     report.rows.sort_by(|a, b| (!a.mismatch, &a.url).cmp(&(!b.mismatch, &b.url)));
     emit(o, &report, urlcheck::render_text)
+}
+
+fn cmd_shares(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::shares;
+    if o.fields {
+        print!("{}", fields::<shares::Config>());
+        return Ok(());
+    }
+    let mut cfg: shares::Config = configure("shares", o, store, targets_json("targets", o))?;
+    if let Ok(p) = std::env::var("PROXY_SCANNER_PASSWORD") {
+        cfg.password = p;
+    }
+    let mut report = shares::Report::default();
+    let quiet = o.quiet;
+    drive(o, |s, c| shares::run(cfg, s, c), |e| match e {
+        shares::Event::Log(m) => eprint_line(quiet, &m),
+        shares::Event::Total(_) => {}
+        shares::Event::Host(h, list) => {
+            report.hosts.push(*h);
+            report.shares.extend(list);
+        }
+    })?;
+    emit(o, &report, shares::render_text)
 }
 
 fn cmd_listen(o: &Opts) -> Result<(), String> {

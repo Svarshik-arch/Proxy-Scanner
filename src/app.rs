@@ -104,7 +104,7 @@ impl Group {
         match self {
             Group::Proxy => "Поиск и проверка прокси, проверка адресов через прокси, обход прокси, PAC/WPAD",
             Group::Network => "Эта машина, трассировка, узлы в сети, проверка доступности портов",
-            Group::Services => "DNS, HTTP, сервисы и версии, TLS, домен AD",
+            Group::Services => "DNS, HTTP, сервисы и версии, TLS, домен AD, общие ресурсы",
             Group::Audit => "Небезопасные настройки, сертификаты, сравнение с прошлой проверкой",
             Group::Monitor => Tool::Monitor.hint(),
         }
@@ -125,6 +125,7 @@ impl Group {
                 Section::Tool(Tool::Services),
                 Section::Tool(Tool::Tls),
                 Section::Tool(Tool::Ad),
+                Section::Tool(Tool::Shares),
             ],
             Group::Audit => &[Section::Tool(Tool::Audit), Section::Tool(Tool::Certs), Section::Tool(Tool::Compare)],
             Group::Monitor => &[Section::Tool(Tool::Monitor)],

@@ -30,6 +30,7 @@ pub const TOOLS: &[(&str, &str)] = &[
     ("monitor", "Мониторинг"),
     ("matrix", "Доступность"),
     ("urlcheck", "Проверка URL"),
+    ("shares", "Общие ресурсы"),
 ];
 
 /// Поля, которые никогда не попадают в пользовательский пресет: они описывают
@@ -37,7 +38,7 @@ pub const TOOLS: &[(&str, &str)] = &[
 pub fn never_saved(tool: &str) -> &'static [&'static str] {
     match tool {
         "proxy" => &["source_ip", "router_ip", "router_mac", "adapter", "masscan_path", "proxy_pass"],
-        "urlcheck" => &["password"],
+        "urlcheck" | "shares" => &["password"],
         "http" => &["proxy_pass"],
         _ => &[],
     }
@@ -55,6 +56,7 @@ pub fn target_fields(tool: &str) -> &'static [&'static str] {
         "monitor" => &["checks"],
         "matrix" => &["rules"],
         "urlcheck" => &["proxies", "urls"],
+        "shares" => &["targets"],
         _ => &[],
     }
 }
@@ -245,6 +247,9 @@ pub fn builtin() -> Vec<Preset> {
             "urls": "+ https://www.gosuslugi.ru/\n- https://www.torproject.org/\n- https://www.dropbox.com/\n- https://mega.nz/\n- https://web.telegram.org/\n- https://www.speedtest.net/"
         })),
         p("urlcheck", "Через прокси под текущим пользователем", "NTLM/Kerberos через SSPI", json!({ "auth": "Auto", "current_user": true })),
+        // --- Общие ресурсы ---
+        p("shares", "Анонимный доступ", "Что видно и доступно без пароля — находка для аудита", json!({ "login": "Anonymous", "check_access": true })),
+        p("shares", "Только SMB", "", json!({ "smb": true, "nfs": false })),
         // --- Матрица доступности ---
         p("matrix", "Обычная проверка", "Таймаут 2 с, один повтор", json!({ "timeout_ms": 2000, "retries": 1 })),
         p("matrix", "Медленные каналы (филиалы, VPN)", "Таймаут 5 с, два повтора", json!({ "timeout_ms": 5000, "retries": 2 })),
@@ -501,6 +506,7 @@ mod tests {
                 "monitor" => check::<crate::tools::monitor::Config>(v, what),
                 "matrix" => check::<crate::tools::matrix::Config>(v, what),
                 "urlcheck" => check::<crate::tools::urlcheck::Config>(v, what),
+                "shares" => check::<crate::tools::shares::Config>(v, what),
                 other => panic!("{what}: неизвестный инструмент {other}"),
             }
         }
