@@ -14,6 +14,7 @@ mod monitor;
 mod mtr;
 mod services;
 mod tls;
+mod urlcheck;
 
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -42,10 +43,11 @@ pub enum Tool {
     Matrix,
     Certs,
     Compare,
+    UrlCheck,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 13] = [
+    pub const ALL: [Tool; 14] = [
         Tool::Host,
         Tool::Mtr,
         Tool::Discovery,
@@ -59,6 +61,7 @@ impl Tool {
         Tool::Matrix,
         Tool::Certs,
         Tool::Compare,
+        Tool::UrlCheck,
     ];
 
     pub fn title(self) -> &'static str {
@@ -76,6 +79,7 @@ impl Tool {
             Tool::Matrix => "Доступность",
             Tool::Certs => "Сертификаты",
             Tool::Compare => "Сравнение сессий",
+            Tool::UrlCheck => "Проверка URL",
         }
     }
 
@@ -94,6 +98,7 @@ impl Tool {
             Tool::Matrix => "Правила межсетевого экрана: откуда → куда → порт, с ожиданием «открыт/закрыт»",
             Tool::Certs => "Все найденные сертификаты по сроку окончания, выгрузка в Excel",
             Tool::Compare => "Что изменилось между двумя проверками",
+            Tool::UrlCheck => "Список адресов через прокси: пропущен, заблокирован, подменён сертификат",
         }
     }
 
@@ -112,6 +117,7 @@ impl Tool {
             Tool::Matrix => "matrix",
             Tool::Certs => "certs",
             Tool::Compare => "compare",
+            Tool::UrlCheck => "urlcheck",
         }
     }
 }
@@ -137,6 +143,8 @@ pub struct Env<'a> {
     pub local_cidr: Option<String>,
     /// Открытые порты из сканирования прокси.
     pub proxy_open: Vec<(std::net::Ipv4Addr, u16)>,
+    /// Найденные HTTP-прокси `ip:порт`.
+    pub http_proxies: Vec<String>,
 }
 
 /// Сохраняемые параметры всех инструментов.
@@ -153,6 +161,7 @@ pub struct Prefs {
     pub audit: crate::tools::audit::Config,
     pub monitor: crate::tools::monitor::Config,
     pub matrix: crate::tools::matrix::Config,
+    pub urlcheck: crate::tools::urlcheck::Config,
 }
 
 /// Результаты инструментов для файла сессии.
@@ -171,6 +180,7 @@ pub struct Results {
     pub monitor: Option<crate::tools::monitor::Report>,
     /// Матрица доступности: результаты с разных машин-источников.
     pub matrix: Option<Vec<crate::tools::matrix::Report>>,
+    pub urlcheck: Option<crate::tools::urlcheck::Report>,
 }
 
 pub struct Workbench {
@@ -191,6 +201,7 @@ pub struct Workbench {
     matrix: matrix::Panel,
     certs: certs::Panel,
     compare: compare::Panel,
+    urlcheck: urlcheck::Panel,
     /// Снимок текущей сессии и архив — для сертификатов и сравнения.
     current: Option<crate::session::Session>,
     archive: Vec<(String, std::path::PathBuf)>,
@@ -233,10 +244,26 @@ impl Workbench {
             matrix: matrix::Panel::new(prefs.matrix),
             certs: certs::Panel::default(),
             compare: compare::Panel::default(),
+            urlcheck: urlcheck::Panel::new(prefs.urlcheck),
             current: None,
             archive: Vec::new(),
             palette: Palette::default(),
         }
+    }
+
+    /// Параметры инструментов из проекта.
+    pub fn set_prefs(&mut self, p: Prefs) {
+        self.mtr.cfg = p.mtr;
+        self.discovery.cfg = p.discovery;
+        self.dns.cfg = p.dns;
+        self.http.cfg = p.http;
+        self.services.cfg = p.services;
+        self.tls.cfg = p.tls;
+        self.ad.cfg = p.ad;
+        self.audit.cfg = p.audit;
+        self.monitor.cfg = p.monitor;
+        self.matrix.cfg = p.matrix;
+        self.urlcheck.cfg = p.urlcheck;
     }
 
     pub fn prefs(&self) -> Prefs {
@@ -251,6 +278,7 @@ impl Workbench {
             audit: self.audit.cfg.clone(),
             monitor: self.monitor.cfg.clone(),
             matrix: self.matrix.cfg.clone(),
+            urlcheck: self.urlcheck.cfg.clone(),
         }
     }
 
@@ -267,6 +295,7 @@ impl Workbench {
             audit: (!self.audit.report.services.is_empty()).then(|| self.audit.report.clone()),
             monitor: (!self.monitor.report.states.is_empty()).then(|| self.monitor.report.clone()),
             matrix: (!self.matrix.reports.is_empty()).then(|| self.matrix.reports.clone()),
+            urlcheck: (!self.urlcheck.report.rows.is_empty()).then(|| self.urlcheck.report.clone()),
         }
     }
 
@@ -304,6 +333,9 @@ impl Workbench {
         if let Some(v) = r.matrix {
             self.matrix.reports = v;
         }
+        if let Some(v) = r.urlcheck {
+            self.urlcheck.report = v;
+        }
     }
 
     pub fn clear_results(&mut self) {
@@ -320,6 +352,7 @@ impl Workbench {
         self.monitor.report = Default::default();
         self.matrix.reports.clear();
         self.certs.certs.clear();
+        self.urlcheck.report = Default::default();
     }
 
     /// Контекст для «Сертификатов» и «Сравнения»: снимок сессии и архив.
@@ -343,6 +376,7 @@ impl Workbench {
         changed |= self.audit.poll();
         changed |= self.monitor.poll(&mut self.message);
         changed |= self.matrix.poll();
+        changed |= self.urlcheck.poll();
         changed
     }
 
@@ -365,6 +399,7 @@ impl Workbench {
             Tool::Monitor => self.monitor.busy(),
             Tool::Matrix => self.matrix.busy(),
             Tool::Certs | Tool::Compare => false,
+            Tool::UrlCheck => self.urlcheck.busy(),
         }
     }
 
@@ -406,6 +441,13 @@ impl Workbench {
                 self.certs.certs.len()
             }
             Tool::Compare => self.compare.diff.as_ref().map(|d| d.changes.len()).unwrap_or(0),
+            Tool::UrlCheck => {
+                let m = self.urlcheck.report.mismatches();
+                if m > 0 {
+                    return Some(format!("⚠{m}"));
+                }
+                self.urlcheck.report.rows.len()
+            }
         };
         (n > 0).then(|| n.to_string())
     }
@@ -432,6 +474,7 @@ impl Workbench {
             message,
             local_cidr,
             proxy_open,
+            http_proxies: Vec::new(),
         }
     }
 
@@ -442,6 +485,7 @@ impl Workbench {
         rt: &Handle,
         local_cidr: Option<String>,
         proxy_open: Vec<(std::net::Ipv4Addr, u16)>,
+        http_proxies: Vec<String>,
     ) -> Option<Nav> {
         let mut nav = None;
         let mut env = Self::env(
@@ -455,6 +499,7 @@ impl Workbench {
             local_cidr,
             proxy_open,
         );
+        env.http_proxies = http_proxies;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.heading(t.title());
@@ -475,6 +520,7 @@ impl Workbench {
             Tool::Matrix => self.matrix.settings_ui(ui, &mut env),
             Tool::Certs => self.certs.settings_ui(ui, &mut env),
             Tool::Compare => self.compare.settings_ui(ui, self.current.as_ref(), &self.archive),
+            Tool::UrlCheck => self.urlcheck.settings_ui(ui, &mut env),
         }
         nav
     }
@@ -506,6 +552,7 @@ impl Workbench {
             Tool::Matrix => self.matrix.results_ui(ui, &mut env),
             Tool::Certs => self.certs.results_ui(ui, &mut env),
             Tool::Compare => self.compare.results_ui(ui, &mut env),
+            Tool::UrlCheck => self.urlcheck.results_ui(ui, &mut env),
         }
         nav
     }
@@ -542,6 +589,7 @@ impl Workbench {
             Tool::Monitor => presets::apply(&mut self.monitor.cfg, &p.values),
             Tool::Matrix => presets::apply(&mut self.matrix.cfg, &p.values),
             Tool::Certs | Tool::Compare => Ok(()),
+            Tool::UrlCheck => presets::apply(&mut self.urlcheck.cfg, &p.values),
         };
         self.message = Some(match r {
             Ok(()) => format!("применён пресет «{}»", p.name),
@@ -587,6 +635,13 @@ impl Workbench {
                 self.matrix.cfg.rules.push_str(&line);
             }
             Tool::Certs | Tool::Compare => {}
+            Tool::UrlCheck => {
+                let line = if host.contains("://") { host.to_string() } else { format!("https://{host}/") };
+                if !self.urlcheck.cfg.urls.is_empty() && !self.urlcheck.cfg.urls.ends_with('\n') {
+                    self.urlcheck.cfg.urls.push('\n');
+                }
+                self.urlcheck.cfg.urls.push_str(&line);
+            }
             Tool::Tls => {
                 if let Some((h, p)) = host.rsplit_once(':')
                     && p.parse::<u16>().is_ok()
@@ -633,6 +688,9 @@ impl Workbench {
         }
         if let Some(v) = get("matrix") {
             presets::apply(&mut self.matrix.cfg, &v)?;
+        }
+        if let Some(v) = get("urlcheck") {
+            presets::apply(&mut self.urlcheck.cfg, &v)?;
         }
         Ok(())
     }

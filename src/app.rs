@@ -102,7 +102,7 @@ impl Group {
 
     fn hint(self) -> &'static str {
         match self {
-            Group::Proxy => "Поиск и проверка прокси, обход прокси, PAC/WPAD",
+            Group::Proxy => "Поиск и проверка прокси, проверка адресов через прокси, обход прокси, PAC/WPAD",
             Group::Network => "Эта машина, трассировка, узлы в сети, проверка доступности портов",
             Group::Services => "DNS, HTTP, сервисы и версии, TLS, домен AD",
             Group::Audit => "Небезопасные настройки, сертификаты, сравнение с прошлой проверкой",
@@ -112,7 +112,7 @@ impl Group {
 
     fn sections(self) -> &'static [Section] {
         match self {
-            Group::Proxy => &[Section::Proxies, Section::Egress, Section::Pac],
+            Group::Proxy => &[Section::Proxies, Section::Tool(Tool::UrlCheck), Section::Egress, Section::Pac],
             Group::Network => &[
                 Section::Tool(Tool::Host),
                 Section::Tool(Tool::Mtr),
@@ -190,6 +190,8 @@ struct ViewPrefs {
     section: Section,
     /// Последний открытый подраздел каждой группы.
     last_sections: Vec<Section>,
+    /// Текущий проект (пусто — основной).
+    project: String,
 }
 
 impl Default for ViewPrefs {
@@ -205,6 +207,7 @@ impl Default for ViewPrefs {
             graph: GraphSettings::default(),
             section: Section::Proxies,
             last_sections: Vec::new(),
+            project: String::new(),
         }
     }
 }
@@ -335,7 +338,7 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value(s, TOOLS_KEY))
             .unwrap_or_default();
-        let session_path = session::default_path();
+        let session_path = session::project_path(&view.project);
         let (tx, rx) = channel();
         let mut app = Self {
             rt,
@@ -426,6 +429,9 @@ impl App {
         self.coverage = s.coverage;
         self.egress_items = s.egress;
         self.bench.restore_results(s.tools);
+        if let Some(p) = s.tool_prefs {
+            self.bench.set_prefs(p);
+        }
         // Сессии старых версий: завершённое сканирование целиком считается проверенным.
         if self.coverage.is_empty()
             && let Some(st) = &self.scan_state
@@ -471,7 +477,93 @@ impl App {
         s.coverage = self.coverage.clone();
         s.egress = self.egress_items.clone();
         s.tools = self.bench.results();
+        s.tool_prefs = Some(self.bench.prefs());
         s
+    }
+
+    /// Переключение проекта: текущая сессия сохраняется, загружается сессия проекта.
+    fn switch_project(&mut self, name: &str) {
+        if self.busy() || self.bench.any_busy() {
+            self.status = "Дождитесь окончания работы инструментов, затем переключите проект".into();
+            return;
+        }
+        let name = session::sanitize(name);
+        if name == self.view.project {
+            return;
+        }
+        self.autosave();
+        self.view.project = name.clone();
+        self.session_path = session::project_path(&name);
+        if let Some(dir) = self.session_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Чистое состояние, затем загрузка сессии проекта, если она есть.
+        self.rows.clear();
+        self.index.clear();
+        self.selected = None;
+        self.scan_state = None;
+        self.coverage.clear();
+        self.egress_items.clear();
+        self.bench.clear_results();
+        self.append_preview = None;
+        self.restored = None;
+        self.progress = 0.0;
+        self.archive = session::list_archive(&self.session_path);
+        if self.session_path.is_file() {
+            match session::load(&self.session_path) {
+                Ok(s) => self.restore_session(s),
+                Err(e) => self.push_log(format!("проект: {e}")),
+            }
+        }
+        self.dirty = true;
+        self.status = format!("Проект: {}", if name.is_empty() { "основной" } else { &name });
+        self.push_log(self.status.clone());
+    }
+
+    fn menu_project(&mut self, ui: &mut egui::Ui) {
+        let title = if self.view.project.is_empty() { "Проект ▾".to_string() } else { format!("Проект: {} ▾", self.view.project) };
+        ui.menu_button(title, |ui| {
+            ui.set_min_width(260.0);
+            ui.weak("У каждого проекта (объект, филиал) свои цели, настройки инструментов, результаты и архив.");
+            ui.separator();
+            let mut pick: Option<String> = None;
+            if ui.radio(self.view.project.is_empty(), "Основной").clicked() {
+                pick = Some(String::new());
+            }
+            for p in session::list_projects() {
+                if ui.radio(self.view.project == p, &p).clicked() {
+                    pick = Some(p);
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                let id = egui::Id::unique("new_project_name");
+                let mut name: String = ui.data_mut(|d| d.get_temp(id).unwrap_or_default());
+                ui.add(egui::TextEdit::singleline(&mut name).hint_text("новый проект").desired_width(150.0));
+                let ok = !session::sanitize(&name).is_empty();
+                if ui.add_enabled(ok, egui::Button::new("Создать")).clicked() {
+                    pick = Some(name.clone());
+                    name.clear();
+                }
+                ui.data_mut(|d| d.insert_temp(id, name));
+            });
+            if ui.button("Открыть папку проектов").clicked() {
+                let dir = session::projects_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                let d = dir.display().to_string();
+                if cfg!(windows) {
+                    let _ = util::run_cmd("explorer.exe", &[&d]);
+                } else {
+                    let _ = std::process::Command::new("xdg-open").arg(&d).spawn();
+                }
+            }
+            if let Some(p) = pick {
+                self.switch_project(&p);
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Объекты и филиалы: у каждого свои цели и результаты");
     }
 
     fn save_session_to(&mut self, path: &std::path::Path) -> Result<(), String> {
@@ -1487,6 +1579,7 @@ impl App {
                 self.ui_scanner_badges(ui, narrow);
             }
 
+            self.menu_project(ui);
             self.menu_session(ui);
             if ui.button("Отчёт").on_hover_text("Сводный отчёт HTML по всем разделам — для заявки или акта").clicked() {
                 self.save_report();
@@ -2371,7 +2464,13 @@ impl App {
             Section::Tool(t) => {
                 let handle = self.rt.handle().clone();
                 let open: Vec<(Ipv4Addr, u16)> = self.rows.iter().map(|r| (r.ip, r.port)).collect();
-                let nav = self.bench.settings_ui(t, ui, &handle, self.local_cidr.clone(), open);
+                let proxies: Vec<String> = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.kind == ProxyKind::HttpProxy)
+                    .map(|r| format!("{}:{}", r.ip, r.port))
+                    .collect();
+                let nav = self.bench.settings_ui(t, ui, &handle, self.local_cidr.clone(), open, proxies);
                 self.navigate(nav);
             }
             _ => {

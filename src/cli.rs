@@ -32,6 +32,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("audit", "audit", "аудит небезопасных настроек в сети"),
     ("monitor", "monitor", "мониторинг: проверки из файла или --set checks=…, по расписанию"),
     ("matrix", "matrix", "матрица доступности: matrix правила.txt (узел:порт open|closed)"),
+    ("urls", "urlcheck", "проверка списка адресов через прокси: urls список.txt --set proxies=10.0.0.10:3128"),
     ("listen", "", "слушатель для проверки доступа сюда: listen 443,1433"),
     ("certs", "", "сертификаты из файла сессии: certs сессия.json [-o certs.csv]"),
     ("compare", "", "сравнение сессий: compare было.json стало.json"),
@@ -320,6 +321,7 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "monitor" => cmd_monitor(&o, &store),
         "report" => cmd_report(&o),
         "matrix" => cmd_matrix(&o, &store),
+        "urls" => cmd_urls(&o, &store),
         "listen" => cmd_listen(&o),
         "certs" => cmd_certs(&o),
         "compare" => cmd_compare(&o),
@@ -632,6 +634,31 @@ fn cmd_matrix(o: &Opts, store: &Store) -> Result<(), String> {
         eprint_line(quiet, &format!("расхождений: {mismatches}"));
     }
     Ok(())
+}
+
+fn cmd_urls(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::urlcheck;
+    if o.fields {
+        print!("{}", fields::<urlcheck::Config>());
+        return Ok(());
+    }
+    let primary = match o.positional.first() {
+        Some(path) => json!({ "urls": std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))? }),
+        None => json!({}),
+    };
+    let mut cfg: urlcheck::Config = configure("urlcheck", o, store, primary)?;
+    if let Ok(p) = std::env::var("PROXY_SCANNER_PROXY_PASSWORD") {
+        cfg.password = p;
+    }
+    let mut report = urlcheck::Report::default();
+    let quiet = o.quiet;
+    drive(o, |s, c| urlcheck::run(cfg, s, c), |e| match e {
+        urlcheck::Event::Log(m) => eprint_line(quiet, &m),
+        urlcheck::Event::Total(_) => {}
+        urlcheck::Event::Row(r) => report.rows.push(*r),
+    })?;
+    report.rows.sort_by(|a, b| (!a.mismatch, &a.url).cmp(&(!b.mismatch, &b.url)));
+    emit(o, &report, urlcheck::render_text)
 }
 
 fn cmd_listen(o: &Opts) -> Result<(), String> {

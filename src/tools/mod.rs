@@ -21,6 +21,7 @@ pub mod notify;
 pub mod service;
 pub mod oui;
 pub mod tls;
+pub mod urlcheck;
 pub mod services;
 pub mod tlsaudit;
 

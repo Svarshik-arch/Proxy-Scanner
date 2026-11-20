@@ -263,6 +263,9 @@ pub struct Session {
     /// Результаты инструментов диагностики (MTR, DNS, TLS…).
     #[serde(default)]
     pub tools: crate::toolui::Results,
+    /// Параметры инструментов (цели, порты…) — у каждого проекта свои.
+    #[serde(default)]
+    pub tool_prefs: Option<crate::toolui::Prefs>,
 }
 
 impl Session {
@@ -278,6 +281,7 @@ impl Session {
             coverage: Vec::new(),
             egress: Vec::new(),
             tools: Default::default(),
+            tool_prefs: None,
         }
     }
 
@@ -340,6 +344,39 @@ pub fn default_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("proxy-scanner").join(FILE_NAME)
+}
+
+/// Папка проектов рядом с основным файлом сессии.
+pub fn projects_dir() -> PathBuf {
+    default_path().with_file_name("proxy-scanner-projects")
+}
+
+/// Файл сессии проекта (пустое имя — основной).
+pub fn project_path(name: &str) -> PathBuf {
+    if name.trim().is_empty() {
+        default_path()
+    } else {
+        projects_dir().join(sanitize(name)).join(FILE_NAME)
+    }
+}
+
+/// Имя папки проекта без недопустимых символов.
+pub fn sanitize(name: &str) -> String {
+    name.trim()
+        .chars()
+        .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .collect::<String>()
+        .trim_matches(['.', ' '])
+        .to_string()
+}
+
+/// Существующие проекты.
+pub fn list_projects() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(projects_dir())
+        .map(|d| d.flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    v.sort_by_key(|s| s.to_lowercase());
+    v
 }
 
 fn dir_writable(dir: &Path) -> bool {

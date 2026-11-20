@@ -144,6 +144,20 @@ pub fn findings(s: &Session) -> Vec<(Severity, String, String)> {
             }
         }
     }
+    if let Some(u) = &s.tools.urlcheck {
+        for r in u.rows.iter().filter(|r| r.mismatch) {
+            out.push((
+                Severity::Medium,
+                format!("{} через {}", r.url, r.proxy),
+                format!(
+                    "ожидалось «{}», на деле «{}» ({})",
+                    if r.expect == Some(true) { "открываться" } else { "блокироваться" },
+                    r.outcome.label(),
+                    r.detail
+                ),
+            ));
+        }
+    }
     for c in crate::tools::certs::collect(s) {
         match c.days_left {
             Some(d) if d < 0 => out.push((Severity::High, c.endpoints.join(", "), format!("сертификат «{}» просрочен ({} дн.)", c.subject, -d))),
