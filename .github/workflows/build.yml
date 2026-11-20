@@ -259,3 +259,64 @@ jobs:
             masscan/bin/masscan
             masscan/LICENSE
           if-no-files-found: error
+
+  # Готовые архивы на странице релизов — после каждой успешной сборки ветки main.
+  # Ссылки вида releases/latest/download/<архив> всегда ведут на последнюю сборку.
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [windows, masscan, linux, masscan-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          w=pkg/win/proxy-scanner; l=pkg/lin/proxy-scanner
+          mkdir -p "$w" "$l" dist
+          cp art/proxy-scanner-windows-x64/*.exe art/masscan64-windows-x64/masscan64.exe "$w/"
+          cp art/masscan64-windows-x64/LICENSE "$w/masscan-LICENSE"
+          cp release/proxy-scanner.ps1 release/proxy-scanner.cmd release/README.md docs/TOOLS.md "$w/"
+          cp art/proxy-scanner-linux-x64/proxy-scanner art/proxy-scanner-linux-x64/proxy-scanner-cli art/masscan-linux-x64/masscan "$l/"
+          cp art/masscan-linux-x64/LICENSE "$l/masscan-LICENSE"
+          cp release/proxy-scanner.sh release/README.md docs/TOOLS.md "$l/"
+          chmod +x "$l/proxy-scanner" "$l/proxy-scanner-cli" "$l/masscan" "$l/proxy-scanner.sh"
+          (cd pkg/win && zip -qr9 ../../dist/proxy-scanner-windows-x64.zip proxy-scanner)
+          (cd pkg/lin && tar czf ../../dist/proxy-scanner-linux-x64.tar.gz proxy-scanner)
+          (cd dist && sha256sum proxy-scanner-windows-x64.zip proxy-scanner-linux-x64.tar.gz > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          n=${{ github.run_number }}
+          tag="v$ver-build.$n"
+          {
+            echo "Сборка из коммита ${GITHUB_SHA::7}."
+            echo
+            echo "| Система | Архив |"
+            echo "|---|---|"
+            echo "| Windows 10/11 x64 | \`proxy-scanner-windows-x64.zip\` — распаковать и запустить \`proxy-scanner.cmd\` или \`proxy-scanner.exe\` |"
+            echo "| Linux x64 (glibc 2.35+) | \`proxy-scanner-linux-x64.tar.gz\` — распаковать и запустить \`./proxy-scanner.sh\` |"
+            echo
+            echo "В архивах: программа с окном, программа для командной строки, masscan 1.3.2 из официальных исходников, скрипт запуска, описание инструментов."
+            echo
+            echo "SHA-256:"
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } > notes.md
+          gh release create "$tag" dist/proxy-scanner-windows-x64.zip dist/proxy-scanner-linux-x64.tar.gz dist/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" --title "Proxy Scanner $ver — сборка $n" --notes-file notes.md --latest
+          # На странице оставляем три последние сборки.
+          gh release list --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+            | xargs -r -n1 gh release delete --yes --cleanup-tag

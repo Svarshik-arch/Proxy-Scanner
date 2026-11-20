@@ -10,6 +10,14 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Svarshik-arch/Proxy-Scanner/releases/latest/download/proxy-scanner-windows-x64.zip"><b>⬇ Скачать для Windows</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/Svarshik-arch/Proxy-Scanner/releases/latest/download/proxy-scanner-linux-x64.tar.gz"><b>⬇ Скачать для Linux</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/Svarshik-arch/Proxy-Scanner/releases/latest">все файлы и контрольные суммы</a>
+</p>
+
+<p align="center">
   <img src="docs/screenshots/proxies.png" alt="Proxy Scanner: поиск прокси" width="920">
 </p>
 
@@ -72,13 +80,19 @@
 
 ## Быстрый старт
 
-Готовые программы — в папке [`release`](release), контрольные суммы — в [`release/README.md`](release/README.md).
+| Система | Архив |
+|---|---|
+| Windows 10/11 x64 | [**proxy-scanner-windows-x64.zip**](https://github.com/Svarshik-arch/Proxy-Scanner/releases/latest/download/proxy-scanner-windows-x64.zip) |
+| Linux x64 | [**proxy-scanner-linux-x64.tar.gz**](https://github.com/Svarshik-arch/Proxy-Scanner/releases/latest/download/proxy-scanner-linux-x64.tar.gz) |
+
+Ссылки всегда ведут на последнюю сборку; контрольные суммы — на странице
+[релиза](https://github.com/Svarshik-arch/Proxy-Scanner/releases/latest). В архиве: программа
+с окном, программа для командной строки, masscan, скрипт запуска и описание инструментов.
+Те же файлы по отдельности — в папке [`release`](release).
 
 ### Windows 10/11
 
-1. Скачайте в одну папку `proxy-scanner.exe`, `proxy-scanner.cmd` и `proxy-scanner.ps1`;
-   при необходимости — `masscan64.exe` (быстрый поиск прокси) и `proxy-scanner-cli.exe`
-   (командная строка).
+1. Скачайте и распакуйте архив для Windows.
 2. Запустите `proxy-scanner.cmd`: скрипт запросит права администратора, снимет блокировку
    SmartScreen, проверит Npcap (и установит его, если рядом лежит `npcap-*.exe`) и откроет
    программу. `proxy-scanner.cmd -User` — без прав администратора.
@@ -91,7 +105,7 @@
 графический сеанс X11 или Wayland.
 
 ```bash
-chmod +x proxy-scanner proxy-scanner-cli masscan proxy-scanner.sh
+tar xzf proxy-scanner-linux-x64.tar.gz && cd proxy-scanner
 ```
 
 ```bash
