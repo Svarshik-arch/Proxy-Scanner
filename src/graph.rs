@@ -1077,6 +1077,38 @@ impl GraphView {
         );
     }
 
+    /// Масштаб к центру области (точка в центре остаётся на месте).
+    fn zoom_to(&mut self, z: f32) {
+        let z = z.clamp(0.05, 8.0);
+        if self.zoom > 0.0 {
+            self.pan *= z / self.zoom;
+        }
+        self.zoom = z;
+        self.user_moved_camera = true;
+    }
+
+    /// Ползунок масштаба у правого края: «+», вертикальный ползунок, «−».
+    fn zoom_slider(&mut self, ui: &mut Ui, rect: Rect) {
+        let h = (rect.height() - 120.0).clamp(80.0, 220.0);
+        let area = Rect::from_min_size(pos2(rect.right() - 44.0, rect.top() + 50.0), vec2(34.0, h + 64.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::Center)), |ui| {
+            if ui.button("➕").on_hover_text("Приблизить").clicked() {
+                self.zoom_to(self.zoom * 1.25);
+            }
+            let mut z = self.zoom;
+            ui.spacing_mut().slider_width = h;
+            let r = ui
+                .add(egui::Slider::new(&mut z, 0.05..=8.0).logarithmic(true).vertical().show_value(false))
+                .on_hover_text(format!("Масштаб {:.0}% (колесо мыши — тоже)", self.zoom * 100.0));
+            if r.changed() {
+                self.zoom_to(z);
+            }
+            if ui.button("➖").on_hover_text("Отдалить").clicked() {
+                self.zoom_to(self.zoom / 1.25);
+            }
+        });
+    }
+
     /// Кнопки и панель настроек в правом верхнем углу (как в Obsidian).
     /// Возвращает `true`, если изменились параметры сил.
     fn overlay(&mut self, ui: &mut Ui, rect: Rect, s: &mut GraphSettings) -> bool {
@@ -1100,6 +1132,7 @@ impl GraphView {
         }
 
         if !self.settings_open {
+            self.zoom_slider(ui, rect);
             return false;
         }
         let w = 250.0f32.min(rect.width() - 20.0);
