@@ -13,6 +13,7 @@ pub mod graph;
 pub mod intro;
 pub mod model;
 pub mod netdetect;
+pub mod nvidia;
 pub mod pac;
 pub mod presets;
 pub mod report;

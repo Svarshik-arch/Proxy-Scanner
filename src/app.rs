@@ -42,6 +42,29 @@ const RED: Color32 = Color32::from_rgb(220, 70, 70);
 const AMBER: Color32 = Color32::from_rgb(215, 160, 40);
 
 /// Файл с выбранной графикой (читается до создания окна).
+/// Настроить профиль NVIDIA из меню (при нехватке прав — через окно UAC).
+fn nvidia_fix_now() -> String {
+    use crate::nvidia::{Outcome, ensure_fixed_refresh};
+    let first = ensure_fixed_refresh();
+    #[cfg(windows)]
+    if let Outcome::Failed(e) = &first
+        && crate::nvidia::needs_admin(e)
+    {
+        if let Err(err) = crate::nvidia::run_elevated() {
+            return format!("{} ({err})", first.describe());
+        }
+        let second = ensure_fixed_refresh();
+        return match second {
+            Outcome::AlreadySet | Outcome::Applied => format!("{} — перезапустите программу", second.describe()),
+            o => o.describe(),
+        };
+    }
+    match first {
+        Outcome::Applied => format!("{} — перезапустите программу", first.describe()),
+        o => o.describe(),
+    }
+}
+
 /// Через что идёт вывод изображения: бэкенд и видеокарта (для журнала и проверки в CI).
 fn graphics_info(cc: &eframe::CreationContext<'_>) -> String {
     if let Some(rs) = &cc.wgpu_render_state {
@@ -423,6 +446,9 @@ impl App {
         app.archive = session::list_archive(&app.session_path);
         let graphics = graphics_info(cc);
         app.push_log(format!("графика: {graphics}"));
+        if let Some(s) = crate::nvidia::STATUS.get() {
+            app.push_log(s.clone());
+        }
         // Проверка в CI: записать, через что идёт вывод, и закрыть окно после первого кадра.
         if let Ok(path) = std::env::var("PROXY_SCANNER_GRAPHICS_REPORT") {
             let _ = std::fs::write(path, &graphics);
@@ -1867,6 +1893,22 @@ impl App {
                     pick(ui, Some("glow"), "OpenGL", "");
                 }
                 ui.weak("Применяется после перезапуска");
+                if cfg!(windows) {
+                    ui.separator();
+                    if ui
+                        .button("Выключить G-SYNC для программы")
+                        .on_hover_text(
+                            "Если экран гаснет при движении мыши: профиль программы в драйвере NVIDIA \
+                             с фиксированной частотой (может спросить права администратора)",
+                        )
+                        .clicked()
+                    {
+                        self.status = nvidia_fix_now();
+                        let s = self.status.clone();
+                        self.push_log(s);
+                        ui.close();
+                    }
+                }
             });
             ui.separator();
             if ui.button("Сбросить вид").clicked() {

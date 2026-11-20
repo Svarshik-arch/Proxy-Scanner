@@ -6,7 +6,7 @@
 // В релизной сборке не открываем окно консоли.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use proxy_scanner::{app, cli};
+use proxy_scanner::{app, cli, nvidia};
 
 use eframe::Renderer;
 
@@ -50,6 +50,14 @@ fn main() {
     if let Some(code) = cli::dispatch_from_gui_binary() {
         std::process::exit(code);
     }
+    // Запуск с правами администратора только для настройки профиля NVIDIA.
+    if std::env::args().any(|a| a == nvidia::FIX_ARG) {
+        let ok = !matches!(nvidia::ensure_fixed_refresh(), nvidia::Outcome::Failed(_));
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    // До создания окна: драйвер NVIDIA читает профиль программы при первом
+    // обращении к видеокарте.
+    let _ = nvidia::STATUS.set(nvidia::prepare());
     // Порядок графических бэкендов: по умолчанию wgpu (в Windows — DirectX 12),
     // при неудаче — OpenGL. Можно задать явно: `--renderer glow|dx12|vulkan|wgpu`.
     let args: Vec<String> = std::env::args().collect();
