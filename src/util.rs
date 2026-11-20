@@ -65,6 +65,24 @@ pub fn run_cmd(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Result<Cm
     })
 }
 
+/// Запуск команды с признаком успешного завершения (код выхода 0).
+pub fn run_cmd_status(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Result<(CmdOutput, bool), String> {
+    let program = program.as_ref();
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    hide_window(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("не удалось запустить {}: {e}", program.to_string_lossy()))?;
+    Ok((
+        CmdOutput {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        },
+        out.status.success(),
+    ))
+}
+
 /// Запуск сценария PowerShell; вывод принудительно в UTF-8.
 pub fn run_powershell(script: &str) -> Result<CmdOutput, String> {
     let full = format!(

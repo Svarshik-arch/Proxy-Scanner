@@ -9,6 +9,7 @@ pub struct Panel {
     error: Option<String>,
     /// Проверка перешла в «сбой» — попросить внимания окна.
     pub attention: bool,
+    service_status: Option<String>,
 }
 
 const EXAMPLE: &str = "ping 10.0.0.1\ntcp mail.corp.local:25\nhttp https://portal.corp.local/ expect=200 max_ms=1500\ndns portal.corp.local @10.0.0.53 expect=10.0.0.5\ntls portal.corp.local:443 warn_days=30";
@@ -30,6 +31,7 @@ impl Panel {
             task: None,
             error: None,
             attention: false,
+            service_status: None,
         }
     }
 
@@ -111,6 +113,55 @@ impl Panel {
             });
             ui.weak("Параметры строки: expect=, max_ms=, contains= (http), @сервер, type=, expect= (dns), warn_days= (tls).");
         });
+        let a = &mut self.cfg.alerts;
+        let configured = !a.is_empty();
+        egui::CollapsingHeader::new(if configured { "Уведомления ✔" } else { "Уведомления" })
+            .id_salt("mon_alerts")
+            .show(ui, |ui| {
+                ui.weak("О сбое и восстановлении. Работают и в окне, и в режиме без окна.");
+                egui::Grid::new("mon_alerts_g").num_columns(2).show(ui, |ui| {
+                    super::labeled(ui, "Syslog", |ui| ui.add(egui::TextEdit::singleline(&mut a.syslog).hint_text("10.0.0.50:514")));
+                    super::labeled(ui, "Почта: SMTP", |ui| ui.add(egui::TextEdit::singleline(&mut a.smtp).hint_text("mail.corp.local:25")));
+                    super::labeled(ui, "От кого", |ui| ui.add(egui::TextEdit::singleline(&mut a.mail_from).hint_text("monitor@corp.local")));
+                    super::labeled(ui, "Кому", |ui| ui.add(egui::TextEdit::singleline(&mut a.mail_to).hint_text("noc@corp.local, …")));
+                    super::labeled(ui, "Файл журнала", |ui| ui.add(egui::TextEdit::singleline(&mut a.log_file).hint_text("C:\\Logs\\monitor.log")));
+                });
+                ui.checkbox(&mut a.on_warn, "Сообщать и о «внимании» (медленно, потери)");
+                ui.weak("Почта — через внутренний релей без пароля; STARTTLS используется, если сервер его предлагает.");
+            });
+        egui::CollapsingHeader::new("Работа без окна")
+            .id_salt("mon_service")
+            .show(ui, |ui| {
+                ui.weak(if cfg!(windows) {
+                    "Мониторинг запускается при старте Windows (задание Планировщика от имени SYSTEM) и работает без входа пользователя."
+                } else {
+                    "Мониторинг запускается при старте системы (служба systemd)."
+                });
+                if self.service_status.is_none() {
+                    self.service_status = Some(crate::tools::service::status());
+                }
+                ui.label(format!("Сейчас: {}", self.service_status.as_deref().unwrap_or("")));
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Установить / обновить")
+                        .on_hover_text("Сохранить текущие проверки и уведомления и запустить без окна")
+                        .clicked()
+                    {
+                        *env.message = Some(match crate::tools::service::install(&self.cfg) {
+                            Ok(m) => m,
+                            Err(e) => format!("служба не установлена: {e}"),
+                        });
+                        self.service_status = None;
+                    }
+                    if ui.button("Удалить").clicked() {
+                        *env.message = Some(crate::tools::service::uninstall().unwrap_or_else(|e| e));
+                        self.service_status = None;
+                    }
+                });
+                if !crate::util::is_admin() {
+                    ui.colored_label(AMBER, "Для установки нужны права администратора/root.");
+                }
+            });
     }
 
     pub fn results_ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {

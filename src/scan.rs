@@ -31,7 +31,7 @@ impl Tx {
 
     pub fn send(&self, ev: AppEvent) {
         let _ = self.tx.send(ev);
-        self.ctx.request_repaint();
+        self.ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 
     pub fn log(&self, msg: impl Into<String>) {

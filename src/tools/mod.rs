@@ -6,14 +6,19 @@
 
 pub mod ad;
 pub mod audit;
+pub mod certs;
+pub mod compare;
 pub mod dns;
 pub mod dnsproto;
 pub mod discovery;
 pub mod hostinfo;
 pub mod http;
 pub mod icmp;
+pub mod matrix;
 pub mod monitor;
 pub mod mtr;
+pub mod notify;
+pub mod service;
 pub mod oui;
 pub mod tls;
 pub mod services;
@@ -52,7 +57,9 @@ impl<E> Sink<E> {
     pub fn send(&self, e: E) {
         let _ = self.tx.send(e);
         if let Some(ctx) = &self.ctx {
-            ctx.request_repaint();
+            // Не чаще ~20 кадров в секунду: тысячи событий сканирования не должны
+            // нагружать видеокарту.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 }

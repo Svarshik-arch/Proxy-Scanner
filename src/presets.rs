@@ -28,6 +28,7 @@ pub const TOOLS: &[(&str, &str)] = &[
     ("ad", "Домен AD"),
     ("audit", "Аудит"),
     ("monitor", "Мониторинг"),
+    ("matrix", "Доступность"),
 ];
 
 /// Поля, которые никогда не попадают в пользовательский пресет: они описывают
@@ -50,6 +51,7 @@ pub fn target_fields(tool: &str) -> &'static [&'static str] {
         "discovery" | "services" | "tls" | "audit" => &["targets"],
         "ad" => &["domain", "dcs"],
         "monitor" => &["checks"],
+        "matrix" => &["rules"],
         _ => &[],
     }
 }
@@ -235,6 +237,12 @@ pub fn builtin() -> Vec<Preset> {
         p("audit", "Серверы и СУБД", "СУБД, кэши, Docker, Elasticsearch", json!({ "tcp_ports": "1433,2375,3306,5432,6379,9200,11211,27017", "udp_ports": "1434" })),
         p("audit", "Сетевое оборудование", "Telnet, SSH, веб-интерфейсы, SNMP", json!({ "tcp_ports": "22,23,80,443,8080,8443", "udp_ports": "161" })),
         p("audit", "Без входа на FTP", "Не пробовать вход anonymous", json!({ "ftp_anonymous": false })),
+        // --- Матрица доступности ---
+        p("matrix", "Обычная проверка", "Таймаут 2 с, один повтор", json!({ "timeout_ms": 2000, "retries": 1 })),
+        p("matrix", "Медленные каналы (филиалы, VPN)", "Таймаут 5 с, два повтора", json!({ "timeout_ms": 5000, "retries": 2 })),
+        p("matrix", "Доступ к контроллерам домена", "Порты, нужные клиентам AD; {domain} не подставляется — впишите имя контроллера", json!({
+            "rules": "dc01:53 open\ndc01:88 open\ndc01:135 open\ndc01:389 open\ndc01:445 open\ndc01:464 open\ndc01:636 open\ndc01:3268 open"
+        })),
         // --- Мониторинг ---
         p("monitor", "Каждую минуту", "", json!({ "interval_s": 60 })),
         p("monitor", "Часто: каждые 10 с", "Для разбора инцидента", json!({ "interval_s": 10, "warn_ms": 300 })),
@@ -483,6 +491,7 @@ mod tests {
                 "ad" => check::<crate::tools::ad::Config>(v, what),
                 "audit" => check::<crate::tools::audit::Config>(v, what),
                 "monitor" => check::<crate::tools::monitor::Config>(v, what),
+                "matrix" => check::<crate::tools::matrix::Config>(v, what),
                 other => panic!("{what}: неизвестный инструмент {other}"),
             }
         }

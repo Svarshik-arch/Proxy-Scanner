@@ -133,6 +133,25 @@ pub fn findings(s: &Session) -> Vec<(Severity, String, String)> {
             out.push((Severity::Medium, format!("{}:{}", r.ip, r.port), format!("{} без аутентификации", r.kind.label())));
         }
     }
+    if let Some(mx) = &s.tools.matrix {
+        for r in mx {
+            for e in r.entries.iter().filter(|e| e.verdict == crate::tools::matrix::Verdict::Mismatch) {
+                out.push((
+                    Severity::High,
+                    format!("{} → {}:{}", r.source, e.target, e.port),
+                    format!("ожидалось «{}», на деле «{}»", e.expect.label(), e.state.label()),
+                ));
+            }
+        }
+    }
+    for c in crate::tools::certs::collect(s) {
+        match c.days_left {
+            Some(d) if d < 0 => out.push((Severity::High, c.endpoints.join(", "), format!("сертификат «{}» просрочен ({} дн.)", c.subject, -d))),
+            Some(d) if d < 30 => out.push((Severity::Medium, c.endpoints.join(", "), format!("сертификат «{}» истекает через {d} дн.", c.subject))),
+            _ => {}
+        }
+    }
+    out.dedup_by(|a, b| a.2 == b.2);
     if let Some(m) = &s.tools.monitor {
         for st in m.states.iter().filter(|x| x.status == Status::Fail) {
             out.push((Severity::Medium, "мониторинг".into(), format!("{}: {}", st.line, st.last.as_ref().map(|l| l.detail.clone()).unwrap_or_default())));
@@ -305,6 +324,53 @@ pub fn html(s: &Session, title: &str) -> String {
                         esc(&leaf.map(|l| l.short_issuer()).unwrap_or_default()),
                         leaf.map(|l| l.days_left.to_string()).unwrap_or_default(),
                         x.findings.len().to_string(),
+                    ]
+                })
+                .collect(),
+        );
+    }
+    if let Some(mx) = &t.matrix {
+        d.section("matrix", "Доступность портов");
+        d.table(
+            &["Откуда", "Куда", "Ожидание", "Результат", "Итог"],
+            mx.iter()
+                .flat_map(|r| r.entries.iter().map(move |e| (r, e)))
+                .map(|(r, e)| {
+                    vec![
+                        esc(&r.source),
+                        format!("<span class=\"mono\">{}:{}</span>", esc(&e.target), e.port),
+                        esc(e.expect.label()),
+                        esc(e.state.label()),
+                        match e.verdict {
+                            crate::tools::matrix::Verdict::Ok => span("ok", "как ожидалось"),
+                            crate::tools::matrix::Verdict::Mismatch => span("high", "расхождение"),
+                            crate::tools::matrix::Verdict::Info => String::new(),
+                        },
+                    ]
+                })
+                .collect(),
+        );
+    }
+    let certs = crate::tools::certs::collect(s);
+    if !certs.is_empty() {
+        d.section("certs", "Сертификаты");
+        d.table(
+            &["Состояние", "Дней", "Субъект", "Издатель", "Где"],
+            certs
+                .iter()
+                .map(|c| {
+                    let st = c.status(30);
+                    let cls = match st {
+                        "просрочен" => "high",
+                        "истекает" | "не доверен" => "med",
+                        _ => "ok",
+                    };
+                    vec![
+                        span(cls, st),
+                        c.days_left.map(|d| d.to_string()).unwrap_or_default(),
+                        esc(&c.subject),
+                        esc(&c.issuer),
+                        format!("<span class=\"mono\">{}</span>", esc(&c.endpoints.join(", "))),
                     ]
                 })
                 .collect(),

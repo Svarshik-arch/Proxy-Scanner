@@ -31,6 +31,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("ad", "ad", "проверка домена AD: контроллеры, Kerberos, LDAP, время, SMB"),
     ("audit", "audit", "аудит небезопасных настроек в сети"),
     ("monitor", "monitor", "мониторинг: проверки из файла или --set checks=…, по расписанию"),
+    ("matrix", "matrix", "матрица доступности: matrix правила.txt (узел:порт open|closed)"),
+    ("listen", "", "слушатель для проверки доступа сюда: listen 443,1433"),
+    ("certs", "", "сертификаты из файла сессии: certs сессия.json [-o certs.csv]"),
+    ("compare", "", "сравнение сессий: compare было.json стало.json"),
+    ("service", "", "мониторинг без окна: service install|uninstall|status [--config файл]"),
     ("report", "", "HTML-отчёт по файлу сессии: report сессия.json -o отчёт.html"),
     ("presets", "", "список пресетов: presets [инструмент]"),
     ("help", "", "справка"),
@@ -314,6 +319,11 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "audit" => cmd_audit(&o, &store),
         "monitor" => cmd_monitor(&o, &store),
         "report" => cmd_report(&o),
+        "matrix" => cmd_matrix(&o, &store),
+        "listen" => cmd_listen(&o),
+        "certs" => cmd_certs(&o),
+        "compare" => cmd_compare(&o),
+        "service" => cmd_service(&o, &store),
         other => Err(format!("неизвестная команда «{other}»; см. help")),
     };
     match res {
@@ -595,6 +605,93 @@ fn cmd_monitor(o: &Opts, store: &Store) -> Result<(), String> {
         }
     })?;
     emit(o, &report, monitor::render_text)
+}
+
+fn cmd_matrix(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::matrix;
+    if o.fields {
+        print!("{}", fields::<matrix::Config>());
+        return Ok(());
+    }
+    let primary = match o.positional.first() {
+        Some(path) => json!({ "rules": std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))? }),
+        None => json!({}),
+    };
+    let cfg: matrix::Config = configure("matrix", o, store, primary)?;
+    let mut report = matrix::new_report();
+    let quiet = o.quiet;
+    drive(o, |s, c| matrix::run(cfg, s, c), |e| match e {
+        matrix::Event::Log(m) => eprint_line(quiet, &m),
+        matrix::Event::Total(_) => {}
+        matrix::Event::Entry(x) => report.entries.push(*x),
+    })?;
+    matrix::sort(&mut report);
+    let mismatches = report.mismatches();
+    emit(o, &report, |r| matrix::render_text(std::slice::from_ref(r)))?;
+    if mismatches > 0 {
+        eprint_line(quiet, &format!("расхождений: {mismatches}"));
+    }
+    Ok(())
+}
+
+fn cmd_listen(o: &Opts) -> Result<(), String> {
+    let ports = crate::targets::parse_ports(o.positional.first().ok_or("укажите порты: listen 443,1433")?)?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let cancel = CancellationToken::new();
+        let (ok, errs) = crate::egress::start_listener(&ports, cancel.clone()).await;
+        for e in &errs {
+            eprintln!("не занят {e}");
+        }
+        if ok.is_empty() {
+            return Err("ни один порт не занят".to_string());
+        }
+        println!(
+            "Слушаю порты {} (отвечаю меткой {} {}). Ctrl+C — стоп.",
+            ok.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
+            crate::egress::MARKER,
+            crate::session::computer_name()
+        );
+        let _ = tokio::signal::ctrl_c().await;
+        cancel.cancel();
+        Ok(())
+    })
+}
+
+fn cmd_certs(o: &Opts) -> Result<(), String> {
+    let path = o.positional.first().ok_or("укажите файл сессии: certs proxy-scanner-session.json")?;
+    let s = crate::session::load(std::path::Path::new(path))?;
+    let list = crate::tools::certs::collect(&s);
+    if let Some(out) = &o.out
+        && out.to_ascii_lowercase().ends_with(".csv")
+    {
+        return std::fs::write(out, crate::tools::certs::to_csv(&list, 30)).map_err(|e| format!("{out}: {e}"));
+    }
+    emit(o, &list, |l| crate::tools::certs::render_text(l, 30))
+}
+
+fn cmd_compare(o: &Opts) -> Result<(), String> {
+    let [a, b] = o.positional.as_slice() else {
+        return Err("укажите два файла сессии: compare было.json стало.json".into());
+    };
+    let old = crate::session::load(std::path::Path::new(a))?;
+    let new = crate::session::load(std::path::Path::new(b))?;
+    let d = crate::tools::compare::diff(&old, &new);
+    emit(o, &d, crate::tools::compare::render_text)
+}
+
+fn cmd_service(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::service;
+    match o.positional.first().map(String::as_str) {
+        Some("install") => {
+            let cfg: crate::tools::monitor::Config = configure("monitor", o, store, json!({}))?;
+            println!("{}", service::install(&cfg)?);
+        }
+        Some("uninstall") | Some("remove") => println!("{}", service::uninstall()?),
+        Some("status") | None => println!("{}", service::status()),
+        Some(x) => return Err(format!("неизвестное действие «{x}»: install, uninstall, status")),
+    }
+    Ok(())
 }
 
 fn cmd_report(o: &Opts) -> Result<(), String> {

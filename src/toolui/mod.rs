@@ -3,10 +3,13 @@
 
 mod ad;
 mod audit;
+mod certs;
+mod compare;
 mod discovery;
 mod dns;
 mod host;
 mod http;
+mod matrix;
 mod monitor;
 mod mtr;
 mod services;
@@ -36,10 +39,13 @@ pub enum Tool {
     Ad,
     Audit,
     Monitor,
+    Matrix,
+    Certs,
+    Compare,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 10] = [
+    pub const ALL: [Tool; 13] = [
         Tool::Host,
         Tool::Mtr,
         Tool::Discovery,
@@ -50,6 +56,9 @@ impl Tool {
         Tool::Ad,
         Tool::Audit,
         Tool::Monitor,
+        Tool::Matrix,
+        Tool::Certs,
+        Tool::Compare,
     ];
 
     pub fn title(self) -> &'static str {
@@ -64,6 +73,9 @@ impl Tool {
             Tool::Ad => "Домен AD",
             Tool::Audit => "Аудит",
             Tool::Monitor => "Мониторинг",
+            Tool::Matrix => "Доступность",
+            Tool::Certs => "Сертификаты",
+            Tool::Compare => "Сравнение сессий",
         }
     }
 
@@ -79,6 +91,9 @@ impl Tool {
             Tool::Ad => "Почему не входит в домен: контроллеры, Kerberos, LDAP, время, SMB",
             Tool::Audit => "Небезопасные настройки в сети: SMBv1, Telnet, RDP без NLA, SNMP public…",
             Tool::Monitor => "Проверки по расписанию: ping, порты, сайты, DNS, сертификаты",
+            Tool::Matrix => "Правила межсетевого экрана: откуда → куда → порт, с ожиданием «открыт/закрыт»",
+            Tool::Certs => "Все найденные сертификаты по сроку окончания, выгрузка в Excel",
+            Tool::Compare => "Что изменилось между двумя проверками",
         }
     }
 
@@ -94,6 +109,9 @@ impl Tool {
             Tool::Ad => "ad",
             Tool::Audit => "audit",
             Tool::Monitor => "monitor",
+            Tool::Matrix => "matrix",
+            Tool::Certs => "certs",
+            Tool::Compare => "compare",
         }
     }
 }
@@ -134,6 +152,7 @@ pub struct Prefs {
     pub ad: crate::tools::ad::Config,
     pub audit: crate::tools::audit::Config,
     pub monitor: crate::tools::monitor::Config,
+    pub matrix: crate::tools::matrix::Config,
 }
 
 /// Результаты инструментов для файла сессии.
@@ -150,6 +169,8 @@ pub struct Results {
     pub ad: Option<crate::tools::ad::Report>,
     pub audit: Option<crate::tools::audit::Report>,
     pub monitor: Option<crate::tools::monitor::Report>,
+    /// Матрица доступности: результаты с разных машин-источников.
+    pub matrix: Option<Vec<crate::tools::matrix::Report>>,
 }
 
 pub struct Workbench {
@@ -167,6 +188,12 @@ pub struct Workbench {
     ad: ad::Panel,
     audit: audit::Panel,
     monitor: monitor::Panel,
+    matrix: matrix::Panel,
+    certs: certs::Panel,
+    compare: compare::Panel,
+    /// Снимок текущей сессии и архив — для сертификатов и сравнения.
+    current: Option<crate::session::Session>,
+    archive: Vec<(String, std::path::PathBuf)>,
     palette: Palette,
 }
 
@@ -203,6 +230,11 @@ impl Workbench {
             ad: ad::Panel::new(prefs.ad),
             audit: audit::Panel::new(prefs.audit),
             monitor: monitor::Panel::new(prefs.monitor),
+            matrix: matrix::Panel::new(prefs.matrix),
+            certs: certs::Panel::default(),
+            compare: compare::Panel::default(),
+            current: None,
+            archive: Vec::new(),
             palette: Palette::default(),
         }
     }
@@ -218,6 +250,7 @@ impl Workbench {
             ad: self.ad.cfg.clone(),
             audit: self.audit.cfg.clone(),
             monitor: self.monitor.cfg.clone(),
+            matrix: self.matrix.cfg.clone(),
         }
     }
 
@@ -233,6 +266,7 @@ impl Workbench {
             ad: self.ad.report.clone(),
             audit: (!self.audit.report.services.is_empty()).then(|| self.audit.report.clone()),
             monitor: (!self.monitor.report.states.is_empty()).then(|| self.monitor.report.clone()),
+            matrix: (!self.matrix.reports.is_empty()).then(|| self.matrix.reports.clone()),
         }
     }
 
@@ -267,6 +301,9 @@ impl Workbench {
         if let Some(v) = r.monitor {
             self.monitor.report = v;
         }
+        if let Some(v) = r.matrix {
+            self.matrix.reports = v;
+        }
     }
 
     pub fn clear_results(&mut self) {
@@ -281,6 +318,15 @@ impl Workbench {
         self.ad.report = None;
         self.audit.report = Default::default();
         self.monitor.report = Default::default();
+        self.matrix.reports.clear();
+        self.certs.certs.clear();
+    }
+
+    /// Контекст для «Сертификатов» и «Сравнения»: снимок сессии и архив.
+    pub fn set_context(&mut self, current: crate::session::Session, archive: Vec<(String, std::path::PathBuf)>) {
+        self.certs.certs = crate::tools::certs::collect(&current);
+        self.current = Some(current);
+        self.archive = archive;
     }
 
     /// Обработка событий фоновых задач (каждый кадр). true — что-то изменилось.
@@ -296,6 +342,7 @@ impl Workbench {
         changed |= self.ad.poll();
         changed |= self.audit.poll();
         changed |= self.monitor.poll(&mut self.message);
+        changed |= self.matrix.poll();
         changed
     }
 
@@ -316,6 +363,8 @@ impl Workbench {
             Tool::Ad => self.ad.busy(),
             Tool::Audit => self.audit.busy(),
             Tool::Monitor => self.monitor.busy(),
+            Tool::Matrix => self.matrix.busy(),
+            Tool::Certs | Tool::Compare => false,
         }
     }
 
@@ -342,6 +391,21 @@ impl Workbench {
                 }
                 self.monitor.report.states.len()
             }
+            Tool::Matrix => {
+                let m: usize = self.matrix.reports.iter().map(|r| r.mismatches()).sum();
+                if m > 0 {
+                    return Some(format!("⚠{m}"));
+                }
+                self.matrix.reports.iter().map(|r| r.entries.len()).sum()
+            }
+            Tool::Certs => {
+                let bad = self.certs.certs.iter().filter(|c| c.days_left.is_some_and(|d| d < self.certs.warn_days)).count();
+                if bad > 0 {
+                    return Some(format!("⚠{bad}"));
+                }
+                self.certs.certs.len()
+            }
+            Tool::Compare => self.compare.diff.as_ref().map(|d| d.changes.len()).unwrap_or(0),
         };
         (n > 0).then(|| n.to_string())
     }
@@ -408,6 +472,9 @@ impl Workbench {
             Tool::Ad => self.ad.settings_ui(ui, &mut env),
             Tool::Audit => self.audit.settings_ui(ui, &mut env),
             Tool::Monitor => self.monitor.settings_ui(ui, &mut env),
+            Tool::Matrix => self.matrix.settings_ui(ui, &mut env),
+            Tool::Certs => self.certs.settings_ui(ui, &mut env),
+            Tool::Compare => self.compare.settings_ui(ui, self.current.as_ref(), &self.archive),
         }
         nav
     }
@@ -436,6 +503,9 @@ impl Workbench {
             Tool::Ad => self.ad.results_ui(ui, &mut env),
             Tool::Audit => self.audit.results_ui(ui, &mut env),
             Tool::Monitor => self.monitor.results_ui(ui, &mut env),
+            Tool::Matrix => self.matrix.results_ui(ui, &mut env),
+            Tool::Certs => self.certs.results_ui(ui, &mut env),
+            Tool::Compare => self.compare.results_ui(ui, &mut env),
         }
         nav
     }
@@ -470,6 +540,8 @@ impl Workbench {
             Tool::Ad => presets::apply(&mut self.ad.cfg, &p.values),
             Tool::Audit => presets::apply(&mut self.audit.cfg, &p.values),
             Tool::Monitor => presets::apply(&mut self.monitor.cfg, &p.values),
+            Tool::Matrix => presets::apply(&mut self.matrix.cfg, &p.values),
+            Tool::Certs | Tool::Compare => Ok(()),
         };
         self.message = Some(match r {
             Ok(()) => format!("применён пресет «{}»", p.name),
@@ -507,6 +579,14 @@ impl Workbench {
                     self.monitor.cfg.checks.push_str(&line);
                 }
             }
+            Tool::Matrix => {
+                let line = if host.contains(':') { format!("{host} open") } else { format!("{host}:443 open") };
+                if !self.matrix.cfg.rules.is_empty() && !self.matrix.cfg.rules.ends_with('\n') {
+                    self.matrix.cfg.rules.push('\n');
+                }
+                self.matrix.cfg.rules.push_str(&line);
+            }
+            Tool::Certs | Tool::Compare => {}
             Tool::Tls => {
                 if let Some((h, p)) = host.rsplit_once(':')
                     && p.parse::<u16>().is_ok()
@@ -550,6 +630,9 @@ impl Workbench {
         }
         if let Some(v) = get("monitor") {
             presets::apply(&mut self.monitor.cfg, &v)?;
+        }
+        if let Some(v) = get("matrix") {
+            presets::apply(&mut self.matrix.cfg, &v)?;
         }
         Ok(())
     }
@@ -781,7 +864,7 @@ pub fn send_menu(ui: &mut egui::Ui, host: &str, nav: &mut Option<Nav>, except: T
         ui.close();
     }
     ui.separator();
-    for t in [Tool::Mtr, Tool::Dns, Tool::Http, Tool::Services, Tool::Tls, Tool::Audit, Tool::Monitor] {
+    for t in [Tool::Mtr, Tool::Dns, Tool::Http, Tool::Services, Tool::Tls, Tool::Audit, Tool::Monitor, Tool::Matrix] {
         if t == except {
             continue;
         }

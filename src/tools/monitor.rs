@@ -32,6 +32,8 @@ pub struct Config {
     pub cycles: u32,
     /// Сколько последних замеров хранить.
     pub history: usize,
+    /// Уведомления о смене состояния.
+    pub alerts: super::notify::Alerts,
 }
 
 impl Default for Config {
@@ -43,6 +45,7 @@ impl Default for Config {
             warn_ms: 1000.0,
             cycles: 0,
             history: 240,
+            alerts: Default::default(),
         }
     }
 }
@@ -394,6 +397,16 @@ pub async fn run(cfg: Config, sink: Sink<Event>, cancel: CancellationToken) {
         Err(e) => return sink.send(Event::Log(e)),
     };
     sink.send(Event::Checks(checks.iter().map(|c| c.line.clone()).collect()));
+    // Собственное отслеживание состояний — для уведомлений (работает и без окна).
+    let states = Arc::new(std::sync::Mutex::new(
+        checks
+            .iter()
+            .map(|c| State {
+                line: c.line.clone(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    ));
     let checks = Arc::new(checks);
     let cfg = Arc::new(cfg);
     let interval = Duration::from_secs(cfg.interval_s.max(5));
@@ -402,10 +415,28 @@ pub async fn run(cfg: Config, sink: Sink<Event>, cancel: CancellationToken) {
         let started = Instant::now();
         let mut set = tokio::task::JoinSet::new();
         for i in 0..checks.len() {
-            let (checks, cfg, sink) = (checks.clone(), cfg.clone(), sink.clone());
+            let (checks, cfg, sink, states) = (checks.clone(), cfg.clone(), sink.clone(), states.clone());
             set.spawn(async move {
                 let s = run_check(&checks[i], &cfg).await;
+                let change = {
+                    let mut st = states.lock().unwrap();
+                    let detail = s.detail.clone();
+                    st[i].apply(s.clone(), 4).map(|(from, to)| Change {
+                        at: s.at,
+                        line: checks[i].line.clone(),
+                        from,
+                        to,
+                        detail,
+                    })
+                };
                 sink.send(Event::Sample(i, s));
+                if let Some(ch) = change
+                    && !cfg.alerts.is_empty()
+                {
+                    for e in super::notify::send(&cfg.alerts, &ch).await {
+                        sink.send(Event::Log(format!("уведомление не отправлено: {e}")));
+                    }
+                }
             });
         }
         tokio::select! {

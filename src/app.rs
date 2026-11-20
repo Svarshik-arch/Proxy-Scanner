@@ -41,6 +41,17 @@ const GREEN: Color32 = Color32::from_rgb(60, 170, 90);
 const RED: Color32 = Color32::from_rgb(220, 70, 70);
 const AMBER: Color32 = Color32::from_rgb(215, 160, 40);
 
+/// Файл с выбранной графикой (читается до создания окна).
+fn renderer_file() -> std::path::PathBuf {
+    session::default_path().with_file_name("proxy-scanner-graphics.txt")
+}
+
+/// Графика, выбранная в меню «Вид»: `glow`, `wgpu` или нет выбора.
+pub fn saved_renderer() -> Option<String> {
+    let v = std::fs::read_to_string(renderer_file()).ok()?.trim().to_ascii_lowercase();
+    (v == "glow" || v == "wgpu").then_some(v)
+}
+
 /// Ширина окна, ниже которой интерфейс переходит на вкладки.
 const COMPACT_WIDTH: f32 = 900.0;
 /// Ширина окна, ниже которой сокращаются подписи в шапке.
@@ -92,9 +103,9 @@ impl Group {
     fn hint(self) -> &'static str {
         match self {
             Group::Proxy => "Поиск и проверка прокси, обход прокси, PAC/WPAD",
-            Group::Network => "Эта машина, трассировка, узлы в сети",
+            Group::Network => "Эта машина, трассировка, узлы в сети, проверка доступности портов",
             Group::Services => "DNS, HTTP, сервисы и версии, TLS, домен AD",
-            Group::Audit => Tool::Audit.hint(),
+            Group::Audit => "Небезопасные настройки, сертификаты, сравнение с прошлой проверкой",
             Group::Monitor => Tool::Monitor.hint(),
         }
     }
@@ -102,7 +113,12 @@ impl Group {
     fn sections(self) -> &'static [Section] {
         match self {
             Group::Proxy => &[Section::Proxies, Section::Egress, Section::Pac],
-            Group::Network => &[Section::Tool(Tool::Host), Section::Tool(Tool::Mtr), Section::Tool(Tool::Discovery)],
+            Group::Network => &[
+                Section::Tool(Tool::Host),
+                Section::Tool(Tool::Mtr),
+                Section::Tool(Tool::Discovery),
+                Section::Tool(Tool::Matrix),
+            ],
             Group::Services => &[
                 Section::Tool(Tool::Dns),
                 Section::Tool(Tool::Http),
@@ -110,7 +126,7 @@ impl Group {
                 Section::Tool(Tool::Tls),
                 Section::Tool(Tool::Ad),
             ],
-            Group::Audit => &[Section::Tool(Tool::Audit)],
+            Group::Audit => &[Section::Tool(Tool::Audit), Section::Tool(Tool::Certs), Section::Tool(Tool::Compare)],
             Group::Monitor => &[Section::Tool(Tool::Monitor)],
         }
     }
@@ -277,6 +293,7 @@ pub struct App {
     bench: Workbench,
     /// Подсеть рабочей станции (из автоопределения).
     local_cidr: Option<String>,
+    last_context: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -363,6 +380,7 @@ impl App {
             pac: PacState::default(),
             bench: Workbench::new(tool_prefs),
             local_cidr: None,
+            last_context: None,
         };
         app.archive = session::list_archive(&app.session_path);
         // Незавершённая сессия рядом с программой (в том числе перенесённая с другого ПК).
@@ -1672,6 +1690,27 @@ impl App {
             if before != self.view.theme {
                 apply_view(ui.ctx(), &self.view);
             }
+            ui.separator();
+            ui.menu_button("Графика", |ui| {
+                let current = saved_renderer();
+                let mut pick = |ui: &mut egui::Ui, value: Option<&str>, label: &str, hint: &str| {
+                    if ui.radio(current.as_deref() == value, label).on_hover_text(hint).clicked() {
+                        let res = match value {
+                            Some(v) => std::fs::write(renderer_file(), v),
+                            None => std::fs::remove_file(renderer_file()).or(Ok(())),
+                        };
+                        self.status = match res {
+                            Ok(()) => "Графика будет изменена после перезапуска программы".into(),
+                            Err(e) => format!("Не удалось сохранить выбор графики: {e}"),
+                        };
+                        ui.close();
+                    }
+                };
+                pick(ui, None, "Автоматически", "DirectX 12 / Vulkan на экономичной видеокарте, при ошибке — OpenGL");
+                pick(ui, Some("glow"), "OpenGL", "Если экран мигает или гаснет — выберите этот вариант");
+                pick(ui, Some("wgpu"), "Только DirectX 12 / Vulkan", "");
+                ui.weak("Применяется после перезапуска");
+            });
             ui.separator();
             if ui.button("Сбросить вид").clicked() {
                 self.view = ViewPrefs::default();
@@ -3463,6 +3502,14 @@ impl eframe::App for App {
         self.handle_events(ctx);
         if self.bench.poll() {
             self.dirty = true;
+        }
+        // «Сертификаты» и «Сравнение» работают со снимком всей сессии.
+        if matches!(self.view.section, Section::Tool(Tool::Certs) | Section::Tool(Tool::Compare))
+            && self.last_context.is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
+        {
+            let archive = self.archive.iter().map(|a| (a.label(), a.path.clone())).collect();
+            self.bench.set_context(self.session_snapshot(), archive);
+            self.last_context = Some(Instant::now());
         }
         if self.bench.take_attention() {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));

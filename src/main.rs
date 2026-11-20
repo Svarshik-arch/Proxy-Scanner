@@ -11,7 +11,7 @@ use proxy_scanner::{app, cli};
 use eframe::Renderer;
 
 fn run(renderer: Renderer) -> eframe::Result {
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Proxy Scanner — инвентаризация прокси-серверов")
             .with_inner_size([1360.0, 800.0])
@@ -19,6 +19,11 @@ fn run(renderer: Renderer) -> eframe::Result {
         renderer,
         ..Default::default()
     };
+    // Экономичная (встроенная) видеокарта: запрос «высокопроизводительной» на ноутбуках
+    // и ПК с двумя видеокартами переключает вывод между ними — монитор гаснет и мигает.
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut options.wgpu_options.wgpu_setup {
+        c.power_preference = eframe::wgpu::PowerPreference::LowPower;
+    }
     eframe::run_native(
         "proxy-scanner",
         options,
@@ -46,6 +51,8 @@ fn main() {
         .position(|a| a == "--renderer")
         .and_then(|i| args.get(i + 1))
         .map(|s| s.to_ascii_lowercase());
+    // Выбор из меню «Вид → Графика» (сохраняется рядом с файлом сессии).
+    let forced = forced.or_else(app::saved_renderer);
     let order: Vec<Renderer> = match forced.as_deref() {
         Some("glow") | Some("opengl") => vec![Renderer::Glow],
         Some("wgpu") => vec![Renderer::Wgpu],
