@@ -409,6 +409,23 @@ impl App {
                 Err(e) => app.push_log(format!("сессия: {e}")),
             }
         }
+        // Открыть вкладку при запуске: PROXY_SCANNER_OPEN=mtr | proxies | egress | pac | graph.
+        if let Ok(v) = std::env::var("PROXY_SCANNER_OPEN") {
+            match v.as_str() {
+                "proxies" => app.view.section = Section::Proxies,
+                "graph" => {
+                    app.view.section = Section::Proxies;
+                    app.view.results_view = ResultsView::Graph;
+                }
+                "egress" => app.view.section = Section::Egress,
+                "pac" => app.view.section = Section::Pac,
+                key => {
+                    if let Some(t) = Tool::ALL.into_iter().find(|t| t.preset_id() == key) {
+                        app.view.section = Section::Tool(t);
+                    }
+                }
+            }
+        }
         // Автоопределение сетевых параметров при старте.
         app.start_detect(&cc.egui_ctx, false);
         app

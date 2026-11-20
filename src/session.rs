@@ -306,7 +306,15 @@ pub fn now_unix() -> u64 {
 pub fn computer_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "неизвестный ПК".into())
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+                .ok()
+                .map(|h| h.trim().to_string())
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "неизвестный ПК".into())
 }
 
 /// Дата и время в UTC: `2026-11-18 09:30 UTC`.
