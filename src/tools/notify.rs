@@ -123,7 +123,7 @@ fn mail_body(from: &str, to: &[String], ch: &Change) -> String {
     )
 }
 
-async fn smtp_dialog<S: AsyncRead + AsyncWrite + Unpin>(r: &mut BufReader<S>, a: &Alerts, to: &[String], ch: &Change, greet: bool) -> Result<(), String> {
+async fn smtp_dialog<S: AsyncRead + AsyncWrite + Unpin>(r: &mut BufReader<S>, a: &Alerts, to: &[String], body: &str, greet: bool) -> Result<(), String> {
     if greet {
         let (code, text) = reply(r).await?;
         if code != 220 {
@@ -136,14 +136,35 @@ async fn smtp_dialog<S: AsyncRead + AsyncWrite + Unpin>(r: &mut BufReader<S>, a:
         cmd(r, &format!("RCPT TO:<{t}>"), 250).await?;
     }
     cmd(r, "DATA", 354).await?;
-    cmd(r, &mail_body(a.mail_from.trim(), to, ch), 250).await?;
+    cmd(r, body, 250).await?;
     let _ = cmd(r, "QUIT", 221).await;
     Ok(())
 }
 
 async fn send_mail(a: &Alerts, ch: &Change) -> Result<(), String> {
-    let (host, port) = crate::probe::split_host_port(&a.smtp, 25)?;
     let to: Vec<String> = super::split_list(&a.mail_to);
+    let body = mail_body(a.mail_from.trim(), &to, ch);
+    smtp_send(a, &to, &body).await
+}
+
+/// Письмо с HTML-отчётом (тема и HTML в UTF-8).
+pub async fn send_html_mail(a: &Alerts, subject: &str, html: &str) -> Result<(), String> {
+    let to: Vec<String> = super::split_list(&a.mail_to);
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s.as_bytes());
+    let body = b64(html);
+    let wrapped: Vec<&str> = body.as_bytes().chunks(76).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    let msg = format!(
+        "From: {}\r\nTo: {}\r\nSubject: =?UTF-8?B?{}?=\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\nX-Mailer: proxy-scanner\r\n\r\n{}\r\n.",
+        a.mail_from.trim(),
+        to.join(", "),
+        b64(subject),
+        wrapped.join("\r\n")
+    );
+    smtp_send(a, &to, &msg).await
+}
+
+async fn smtp_send(a: &Alerts, to: &[String], body: &str) -> Result<(), String> {
+    let (host, port) = crate::probe::split_host_port(&a.smtp, 25)?;
     if to.is_empty() || a.mail_from.trim().is_empty() {
         return Err("почта: укажите отправителя и получателей".into());
     }
@@ -161,10 +182,10 @@ async fn send_mail(a: &Alerts, ch: &Change) -> Result<(), String> {
         cmd(&mut r, "STARTTLS", 220).await?;
         let (tls, _) = super::tls::handshake(r.into_inner(), &host, super::tls::Versions::Auto, &[], Duration::from_secs(10)).await?;
         let mut r = BufReader::new(tls);
-        return smtp_dialog(&mut r, a, &to, ch, false).await;
+        return smtp_dialog(&mut r, a, to, body, false).await;
     }
     // Без STARTTLS: продолжаем в том же соединении (EHLO уже отправлен — повтор допустим).
-    smtp_dialog(&mut r, a, &to, ch, false).await
+    smtp_dialog(&mut r, a, to, body, false).await
 }
 
 fn append_log(path: &str, ch: &Change) -> Result<(), String> {

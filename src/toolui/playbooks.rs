@@ -24,6 +24,10 @@ pub struct Panel {
     editor_error: Option<String>,
     new_tool: String,
     pub last_run: Option<(String, u64)>,
+    pub schedule: crate::tools::schedule::Config,
+    schedule_status: Option<String>,
+    schedule_task: Option<Task<crate::tools::schedule::Event>>,
+    schedule_log: Vec<String>,
 }
 
 impl Default for Panel {
@@ -39,6 +43,10 @@ impl Default for Panel {
             editor_error: None,
             new_tool: "services".into(),
             last_run: None,
+            schedule: crate::tools::schedule::load_config(&crate::tools::schedule::config_path()).unwrap_or_default(),
+            schedule_status: None,
+            schedule_task: None,
+            schedule_log: Vec::new(),
         };
         p.reload();
         p
@@ -55,11 +63,26 @@ impl Panel {
     }
 
     pub fn busy(&self) -> bool {
-        self.task.is_some()
+        self.task.is_some() || self.schedule_task.is_some()
     }
 
     pub fn poll(&mut self) -> bool {
-        let Some(t) = &self.task else { return false };
+        let mut sched_changed = false;
+        if let Some(t) = &self.schedule_task {
+            let ev = t.drain();
+            let fin = t.finished();
+            sched_changed = !ev.is_empty() || fin;
+            for e in ev {
+                match e {
+                    crate::tools::schedule::Event::Log(l) => self.schedule_log.push(l),
+                    crate::tools::schedule::Event::Done(d) => self.schedule_log.push(d),
+                }
+            }
+            if fin {
+                self.schedule_task = None;
+            }
+        }
+        let Some(t) = &self.task else { return sched_changed };
         let events = t.drain();
         let finished = t.finished();
         let changed = !events.is_empty() || finished;
@@ -205,7 +228,86 @@ impl Panel {
             }
         }
         ui.add_space(6.0);
-        ui.weak("Из командной строки: proxy-scanner-cli playbook файл.json -o отчёт.html — удобно по расписанию.");
+        self.schedule_ui(ui, env);
+        ui.add_space(6.0);
+        ui.weak("Из командной строки: proxy-scanner-cli playbook файл.json -o отчёт.html.");
+    }
+
+    fn schedule_ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {
+        use crate::tools::schedule::{self, Every};
+        let name = self.current().map(|p| p.name.clone()).unwrap_or_default();
+        egui::CollapsingHeader::new("По расписанию с отчётом на почту").id_salt("pb_sched").show(ui, |ui| {
+            if self.schedule_status.is_none() {
+                self.schedule_status = Some(schedule::status());
+            }
+            ui.weak(self.schedule_status.clone().unwrap_or_default());
+            let c = &mut self.schedule;
+            if c.playbook.is_empty() || ui.small_button(format!("взять выбранный: «{name}»")).clicked() {
+                c.playbook = name.clone();
+            }
+            ui.label(format!("Сценарий: «{}»", c.playbook));
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut c.every, Every::Day, "каждый день");
+                ui.radio_value(&mut c.every, Every::Week, "раз в неделю");
+                ui.radio_value(&mut c.every, Every::Hours, "каждые N часов");
+            });
+            ui.horizontal(|ui| match c.every {
+                Every::Hours => {
+                    ui.add(egui::DragValue::new(&mut c.hours).range(1..=168).suffix(" ч"));
+                }
+                Every::Week => {
+                    egui::ComboBox::from_id_salt("pb_wd")
+                        .selected_text(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][(c.weekday.clamp(1, 7) - 1) as usize])
+                        .show_ui(ui, |ui| {
+                            for (i, d) in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].iter().enumerate() {
+                                ui.selectable_value(&mut c.weekday, i as u8 + 1, *d);
+                            }
+                        });
+                    ui.label("в");
+                    ui.add(egui::DragValue::new(&mut c.hour).range(0..=23).suffix(":00"));
+                }
+                Every::Day => {
+                    ui.label("в");
+                    ui.add(egui::DragValue::new(&mut c.hour).range(0..=23).suffix(":00"));
+                }
+            });
+            super::alerts_ui(ui, &mut c.alerts, "pb_sched_mail", "Отчёт HTML с блоком «Что изменилось с прошлого прогона» — на почту; в файл журнала — строка об итоге.");
+            ui.horizontal(|ui| {
+                ui.label("Хранить прогонов");
+                ui.add(egui::DragValue::new(&mut c.keep).range(1..=1000));
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Установить").on_hover_text("Задание Планировщика Windows (SYSTEM) или таймер systemd; нужны права администратора").clicked() {
+                    self.schedule_status = Some(match schedule::install(&self.schedule) {
+                        Ok(m) => m,
+                        Err(e) => format!("не установлено: {e}"),
+                    });
+                }
+                if ui.button("Удалить").clicked() {
+                    self.schedule_status = Some(match schedule::uninstall() {
+                        Ok(m) => m,
+                        Err(e) => e,
+                    });
+                }
+                let running = self.schedule_task.is_some();
+                if ui.add_enabled(!running, egui::Button::new("Выполнить сейчас")).on_hover_text("Прогон как по расписанию: история, сравнение, отчёт и письмо").clicked() {
+                    self.schedule_log.clear();
+                    let cfg = self.schedule.clone();
+                    let store = env.store.clone();
+                    self.schedule_task = Some(Task::spawn(env.rt, &env.ctx, move |s, c| schedule::run_once(cfg, store, s, c)));
+                }
+                if running {
+                    ui.spinner();
+                }
+                if ui.button("История").on_hover_text(schedule::history_dir().display().to_string()).clicked() {
+                    let _ = std::fs::create_dir_all(schedule::history_dir());
+                    crate::util::open_path(&schedule::history_dir());
+                }
+            });
+            for l in &self.schedule_log {
+                ui.add(egui::Label::new(RichText::new(l).small()).wrap());
+            }
+        });
     }
 
     pub fn results_ui(&mut self, ui: &mut egui::Ui, _env: &mut Env) {

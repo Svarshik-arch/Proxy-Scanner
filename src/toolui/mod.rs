@@ -10,6 +10,7 @@ mod discovery;
 mod dns;
 mod host;
 mod http;
+mod ipam;
 mod map;
 mod matrix;
 mod monitor;
@@ -61,10 +62,11 @@ pub enum Tool {
     Switches,
     Playbooks,
     Overview,
+    Ipam,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 23] = [
+    pub const ALL: [Tool; 24] = [
         Tool::Host,
         Tool::Mtr,
         Tool::Discovery,
@@ -88,6 +90,7 @@ impl Tool {
         Tool::Switches,
         Tool::Playbooks,
         Tool::Overview,
+        Tool::Ipam,
     ];
 
     pub fn title(self) -> &'static str {
@@ -115,6 +118,7 @@ impl Tool {
             Tool::Switches => "Коммутаторы",
             Tool::Playbooks => "Сценарии",
             Tool::Overview => "Обзор",
+            Tool::Ipam => "Адреса",
         }
     }
 
@@ -143,6 +147,7 @@ impl Tool {
             Tool::Switches => "SNMP: какой MAC за каким портом и в каком VLAN; соседи LLDP",
             Tool::Playbooks => "Последовательность проверок одной кнопкой: приёмка сегмента, домен, аудит",
             Tool::Overview => "Состояние сети одним экраном: тревоги, сбои, угрозы, сертификаты",
+            Tool::Ipam => "Учёт адресов: занято и свободно, давно не появлялись, расхождения DNS, конфликты",
         }
     }
 
@@ -171,6 +176,7 @@ impl Tool {
             Tool::Switches => "snmp",
             Tool::Playbooks => "playbooks",
             Tool::Overview => "overview",
+            Tool::Ipam => "ipam",
         }
     }
 }
@@ -183,6 +189,8 @@ pub enum Nav {
     Proxy(String),
     /// Открыть инструмент, ничего не меняя.
     Open(Tool),
+    /// Карточка узла.
+    Card(String),
     /// Разбудить узел (Wake-on-LAN).
     Wake(String),
     /// Где воткнут узел (по таблицам коммутаторов).
@@ -355,6 +363,7 @@ pub struct Prefs {
     pub sitecheck: crate::tools::sitecheck::Config,
     pub watch: crate::tools::watch::Config,
     pub snmp: crate::tools::snmp::Config,
+    pub ipam: crate::tools::ipam::Config,
 }
 
 /// Результаты инструментов для файла сессии.
@@ -380,6 +389,8 @@ pub struct Results {
     pub sitecheck: Option<crate::tools::sitecheck::Report>,
     pub snmp: Option<crate::tools::snmp::Report>,
     pub watch: Option<crate::tools::watch::Report>,
+    /// Заметки и метки к узлам.
+    pub notes: std::collections::BTreeMap<String, crate::hostcard::HostNote>,
 }
 
 pub use capture::render_summary as render_capture_summary;
@@ -410,6 +421,12 @@ pub struct Workbench {
     watch: watch::Panel,
     switches: switches::Panel,
     playbooks: playbooks::Panel,
+    ipam: ipam::Panel,
+    notes: std::collections::BTreeMap<String, crate::hostcard::HostNote>,
+    /// Открытые карточки узлов.
+    cards: Vec<crate::hostcard::Card>,
+    /// Переход, запрошенный из карточки.
+    card_nav: Option<Nav>,
     /// Снимок текущей сессии и архив — для сертификатов и сравнения.
     current: Option<crate::session::Session>,
     archive: Vec<(String, std::path::PathBuf)>,
@@ -460,6 +477,10 @@ impl Workbench {
             watch: watch::Panel::new(prefs.watch),
             switches: switches::Panel::new(prefs.snmp),
             playbooks: playbooks::Panel::default(),
+            ipam: ipam::Panel::new(prefs.ipam),
+            notes: Default::default(),
+            cards: Vec::new(),
+            card_nav: None,
             current: None,
             archive: Vec::new(),
             palette: Palette::default(),
@@ -484,6 +505,7 @@ impl Workbench {
         self.sitecheck.cfg = p.sitecheck;
         self.watch.cfg = p.watch;
         self.switches.cfg = p.snmp;
+        self.ipam.cfg = p.ipam;
     }
 
     pub fn prefs(&self) -> Prefs {
@@ -504,6 +526,7 @@ impl Workbench {
             sitecheck: self.sitecheck.cfg.clone(),
             watch: self.watch.cfg.clone(),
             snmp: self.switches.cfg.clone(),
+            ipam: self.ipam.cfg.clone(),
         }
     }
 
@@ -526,12 +549,16 @@ impl Workbench {
             sitecheck: (!self.sitecheck.report.steps.is_empty()).then(|| self.sitecheck.report.clone()),
             snmp: (!self.switches.report.switches.is_empty()).then(|| self.switches.report.clone()),
             watch: self.watch.report.last.is_some().then(|| self.watch.report.clone()),
+            notes: self.notes.iter().filter(|(_, n)| !n.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
 
     /// Есть ли что сохранять в сессию.
     pub fn has_results(&self) -> bool {
-        serde_json::to_value(self.results()).ok().and_then(|v| v.as_object().map(|m| m.values().any(|x| !x.is_null()))).unwrap_or(false)
+        serde_json::to_value(self.results())
+            .ok()
+            .and_then(|v| v.as_object().map(|m| m.values().any(|x| !x.is_null() && x.as_object().is_none_or(|o| !o.is_empty()))))
+            .unwrap_or(false)
     }
 
     pub fn restore_results(&mut self, r: Results) {
@@ -586,6 +613,9 @@ impl Workbench {
         if let Some(v) = r.watch {
             self.watch.report = v;
         }
+        if !r.notes.is_empty() {
+            self.notes = r.notes;
+        }
     }
 
     pub fn clear_results(&mut self) {
@@ -608,6 +638,8 @@ impl Workbench {
         self.sitecheck.report = Default::default();
         self.switches.report = Default::default();
         self.watch.report = Default::default();
+        self.notes.clear();
+        self.cards.clear();
     }
 
     /// Контекст для «Сертификатов» и «Сравнения»: снимок сессии и архив.
@@ -638,6 +670,7 @@ impl Workbench {
         changed |= self.sitecheck.poll();
         changed |= self.watch.poll();
         changed |= self.switches.poll();
+        changed |= self.ipam.poll();
         if self.playbooks.poll() {
             changed = true;
             if let Some(r) = self.playbooks.finished.take() {
@@ -675,6 +708,7 @@ impl Workbench {
             Tool::Watch => self.watch.busy(),
             Tool::Switches => self.switches.busy(),
             Tool::Playbooks => self.playbooks.busy(),
+            Tool::Ipam => self.ipam.busy(),
         }
     }
 
@@ -750,7 +784,7 @@ impl Workbench {
                 self.watch.report.changes.len()
             }
             Tool::Switches => self.switches.report.switches.iter().map(|s| s.entries.len()).sum(),
-            Tool::Playbooks | Tool::Overview => return None,
+            Tool::Playbooks | Tool::Overview | Tool::Ipam => return None,
         };
         (n > 0).then(|| n.to_string())
     }
@@ -833,6 +867,10 @@ impl Workbench {
             }
             Tool::Playbooks => self.playbooks.settings_ui(ui, &mut env),
             Tool::Overview => overview_settings(ui),
+            Tool::Ipam => {
+                let known = self.current.as_ref().map(crate::tools::ipam::known_hosts).unwrap_or_default();
+                self.ipam.settings_ui(ui, &mut env, &known)
+            }
         }
         nav
     }
@@ -891,6 +929,10 @@ impl Workbench {
             }
             Tool::Playbooks => self.playbooks.results_ui(ui, &mut env),
             Tool::Overview => {}
+            Tool::Ipam => {
+                let known = self.current.as_ref().map(crate::tools::ipam::known_hosts).unwrap_or_default();
+                self.ipam.results_ui(ui, &mut env, &known, &self.notes)
+            }
         }
         nav
     }
@@ -931,6 +973,7 @@ impl Workbench {
             Tool::SiteCheck => presets::apply(&mut self.sitecheck.cfg, &p.values),
             Tool::Watch => presets::apply(&mut self.watch.cfg, &p.values),
             Tool::Switches => presets::apply(&mut self.switches.cfg, &p.values),
+            Tool::Ipam => presets::apply(&mut self.ipam.cfg, &p.values),
             Tool::UrlCheck => presets::apply(&mut self.urlcheck.cfg, &p.values),
             Tool::Shares => presets::apply(&mut self.shares.cfg, &p.values),
         };
@@ -1062,6 +1105,124 @@ impl Workbench {
         open
     }
 
+    /// Открыть карточку узла (по снимку сессии).
+    pub fn open_card(&mut self, ip: &str, s: &crate::session::Session) {
+        let Ok(addr) = ip.split(':').next().unwrap_or(ip).parse::<std::net::Ipv4Addr>() else {
+            self.message = Some(format!("{ip}: карточка — только для адресов IPv4"));
+            return;
+        };
+        let card = crate::hostcard::build(s, addr);
+        self.cards.retain(|c| c.ip != card.ip);
+        self.cards.push(card);
+        if self.cards.len() > 4 {
+            self.cards.remove(0);
+        }
+    }
+
+    /// Переход из карточки (забирает приложение).
+    pub fn take_card_nav(&mut self) -> Option<Nav> {
+        self.card_nav.take()
+    }
+
+    /// Пересобрать открытые карточки (после новых результатов).
+    pub fn refresh_cards(&mut self, s: &crate::session::Session) {
+        for c in &mut self.cards {
+            if let Ok(a) = c.ip.parse() {
+                *c = crate::hostcard::build(s, a);
+            }
+        }
+    }
+
+    pub fn has_cards(&self) -> bool {
+        !self.cards.is_empty()
+    }
+
+    fn cards_ui(&mut self, ctx: &egui::Context) {
+        use crate::hostcard::Level;
+        let mut close = Vec::new();
+        for (i, card) in self.cards.iter().enumerate() {
+            let mut open = true;
+            let note = self.notes.entry(card.ip.clone()).or_default();
+            egui::Window::new(RichText::new(&card.title).strong())
+                .id(egui::Id::unique(("host_card", &card.ip)))
+                .open(&mut open)
+                .default_size([520.0, 560.0])
+                .default_pos([380.0 + 30.0 * i as f32, 90.0 + 30.0 * i as f32])
+                .resizable(true)
+                .show(ctx, |ui| {
+                    for l in &card.subtitle {
+                        ui.label(l);
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, nav) in [
+                            ("MTR", Nav::Send(Tool::Mtr, card.ip.clone())),
+                            ("Сервисы", Nav::Send(Tool::Services, card.ip.clone())),
+                            ("Аудит", Nav::Send(Tool::Audit, card.ip.clone())),
+                            ("Мониторинг", Nav::Send(Tool::Monitor, card.ip.clone())),
+                            ("Где воткнут?", Nav::Locate(card.ip.clone())),
+                            ("Разбудить", Nav::Wake(card.ip.clone())),
+                        ] {
+                            if ui.small_button(label).clicked() {
+                                self.card_nav = Some(nav);
+                            }
+                        }
+                        if ui.small_button("Копировать").clicked() {
+                            let mut t = vec![card.title.clone()];
+                            t.extend(card.subtitle.iter().cloned());
+                            for (h, lines) in &card.sections {
+                                t.push(format!("\n{h}"));
+                                t.extend(lines.iter().map(|l| format!("  {}", l.text)));
+                            }
+                            if !note.is_empty() {
+                                t.push(format!("\nЗаметка: {} {}", note.tags, note.text));
+                            }
+                            ui.ctx().copy_text(t.join("\n"));
+                        }
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Метки");
+                        ui.add(egui::TextEdit::singleline(&mut note.tags).hint_text("сервер, 1С, ответственный Иванов").desired_width(f32::INFINITY));
+                    });
+                    ui.add(egui::TextEdit::multiline(&mut note.text).hint_text("заметка: назначение, где стоит, к кому обращаться").desired_rows(2).desired_width(f32::INFINITY));
+                    ui.separator();
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if card.sections.is_empty() {
+                            ui.weak("Об узле пока ничего не собрано: запустите «Узлы», «Сервисы» или «Аудит».");
+                        }
+                        for (head, lines) in &card.sections {
+                            egui::CollapsingHeader::new(RichText::new(format!("{head} ({})", lines.len())).strong())
+                                .id_salt(("card_sec", &card.ip, head))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for l in lines {
+                                        let t = RichText::new(&l.text);
+                                        let t = match l.level {
+                                            Level::Bad => t.color(RED),
+                                            Level::Warn => t.color(AMBER),
+                                            Level::Good => t.color(GREEN),
+                                            Level::Normal => t,
+                                        };
+                                        ui.add(egui::Label::new(t).wrap());
+                                    }
+                                });
+                        }
+                    });
+                });
+            if !open {
+                close.push(i);
+            }
+        }
+        for i in close.into_iter().rev() {
+            self.cards.remove(i);
+        }
+    }
+
+    /// Метки узла (для таблиц).
+    pub fn tags_of(&self, ip: &str) -> Option<&str> {
+        self.notes.get(ip).map(|n| n.tags.as_str()).filter(|t| !t.trim().is_empty())
+    }
+
     /// MAC узла из того, что уже собрано: «Узлы», «Наблюдение», ARP-таблица, прослушивание.
     pub fn find_mac(&self, ip: &str) -> Option<String> {
         let addr: std::net::Ipv4Addr = ip.parse().ok()?;
@@ -1150,6 +1311,7 @@ impl Workbench {
             Tool::SiteCheck => self.sitecheck.cfg.url = host.to_string(),
             Tool::Watch => self.watch.cfg.targets = host.split(':').next().unwrap_or(host).to_string(),
             Tool::Switches => self.switches.cfg.switches = host.split(':').next().unwrap_or(host).to_string(),
+            Tool::Ipam => {}
             Tool::Capture => self.capture.cfg.filter = format!("host {}", host.split(':').next().unwrap_or(host)),
             Tool::Shares => self.shares.cfg.targets = host.split(':').next().unwrap_or(host).to_string(),
             Tool::UrlCheck => {
@@ -1229,6 +1391,7 @@ impl Workbench {
 
     /// Окна, общие для всех инструментов: сохранение пресета, палитра команд.
     pub fn windows(&mut self, ctx: &egui::Context) {
+        self.cards_ui(ctx);
         if self.save.open {
             let mut open = true;
             let mut done = false;
@@ -1482,6 +1645,11 @@ pub fn export_buttons<R: Serialize>(ui: &mut egui::Ui, env: &mut Env, name: &str
 /// Меню «Отправить в…» для узла.
 pub fn send_menu(ui: &mut egui::Ui, host: &str, nav: &mut Option<Nav>, except: Tool) {
     ui.label(RichText::new(host).strong());
+    let ip0 = host.split(':').next().unwrap_or(host);
+    if ip0.parse::<std::net::Ipv4Addr>().is_ok() && ui.button("🗂 Карточка узла").on_hover_text("Всё, что известно об узле, заметки и метки").clicked() {
+        *nav = Some(Nav::Card(ip0.to_string()));
+        ui.close();
+    }
     if ui.button("Копировать").clicked() {
         ui.ctx().copy_text(host.to_string());
         ui.close();

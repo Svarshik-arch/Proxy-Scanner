@@ -102,12 +102,25 @@ pub struct Change {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Report {
     /// Первый опрос — эталон.
     pub baseline: Option<Snapshot>,
     pub last: Option<Snapshot>,
     pub changes: Vec<Change>,
     pub cycles: u32,
+    /// Когда узел впервые и в последний раз отвечал (unix).
+    pub seen: BTreeMap<std::net::Ipv4Addr, (u64, u64)>,
+}
+
+impl Report {
+    /// Учесть опрос: обновить время появления узлов.
+    pub fn note_seen(&mut self, s: &Snapshot) {
+        for ip in s.hosts.keys() {
+            let e = self.seen.entry(*ip).or_insert((s.at, s.at));
+            e.1 = e.1.max(s.at);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

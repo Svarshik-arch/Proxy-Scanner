@@ -292,6 +292,14 @@ pub fn rules(s: &Service) -> Vec<Issue> {
             out.push(issue(s, Low, "Сертификат не доверен системой (самоподписанный или чужой CA)", "Выпустите сертификат от корпоративного CA"));
         }
     }
+    for v in super::cve::check(s) {
+        out.push(issue(
+            s,
+            v.severity,
+            &format!("{} {} {}: {}", v.product, v.version, v.cve, v.title),
+            &format!("Обновите до {} или проверьте, перенесено ли исправление в пакет дистрибутива", v.fixed),
+        ));
+    }
     out
 }
 
@@ -448,7 +456,7 @@ mod tests {
         assert_eq!(rules(&svc("rdp", "TLS", &[])).len(), 1);
         assert!(rules(&svc("rdp", "NLA (CredSSP)", &[])).is_empty());
         assert_eq!(rules(&svc("ssh", "OpenSSH 6.6.1p1 Ubuntu", &[]))[0].severity, Severity::Medium);
-        assert!(rules(&svc("ssh", "OpenSSH 9.6p1", &[])).is_empty());
+        assert!(rules(&svc("ssh", "OpenSSH 9.8p1", &[])).is_empty());
         assert_eq!(rules(&svc("redis", "", &["доступ без пароля"]))[0].severity, Severity::High);
         let mut t = svc("https", "nginx", &["HTTP 200"]);
         t.tls = Some(services::TlsSummary { days_left: -1, trusted: true, ..Default::default() });

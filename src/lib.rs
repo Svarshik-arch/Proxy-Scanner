@@ -10,6 +10,7 @@ pub mod egress;
 pub mod export;
 pub mod filters;
 pub mod graph;
+pub mod hostcard;
 pub mod intro;
 pub mod model;
 pub mod netdetect;

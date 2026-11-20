@@ -185,6 +185,14 @@ impl Panel {
                         }
                     }
                     5 => {
+                        let vulns = crate::tools::cve::check(s);
+                        if !vulns.is_empty() {
+                            let text = vulns.iter().map(|v| v.cve.clone()).collect::<Vec<_>>().join(", ");
+                            ui.colored_label(RED, format!("⚠ {text}")).on_hover_text(
+                                vulns.iter().map(|v| format!("{} {}: {}", v.product, v.version, v.title)).collect::<Vec<_>>().join("\n"),
+                            );
+                            return;
+                        }
                         let risky = s.details.iter().any(|d| {
                             d.contains("SMBv1") || d.contains("без NLA") || d.contains("без пароля") || d.contains("не обязательна") || d.contains("community") || d.contains("5 минут")
                         });
@@ -213,6 +221,9 @@ impl Panel {
             ui.strong(format!("{}:{}/{} — {} {}", s.ip, s.port, s.proto, s.service, s.version));
             for d in &s.details {
                 ui.label(format!("• {d}"));
+            }
+            for v in crate::tools::cve::check(s) {
+                ui.colored_label(RED, format!("⚠ {} — {} {}: {} (исправлено в {})", v.cve, v.product, v.version, v.title, v.fixed));
             }
             if let Some(t) = &s.tls {
                 ui.label(format!(

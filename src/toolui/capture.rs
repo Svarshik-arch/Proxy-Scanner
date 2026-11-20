@@ -8,7 +8,18 @@ use crate::tools::capture::{self, Config, Device, Event, Packet, Raw, Summary};
 #[derive(PartialEq, Clone, Copy)]
 enum View {
     Summary,
+    Top,
     Packets,
+}
+
+/// Скорость по узлам и приложениям: замер раз в секунду.
+#[derive(Default)]
+struct Rates {
+    at: Option<std::time::Instant>,
+    hosts_prev: std::collections::BTreeMap<String, u64>,
+    apps_prev: std::collections::BTreeMap<String, u64>,
+    hosts: std::collections::BTreeMap<String, f64>,
+    apps: std::collections::BTreeMap<String, f64>,
 }
 
 pub struct Panel {
@@ -23,6 +34,7 @@ pub struct Panel {
     view: View,
     text: String,
     follow: bool,
+    rates: Rates,
 }
 
 const MAX_SHOWN: usize = 50_000;
@@ -41,6 +53,7 @@ impl Panel {
             view: View::Summary,
             text: String::new(),
             follow: true,
+            rates: Rates::default(),
         }
     }
 
@@ -87,7 +100,95 @@ impl Panel {
         changed
     }
 
+    fn update_rates(&mut self) {
+        let now = std::time::Instant::now();
+        let r = &mut self.rates;
+        let dt = r.at.map(|t| now.duration_since(t).as_secs_f64()).unwrap_or(0.0);
+        if r.at.is_some() && dt < 1.0 {
+            return;
+        }
+        let hosts = self.summary.host_bytes();
+        let apps = self.summary.apps.clone();
+        if dt > 0.0 {
+            let rate = |cur: &std::collections::BTreeMap<String, u64>, prev: &std::collections::BTreeMap<String, u64>| {
+                cur.iter()
+                    .map(|(k, v)| (k.clone(), v.saturating_sub(prev.get(k).copied().unwrap_or(0)) as f64 / dt))
+                    .collect()
+            };
+            r.hosts = rate(&hosts, &r.hosts_prev);
+            r.apps = rate(&apps, &r.apps_prev);
+        }
+        r.hosts_prev = hosts;
+        r.apps_prev = apps;
+        r.at = Some(now);
+    }
+
+    /// Кто занимает канал: узлы и приложения по объёму и текущей скорости.
+    fn top_ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {
+        if self.busy() {
+            self.update_rates();
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let hosts = self.summary.host_bytes();
+        if hosts.is_empty() {
+            ui.weak("Запустите захват с фильтром «всё» (не только служебные протоколы) — здесь появятся самые активные узлы и приложения.");
+            return;
+        }
+        let fmt = |b: f64| {
+            if b >= 1e9 {
+                format!("{:.1} ГБ", b / 1e9)
+            } else if b >= 1e6 {
+                format!("{:.1} МБ", b / 1e6)
+            } else if b >= 1e3 {
+                format!("{:.0} КБ", b / 1e3)
+            } else {
+                format!("{b:.0} Б")
+            }
+        };
+        let speed = |b: f64| if b <= 0.0 { String::new() } else { format!("{}/с", fmt(b * 8.0).replace('Б', "бит")) };
+        let mut top: Vec<(String, u64)> = hosts.into_iter().collect();
+        top.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let mut apps: Vec<(String, u64)> = self.summary.apps.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        apps.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let total: u64 = apps.iter().map(|x| x.1).sum::<u64>().max(1);
+        let max_host = top.first().map(|x| x.1).unwrap_or(1).max(1);
+        let bar = |ui: &mut egui::Ui, share: f32, color: egui::Color32| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(160.0, 10.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 2.0, ui.visuals().faint_bg_color);
+            let mut r = rect;
+            r.set_width(rect.width() * share.clamp(0.0, 1.0));
+            ui.painter().rect_filled(r, 2.0, color);
+        };
+        let nav = &mut *env.nav;
+        let accent = ui.visuals().selection.bg_fill;
+        ui.columns(2, |c| {
+            c[0].strong("Узлы");
+            egui::Grid::new("top_hosts").striped(true).num_columns(4).show(&mut c[0], |ui| {
+                for (h, n) in top.iter().take(25) {
+                    ui.monospace(h).context_menu(|ui| super::send_menu(ui, h, nav, Tool::Capture));
+                    bar(ui, *n as f32 / max_host as f32, accent);
+                    ui.label(fmt(*n as f64));
+                    ui.weak(speed(self.rates.hosts.get(h).copied().unwrap_or(0.0)));
+                    ui.end_row();
+                }
+            });
+            c[1].strong("Приложения");
+            egui::Grid::new("top_apps").striped(true).num_columns(4).show(&mut c[1], |ui| {
+                for (a, n) in apps.iter().take(25) {
+                    ui.label(a);
+                    bar(ui, *n as f32 / total as f32, AMBER);
+                    ui.label(format!("{} · {:.0}%", fmt(*n as f64), 100.0 * *n as f64 / total as f64));
+                    ui.weak(speed(self.rates.apps.get(a).copied().unwrap_or(0.0)));
+                    ui.end_row();
+                }
+            });
+        });
+        ui.add_space(6.0);
+        ui.weak("Объём — за всё время захвата, скорость — за последнюю секунду. Учитывается трафик, который видит этот интерфейс: свой, широковещательный, а на зеркальном порту (SPAN) — весь сегмент.");
+    }
+
     fn start(&mut self, env: &Env) {
+        self.rates = Rates::default();
         self.packets.clear();
         self.raws.clear();
         self.summary = Summary::default();
@@ -219,6 +320,7 @@ impl Panel {
     pub fn results_ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.view, View::Summary, "Сводка");
+            ui.selectable_value(&mut self.view, View::Top, "Кто занимает канал");
             ui.selectable_value(&mut self.view, View::Packets, format!("Пакеты ({})", self.summary.packets));
             ui.weak(format!("{:.1} МБ", self.summary.bytes as f64 / 1e6));
             if self.busy() {
@@ -231,6 +333,7 @@ impl Panel {
         match self.view {
             View::Summary => self.summary_ui(ui, env),
             View::Packets => self.packets_ui(ui),
+            View::Top => self.top_ui(ui, env),
         }
     }
 

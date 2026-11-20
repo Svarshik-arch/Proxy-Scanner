@@ -42,6 +42,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("wol", "", "разбудить узел: wol AA:BB:CC:DD:EE:FF [10.0.0.25]"),
     ("calc", "", "калькулятор подсетей: calc 10.0.1.5/22 | calc 10.0.0.0/22 /24 | calc 10.0.0.5-10.0.0.70"),
     ("playbook", "", "сценарий: playbook файл.json|«имя встроенного» [-o отчёт.html]; playbook list"),
+    ("scheduled", "", "прогон сценария по расписанию: scheduled [--config proxy-scanner-schedule.json] (история, сравнение, почта)"),
     ("listen", "", "слушатель для проверки доступа сюда: listen 443,1433"),
     ("certs", "", "сертификаты из файла сессии: certs сессия.json [-o certs.csv]"),
     ("compare", "", "сравнение сессий: compare было.json стало.json"),
@@ -340,6 +341,7 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "wol" => cmd_wol(&o),
         "calc" => cmd_calc(&o),
         "playbook" => cmd_playbook(&o, &store),
+        "scheduled" => cmd_scheduled(&o, &store),
         "listen" => cmd_listen(&o),
         "certs" => cmd_certs(&o),
         "compare" => cmd_compare(&o),
@@ -791,6 +793,7 @@ fn cmd_watch(o: &Opts, store: &Store) -> Result<(), String> {
             if r.baseline.is_none() {
                 r.baseline = Some((*snap).clone());
             }
+            r.note_seen(&snap);
             r.last = Some(*snap);
         }
         watch::Event::Change(ch) => {
@@ -950,6 +953,21 @@ fn cmd_playbook(o: &Opts, store: &Store) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn cmd_scheduled(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::schedule;
+    let path = o.config.clone().map(std::path::PathBuf::from).unwrap_or_else(schedule::config_path);
+    let cfg = schedule::load_config(&path)?;
+    let store = store.clone();
+    let quiet = o.quiet;
+    let mut result = String::new();
+    drive(&Opts { out: None, ..Default::default() }, |s, c| schedule::run_once(cfg, store, s, c), |e| match e {
+        schedule::Event::Log(m) => eprint_line(quiet, &m),
+        schedule::Event::Done(m) => result = m,
+    })?;
+    println!("{result}");
+    if result.starts_with("ошибка") { Err(result) } else { Ok(()) }
 }
 
 fn cmd_listen(o: &Opts) -> Result<(), String> {

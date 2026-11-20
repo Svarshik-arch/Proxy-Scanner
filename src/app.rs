@@ -207,6 +207,7 @@ impl Group {
                 Section::Tool(Tool::Capture),
                 Section::Tool(Tool::Map),
                 Section::Tool(Tool::Switches),
+                Section::Tool(Tool::Ipam),
             ],
             Group::Services => &[
                 Section::Tool(Tool::Dns),
@@ -219,7 +220,7 @@ impl Group {
             Group::Audit => &[Section::Tool(Tool::Audit), Section::Tool(Tool::Certs), Section::Tool(Tool::Compare)],
             Group::Diagnose => &[Section::Tool(Tool::SiteCheck), Section::Tool(Tool::Playbooks)],
             Group::Overview => &[Section::Tool(Tool::Overview)],
-            Group::Watch => &[Section::Tool(Tool::Watch), Section::Tool(Tool::Compare)],
+            Group::Watch => &[Section::Tool(Tool::Watch), Section::Tool(Tool::Ipam), Section::Tool(Tool::Compare)],
             Group::Monitor => &[Section::Tool(Tool::Monitor), Section::Tool(Tool::Certs)],
             Group::Threats => &[Section::Tool(Tool::Threats), Section::Tool(Tool::Capture)],
             Group::Map => &[Section::Tool(Tool::Map), Section::Tool(Tool::Switches)],
@@ -2799,6 +2800,10 @@ impl App {
                 self.compact_tab = CompactTab::Settings;
             }
             Some(Nav::Open(t)) => self.goto(Section::Tool(t)),
+            Some(Nav::Card(ip)) => {
+                let snap = self.session_snapshot();
+                self.bench.open_card(&ip, &snap);
+            }
             Some(Nav::Wake(ip)) => {
                 let handle = self.rt.handle().clone();
                 self.status = self.bench.wake(&handle, &ip);
@@ -3977,11 +3982,16 @@ impl eframe::App for App {
             self.dirty = true;
         }
         // «Сертификаты» и «Сравнение» работают со снимком всей сессии.
-        if matches!(self.view.section, Section::Tool(Tool::Certs | Tool::Compare | Tool::Map | Tool::Overview))
-            && self.last_context.is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
-        {
-            let archive = self.archive.iter().map(|a| (a.label(), a.path.clone())).collect();
-            self.bench.set_context(self.session_snapshot(), archive);
+        let needs_context = matches!(self.view.section, Section::Tool(Tool::Certs | Tool::Compare | Tool::Map | Tool::Overview | Tool::Ipam));
+        if (needs_context || self.bench.has_cards()) && self.last_context.is_none_or(|t| t.elapsed() >= Duration::from_secs(3)) {
+            let snap = self.session_snapshot();
+            if self.bench.has_cards() {
+                self.bench.refresh_cards(&snap);
+            }
+            if needs_context {
+                let archive = self.archive.iter().map(|a| (a.label(), a.path.clone())).collect();
+                self.bench.set_context(snap, archive);
+            }
             self.last_context = Some(Instant::now());
         }
         if self.bench.take_attention() {
@@ -4015,6 +4025,9 @@ impl eframe::App for App {
         self.ui_confirm_new_scan(&ui.ctx().clone());
         self.ui_palette(&ui.ctx().clone());
         self.bench.windows(&ui.ctx().clone());
+        if let Some(n) = self.bench.take_card_nav() {
+            self.navigate(Some(n));
+        }
         if let Some(m) = self.bench.message.take() {
             self.status = m.clone();
             self.push_log(m);

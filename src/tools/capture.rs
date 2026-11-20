@@ -300,6 +300,73 @@ pub struct Summary {
     pub name_responders: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// Объём трафика между адресами: «a ↔ b» → байт (для живой карты).
     pub talk: BTreeMap<String, u64>,
+    /// Объём по приложениям (HTTPS, SMB, RDP…) → байт.
+    pub apps: BTreeMap<String, u64>,
+}
+
+impl Summary {
+    /// Байт на узел (сумма по всем его парам).
+    pub fn host_bytes(&self) -> BTreeMap<String, u64> {
+        let mut m: BTreeMap<String, u64> = BTreeMap::new();
+        for (k, n) in &self.talk {
+            if let Some((a, b)) = k.split_once(" ↔ ") {
+                *m.entry(a.to_string()).or_insert(0) += n;
+                *m.entry(b.to_string()).or_insert(0) += n;
+            }
+        }
+        m
+    }
+}
+
+/// Приложение по протоколу и портам (меньший из портов обычно серверный).
+pub fn app_name(proto: u8, l4: &[u8]) -> String {
+    let name = |p: u16| -> Option<&'static str> {
+        Some(match p {
+            20 | 21 => "FTP",
+            22 => "SSH",
+            23 => "Telnet",
+            25 | 465 | 587 => "SMTP",
+            53 => "DNS",
+            67 | 68 => "DHCP",
+            80 | 8080 | 8000 | 3128 => "HTTP",
+            88 => "Kerberos",
+            110 | 995 => "POP3",
+            123 => "NTP",
+            135 => "RPC",
+            137..=139 => "NetBIOS",
+            143 | 993 => "IMAP",
+            161 | 162 => "SNMP",
+            389 | 636 | 3268 | 3269 => "LDAP",
+            443 | 8443 => "HTTPS",
+            445 => "SMB",
+            514 => "Syslog",
+            1433 => "MSSQL",
+            1521 => "Oracle",
+            1194 => "OpenVPN",
+            3306 => "MySQL",
+            3389 => "RDP",
+            5060 | 5061 => "SIP",
+            5432 => "PostgreSQL",
+            5900..=5903 => "VNC",
+            5985 | 5986 => "WinRM",
+            6379 => "Redis",
+            9100 => "Печать",
+            _ => return None,
+        })
+    };
+    let ports = || (l4.len() >= 4).then(|| (be16(l4, 0), be16(l4, 2)));
+    match proto {
+        6 | 17 => {
+            let Some((a, b)) = ports() else { return "IP".into() };
+            let t = if proto == 6 { "TCP" } else { "UDP" };
+            name(a.min(b))
+                .or_else(|| name(a.max(b)))
+                .map(String::from)
+                .unwrap_or_else(|| format!("{t}/{}", a.min(b)))
+        }
+        1 | 58 => "ICMP".into(),
+        p => format!("IP/{p}"),
+    }
 }
 
 impl Summary {
@@ -407,6 +474,7 @@ pub fn dissect(frame: &[u8], linktype: i32, sum: &mut Summary) -> (String, Strin
             if sum.talk.len() < 5000 || sum.talk.contains_key(&key) {
                 *sum.talk.entry(key).or_insert(0) += frame.len() as u64;
             }
+            *sum.apps.entry(app_name(proto, l4)).or_insert(0) += frame.len() as u64;
             let (p, info) = transport(proto, l4, &s, &d, &smac, sum);
             (s, d, p, info + &vtag)
         }
@@ -1004,5 +1072,22 @@ mod tests {
         h.await.unwrap();
         let n: usize = rx.try_iter().map(|e| if let Event::Packets(p, _) = e { p.len() } else { 0 }).sum();
         assert!(n >= 3, "пакетов: {n}");
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn apps_and_hosts() {
+        let l4 = |a: u16, b: u16| [a.to_be_bytes(), b.to_be_bytes()].concat();
+        assert_eq!(app_name(6, &l4(51234, 443)), "HTTPS");
+        assert_eq!(app_name(6, &l4(3389, 50000)), "RDP");
+        assert_eq!(app_name(17, &l4(40000, 40001)), "UDP/40000");
+        let mut s = Summary::default();
+        s.talk.insert("10.0.0.1 ↔ 10.0.0.2".into(), 100);
+        s.talk.insert("10.0.0.1 ↔ 10.0.0.3".into(), 50);
+        assert_eq!(s.host_bytes()["10.0.0.1"], 150);
     }
 }

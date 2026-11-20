@@ -56,6 +56,7 @@ impl Panel {
                     if self.report.baseline.is_none() {
                         self.report.baseline = Some((*s).clone());
                     }
+                    self.report.note_seen(&s);
                     self.report.last = Some(*s);
                 }
                 Event::Change(c) => self.report.changes.push(*c),
