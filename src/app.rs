@@ -117,6 +117,29 @@ enum Section {
     Tool(Tool),
 }
 
+/// Режим работы: разовые проверки или постоянный контроль сети.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum Mode {
+    #[default]
+    Scanner,
+    Control,
+}
+
+impl Mode {
+    fn title(self) -> &'static str {
+        match self {
+            Mode::Scanner => "Сканер",
+            Mode::Control => "Контроль сети",
+        }
+    }
+    fn hint(self) -> &'static str {
+        match self {
+            Mode::Scanner => "Разовые проверки: поиск прокси, узлы, сервисы, DNS, TLS, домен, аудит, диагностика сайта",
+            Mode::Control => "Постоянный контроль: обзор, наблюдение за изменениями, мониторинг, угрозы, живая карта, сценарии",
+        }
+    }
+}
+
 /// Группа разделов (верхний ряд вкладок).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Group {
@@ -124,11 +147,22 @@ enum Group {
     Network,
     Services,
     Audit,
+    Diagnose,
+    Overview,
+    Watch,
     Monitor,
+    Threats,
+    Map,
+    Scenarios,
 }
 
 impl Group {
-    const ALL: [Group; 5] = [Group::Proxy, Group::Network, Group::Services, Group::Audit, Group::Monitor];
+    fn all(mode: Mode) -> &'static [Group] {
+        match mode {
+            Mode::Scanner => &[Group::Proxy, Group::Network, Group::Services, Group::Audit, Group::Diagnose],
+            Mode::Control => &[Group::Overview, Group::Watch, Group::Monitor, Group::Threats, Group::Map, Group::Scenarios],
+        }
+    }
 
     fn title(self) -> &'static str {
         match self {
@@ -136,17 +170,29 @@ impl Group {
             Group::Network => "Сеть",
             Group::Services => "Службы",
             Group::Audit => "Аудит",
+            Group::Diagnose => "Диагностика",
+            Group::Overview => "Обзор",
+            Group::Watch => "Наблюдение",
             Group::Monitor => "Мониторинг",
+            Group::Threats => "Угрозы",
+            Group::Map => "Карта",
+            Group::Scenarios => "Сценарии",
         }
     }
 
     fn hint(self) -> &'static str {
         match self {
             Group::Proxy => "Поиск и проверка прокси, проверка адресов через прокси, обход прокси, PAC/WPAD",
-            Group::Network => "Эта машина, трассировка, узлы, доступность портов, трафик, карта сети",
+            Group::Network => "Эта машина, трассировка, узлы, доступность портов, трафик, карта, коммутаторы",
             Group::Services => "DNS, HTTP, сервисы и версии, TLS, домен AD, общие ресурсы",
             Group::Audit => "Небезопасные настройки, сертификаты, сравнение с прошлой проверкой",
-            Group::Monitor => Tool::Monitor.hint(),
+            Group::Diagnose => "Почему не открывается сайт; сценарии из нескольких проверок",
+            Group::Overview => Tool::Overview.hint(),
+            Group::Watch => "Изменения в сети по расписанию и сравнение с прошлыми проверками",
+            Group::Monitor => "Проверки по расписанию и сроки сертификатов",
+            Group::Threats => "Атаки и посторонние устройства в сегменте; захват трафика",
+            Group::Map => "Живая карта сети и коммутаторы",
+            Group::Scenarios => Tool::Playbooks.hint(),
         }
     }
 
@@ -160,6 +206,7 @@ impl Group {
                 Section::Tool(Tool::Matrix),
                 Section::Tool(Tool::Capture),
                 Section::Tool(Tool::Map),
+                Section::Tool(Tool::Switches),
             ],
             Group::Services => &[
                 Section::Tool(Tool::Dns),
@@ -170,12 +217,28 @@ impl Group {
                 Section::Tool(Tool::Shares),
             ],
             Group::Audit => &[Section::Tool(Tool::Audit), Section::Tool(Tool::Certs), Section::Tool(Tool::Compare)],
-            Group::Monitor => &[Section::Tool(Tool::Monitor)],
+            Group::Diagnose => &[Section::Tool(Tool::SiteCheck), Section::Tool(Tool::Playbooks)],
+            Group::Overview => &[Section::Tool(Tool::Overview)],
+            Group::Watch => &[Section::Tool(Tool::Watch), Section::Tool(Tool::Compare)],
+            Group::Monitor => &[Section::Tool(Tool::Monitor), Section::Tool(Tool::Certs)],
+            Group::Threats => &[Section::Tool(Tool::Threats), Section::Tool(Tool::Capture)],
+            Group::Map => &[Section::Tool(Tool::Map), Section::Tool(Tool::Switches)],
+            Group::Scenarios => &[Section::Tool(Tool::Playbooks)],
         }
     }
 
-    fn of(s: Section) -> Group {
-        Group::ALL.into_iter().find(|g| g.sections().contains(&s)).unwrap_or(Group::Proxy)
+    /// Группа раздела в режиме (раздел может быть в группах обоих режимов).
+    fn of(s: Section, mode: Mode) -> Group {
+        Group::all(mode)
+            .iter()
+            .copied()
+            .find(|g| g.sections().contains(&s))
+            .unwrap_or(Group::all(mode)[0])
+    }
+
+    /// Есть ли раздел в режиме.
+    fn has(s: Section, mode: Mode) -> bool {
+        Group::all(mode).iter().any(|g| g.sections().contains(&s))
     }
 }
 
@@ -247,6 +310,12 @@ struct ViewPrefs {
     project: String,
     /// Вкладки, у которых скрыто предисловие.
     hidden_intros: Vec<String>,
+    /// Режим работы.
+    mode: Mode,
+    /// Последний раздел каждого режима.
+    mode_sections: Vec<(Mode, Section)>,
+    /// Открытые вкладки проектов (пусто — «Основной»).
+    open_projects: Vec<String>,
 }
 
 impl Default for ViewPrefs {
@@ -264,6 +333,9 @@ impl Default for ViewPrefs {
             last_sections: Vec::new(),
             project: String::new(),
             hidden_intros: Vec::new(),
+            mode: Mode::Scanner,
+            mode_sections: Vec::new(),
+            open_projects: Vec::new(),
         }
     }
 }
@@ -464,16 +536,16 @@ impl App {
         // Открыть вкладку при запуске: PROXY_SCANNER_OPEN=mtr | proxies | egress | pac | graph.
         if let Ok(v) = std::env::var("PROXY_SCANNER_OPEN") {
             match v.as_str() {
-                "proxies" => app.view.section = Section::Proxies,
+                "proxies" => app.goto(Section::Proxies),
                 "graph" => {
-                    app.view.section = Section::Proxies;
+                    app.goto(Section::Proxies);
                     app.view.results_view = ResultsView::Graph;
                 }
-                "egress" => app.view.section = Section::Egress,
-                "pac" => app.view.section = Section::Pac,
+                "egress" => app.goto(Section::Egress),
+                "pac" => app.goto(Section::Pac),
                 key => {
                     if let Some(t) = Tool::ALL.into_iter().find(|t| t.preset_id() == key) {
-                        app.view.section = Section::Tool(t);
+                        app.goto(Section::Tool(t));
                     }
                 }
             }
@@ -656,7 +728,7 @@ impl App {
     }
 
     fn autosave(&mut self) {
-        if self.rows.is_empty() && self.scan_state.is_none() {
+        if self.rows.is_empty() && self.scan_state.is_none() && self.egress_items.is_empty() && !self.bench.has_results() {
             return;
         }
         let path = self.session_path.clone();
@@ -1643,6 +1715,8 @@ impl App {
                 ui.heading("Proxy Scanner");
             }
             ui.separator();
+            self.ui_mode_switch(ui, narrow);
+            ui.separator();
             if compact {
                 ui.selectable_value(&mut self.compact_tab, CompactTab::Settings, "Параметры");
                 let count = match self.view.section {
@@ -1659,7 +1733,7 @@ impl App {
                 );
                 ui.separator();
             }
-            // Режим сканера и признаки прав нужны только в разделах прокси.
+            // Движок сканера и признаки прав нужны только в разделах прокси.
             if !matches!(self.view.section, Section::Tool(_)) {
                 self.ui_scanner_badges(ui, narrow);
             }
@@ -1677,9 +1751,131 @@ impl App {
         });
     }
 
+    /// Переключатель режима работы: «Сканер» / «Контроль сети».
+    fn ui_mode_switch(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        for m in [Mode::Scanner, Mode::Control] {
+            let label = if narrow { if m == Mode::Scanner { "Сканер" } else { "Контроль" } } else { m.title() };
+            let mut text = RichText::new(label).strong();
+            if m == Mode::Control && m != self.view.mode {
+                let alert = ["⚠"].iter().any(|_| {
+                    [Tool::Watch, Tool::Monitor, Tool::Threats].iter().any(|t| self.bench.badge(*t).is_some_and(|b| b.starts_with('⚠')))
+                });
+                if alert {
+                    text = text.color(RED);
+                }
+            }
+            if ui.selectable_label(self.view.mode == m, text).on_hover_text(m.hint()).clicked() && self.view.mode != m {
+                self.set_mode(m);
+            }
+        }
+    }
+
+    /// Открыть раздел; если его нет в текущем режиме — переключить режим.
+    fn goto(&mut self, s: Section) {
+        if !Group::has(s, self.view.mode) {
+            let other = if self.view.mode == Mode::Scanner { Mode::Control } else { Mode::Scanner };
+            self.set_mode(other);
+        }
+        self.view.section = s;
+    }
+
+    fn set_mode(&mut self, m: Mode) {
+        let cur = (self.view.mode, self.view.section);
+        self.view.mode_sections.retain(|x| x.0 != cur.0);
+        self.view.mode_sections.push(cur);
+        self.view.mode = m;
+        self.view.section = self
+            .view
+            .mode_sections
+            .iter()
+            .find(|x| x.0 == m)
+            .map(|x| x.1)
+            .filter(|s| Group::has(*s, m))
+            .unwrap_or(Group::all(m)[0].sections()[0]);
+    }
+
+    /// Вкладки открытых проектов — как в браузере.
+    fn ui_project_tabs(&mut self, ui: &mut egui::Ui) {
+        if !self.view.open_projects.contains(&self.view.project) {
+            self.view.open_projects.push(self.view.project.clone());
+        }
+        let busy = self.busy() || self.bench.any_busy();
+        let mut switch: Option<String> = None;
+        let mut close: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for p in self.view.open_projects.clone() {
+                let current = p == self.view.project;
+                let title = if p.is_empty() { "Основной".to_string() } else { p.clone() };
+                let fill = if current { ui.visuals().selection.bg_fill } else { ui.visuals().faint_bg_color };
+                egui::Frame::new().fill(fill).corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }).inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let text = if current { RichText::new(&title).strong() } else { RichText::new(&title) };
+                        let r = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                        let r = if busy && !current { r.on_hover_text("Дождитесь окончания проверок, затем переключите проект") } else { r.on_hover_text("Проект: свои цели, настройки и результаты") };
+                        if r.clicked() && !current {
+                            switch = Some(p.clone());
+                        }
+                        if self.view.open_projects.len() > 1
+                            && ui.add(egui::Button::new(RichText::new("×").small()).frame(false)).on_hover_text("Закрыть вкладку (проект остаётся на диске)").clicked()
+                        {
+                            close = Some(p.clone());
+                        }
+                    });
+                });
+            }
+            ui.add_space(4.0);
+            ui.menu_button("+", |ui| {
+                ui.set_min_width(220.0);
+                ui.weak("Открыть проект во вкладке");
+                let mut all = vec![String::new()];
+                all.extend(session::list_projects());
+                for p in all.into_iter().filter(|p| !self.view.open_projects.contains(p)) {
+                    if ui.button(if p.is_empty() { "Основной".to_string() } else { p.clone() }).clicked() {
+                        switch = Some(p);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                let id = egui::Id::unique("tab_new_project");
+                let mut name: String = ui.data_mut(|d| d.get_temp(id).unwrap_or_default());
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut name).hint_text("новый проект").desired_width(140.0));
+                    let ok = !session::sanitize(&name).is_empty();
+                    if ui.add_enabled(ok, egui::Button::new("Создать")).clicked() {
+                        switch = Some(name.clone());
+                        name.clear();
+                        ui.close();
+                    }
+                });
+                ui.data_mut(|d| d.insert_temp(id, name));
+            })
+            .response
+            .on_hover_text("Открыть или создать проект");
+        });
+        if let Some(c) = close {
+            let idx = self.view.open_projects.iter().position(|p| *p == c).unwrap_or(0);
+            if c == self.view.project {
+                let next = self.view.open_projects.get(if idx > 0 { idx - 1 } else { 1 }).cloned().unwrap_or_default();
+                self.switch_project(&next);
+                if self.view.project == c {
+                    return; // не переключились (идут проверки)
+                }
+            }
+            self.view.open_projects.retain(|p| *p != c);
+        }
+        if let Some(p) = switch {
+            let name = session::sanitize(&p);
+            self.switch_project(&name);
+            if self.view.project == name && !self.view.open_projects.contains(&name) {
+                self.view.open_projects.push(name);
+            }
+        }
+    }
+
     fn ui_scanner_badges(&mut self, ui: &mut egui::Ui, narrow: bool) {
         if !narrow {
-            ui.label("Режим:");
+            ui.label("Движок:");
         }
         let busy = self.busy();
         ui.add_enabled_ui(!busy, |ui| {
@@ -2463,13 +2659,17 @@ impl App {
     }
 
     fn ui_central(&mut self, ui: &mut egui::Ui) {
-        let current = Group::of(self.view.section);
+        let mode = self.view.mode;
+        if !Group::has(self.view.section, mode) {
+            self.view.section = Group::all(mode)[0].sections()[0];
+        }
+        let current = Group::of(self.view.section, mode);
         let intro_key = section_key(self.view.section);
         let intro_hidden = self.view.hidden_intros.contains(&intro_key);
         let mut show_intro = false;
         // Разделы.
         ui.horizontal_wrapped(|ui| {
-            for g in Group::ALL {
+            for &g in Group::all(mode) {
                 let busy = g.sections().iter().any(|s| match s {
                     Section::Tool(t) => self.bench.busy(*t),
                     Section::Proxies => self.busy(),
@@ -2479,6 +2679,8 @@ impl App {
                 let alert = match g {
                     Group::Proxy => self.egress_items.iter().any(|i| i.status.is_leak()),
                     Group::Monitor => self.bench.badge(Tool::Monitor).is_some_and(|b| b.starts_with('⚠')),
+                    Group::Watch => self.bench.badge(Tool::Watch).is_some_and(|b| b.starts_with('⚠')),
+                    Group::Threats => self.bench.badge(Tool::Threats).is_some_and(|b| b.starts_with('⚠')),
                     _ => false,
                 };
                 if alert {
@@ -2490,7 +2692,7 @@ impl App {
                         .last_sections
                         .iter()
                         .copied()
-                        .find(|s| Group::of(*s) == g)
+                        .find(|s| Group::has(*s, mode) && Group::of(*s, mode) == g)
                         .unwrap_or(g.sections()[0]);
                 }
             }
@@ -2565,7 +2767,7 @@ impl App {
         }
         // Запоминаем подраздел группы.
         let sec = self.view.section;
-        self.view.last_sections.retain(|s| Group::of(*s) != Group::of(sec));
+        self.view.last_sections.retain(|s| !(Group::has(*s, mode) && Group::of(*s, mode) == Group::of(sec, mode)));
         self.view.last_sections.push(sec);
         ui.separator();
         match self.view.section {
@@ -2585,7 +2787,7 @@ impl App {
         match nav {
             Some(Nav::Send(t, host)) => {
                 self.bench.receive(t, &host);
-                self.view.section = Section::Tool(t);
+                self.goto(Section::Tool(t));
                 self.view.settings_open = true;
                 self.compact_tab = CompactTab::Settings;
             }
@@ -2593,8 +2795,20 @@ impl App {
                 if !self.busy() {
                     self.settings.targets = host;
                 }
-                self.view.section = Section::Proxies;
+                self.goto(Section::Proxies);
                 self.compact_tab = CompactTab::Settings;
+            }
+            Some(Nav::Open(t)) => self.goto(Section::Tool(t)),
+            Some(Nav::Wake(ip)) => {
+                let handle = self.rt.handle().clone();
+                self.status = self.bench.wake(&handle, &ip);
+                let s = self.status.clone();
+                self.push_log(s);
+            }
+            Some(Nav::Locate(ip)) => {
+                self.status = self.bench.locate(&ip);
+                let s = self.status.clone();
+                self.push_log(s);
             }
             None => {}
         }
@@ -2684,8 +2898,8 @@ impl App {
         let mut hosts: Vec<String> = self.rows.iter().map(|r| format!("{}:{}", r.ip, r.port)).collect();
         hosts.dedup();
         match self.bench.palette_ui(ctx, tool_id, &hosts) {
-            Some(PaletteItem::Tool(t)) => self.view.section = Section::Tool(t),
-            Some(PaletteItem::Proxy) => self.view.section = Section::Proxies,
+            Some(PaletteItem::Tool(t)) => self.goto(Section::Tool(t)),
+            Some(PaletteItem::Proxy) => self.goto(Section::Proxies),
             Some(PaletteItem::Preset(tool, p)) => {
                 if p.tool == crate::presets::ALL_TOOLS {
                     self.apply_common_preset(&p);
@@ -3763,7 +3977,7 @@ impl eframe::App for App {
             self.dirty = true;
         }
         // «Сертификаты» и «Сравнение» работают со снимком всей сессии.
-        if matches!(self.view.section, Section::Tool(Tool::Certs | Tool::Compare | Tool::Map))
+        if matches!(self.view.section, Section::Tool(Tool::Certs | Tool::Compare | Tool::Map | Tool::Overview))
             && self.last_context.is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
         {
             let archive = self.archive.iter().map(|a| (a.label(), a.path.clone())).collect();
@@ -3810,7 +4024,8 @@ impl eframe::App for App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             self.ui_top(ui, compact, narrow);
-            ui.add_space(4.0);
+            ui.add_space(2.0);
+            self.ui_project_tabs(ui);
         });
         egui::Panel::bottom("bottom").show(ui, |ui| self.ui_bottom(ui));
 

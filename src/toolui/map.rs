@@ -13,6 +13,7 @@ pub struct Panel {
 impl Panel {
     pub fn refresh(&mut self, s: &crate::session::Session) {
         self.nodes = netmap::build(s, self.opts);
+        self.graph.set_heat(if self.opts.traffic { netmap::heat(s) } else { Vec::new() });
     }
 
     pub fn settings_ui(&mut self, ui: &mut egui::Ui, _env: &mut Env) {
@@ -39,7 +40,11 @@ impl Panel {
         ui.checkbox(&mut self.opts.hosts, "Показывать найденные узлы");
         ui.checkbox(&mut self.opts.trace, "Показывать трассировку");
         ui.checkbox(&mut self.opts.services, "Показывать серверы");
+        ui.checkbox(&mut self.opts.traffic, "Живые связи по трафику").on_hover_text(
+            "Связи между узлами из «Трафика»: толщина — объём, бегущие точки — поток, красные — узел со сбоем мониторинга",
+        );
         ui.add_space(6.0);
+        ui.weak("Карта живая: обновляется каждые несколько секунд по трафику, мониторингу и наблюдению. Красное кольцо — сбой, оранжевое — предупреждение или изменение.");
         ui.weak("Колесо — масштаб, перетаскивание — сдвиг, F — линза «рыбий глаз». Двойной щелчок по узлу — трассировка до него.");
     }
 

@@ -204,7 +204,7 @@ impl Device {
 // ---------------------------------------------------------------------------
 
 /// Фильтр для пассивного прослушивания служебных протоколов.
-pub const PASSIVE_FILTER: &str = "arp or udp port 67 or udp port 68 or ether proto 0x88cc or ether dst 01:00:0c:cc:cc:cc or stp or udp port 5355 or udp port 137 or udp port 5353 or udp port 1900";
+pub const PASSIVE_FILTER: &str = "arp or udp port 67 or udp port 68 or ether proto 0x88cc or ether dst 01:00:0c:cc:cc:cc or stp or udp port 5355 or udp port 137 or udp port 5353 or udp port 1900 or icmp6 or (icmp and icmp[0] = 5)";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -277,6 +277,7 @@ pub struct Neighbor {
 
 /// Сводка пассивного прослушивания.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Summary {
     pub dhcp: Vec<DhcpServer>,
     pub neighbors: Vec<Neighbor>,
@@ -289,6 +290,16 @@ pub struct Summary {
     pub protocols: BTreeMap<String, u64>,
     pub packets: u64,
     pub bytes: u64,
+    /// Все замеченные корневые мосты STP (смена корня — признак атаки или сбоя).
+    pub stp_roots: Vec<String>,
+    /// Объявления маршрутизатора IPv6 (RA): «адрес (MAC)» → количество.
+    pub ipv6_ra: BTreeMap<String, u32>,
+    /// ICMP Redirect: «от кого → какой шлюз предлагает» → количество.
+    pub icmp_redirects: BTreeMap<String, u32>,
+    /// Кто отвечает на широковещательные запросы имён: адрес → имена.
+    pub name_responders: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Объём трафика между адресами: «a ↔ b» → байт (для живой карты).
+    pub talk: BTreeMap<String, u64>,
 }
 
 impl Summary {
@@ -353,6 +364,9 @@ pub fn dissect(frame: &[u8], linktype: i32, sum: &mut Summary) -> (String, Strin
                 let prio = be16(bpdu, 5);
                 let root = format!("{} / {}", prio & 0xF000, mac(&bpdu[7..13]));
                 sum.stp_root = Some(root.clone());
+                if !sum.stp_roots.contains(&root) {
+                    sum.stp_roots.push(root.clone());
+                }
                 return (smac, dmac, "STP".into(), format!("корень {root}"));
             }
             return (smac, dmac, "STP".into(), String::new());
@@ -389,6 +403,10 @@ pub fn dissect(frame: &[u8], linktype: i32, sum: &mut Summary) -> (String, Strin
             let s = Ipv4Addr::new(payload[12], payload[13], payload[14], payload[15]).to_string();
             let d = Ipv4Addr::new(payload[16], payload[17], payload[18], payload[19]).to_string();
             let l4 = payload.get(ihl..).unwrap_or(&[]);
+            let key = if s < d { format!("{s} ↔ {d}") } else { format!("{d} ↔ {s}") };
+            if sum.talk.len() < 5000 || sum.talk.contains_key(&key) {
+                *sum.talk.entry(key).or_insert(0) += frame.len() as u64;
+            }
             let (p, info) = transport(proto, l4, &s, &d, &smac, sum);
             (s, d, p, info + &vtag)
         }
@@ -443,14 +461,18 @@ fn transport(proto: u8, l4: &[u8], src: &str, _dst: &str, smac: &str, sum: &mut 
                     let q = dns_qname(data).unwrap_or_default();
                     if dp == 5355 {
                         *sum.name_queries.entry(format!("LLMNR {q} ← {src}")).or_insert(0) += 1;
+                    } else if sp == 5355 && data.len() > 3 && data[2] & 0x80 != 0 && !q.is_empty() {
+                        sum.name_responders.entry(src.to_string()).or_default().insert(format!("LLMNR {q}"));
                     }
                     ("LLMNR".into(), format!("запрос {q}"))
                 }
                 (_, 137) | (137, _) => {
                     count("NBNS");
                     let q = dns_qname(data).map(|n| nbns_decode(&n)).unwrap_or_default();
-                    if dp == 137 && !q.is_empty() {
+                    if dp == 137 && !q.is_empty() && data.len() > 3 && data[2] & 0x80 == 0 {
                         *sum.name_queries.entry(format!("NBT-NS {q} ← {src}")).or_insert(0) += 1;
+                    } else if !q.is_empty() && data.len() > 3 && data[2] & 0x80 != 0 {
+                        sum.name_responders.entry(src.to_string()).or_default().insert(format!("NBT-NS {q}"));
                     }
                     ("NBNS".into(), format!("имя {q}"))
                 }
@@ -479,6 +501,12 @@ fn transport(proto: u8, l4: &[u8], src: &str, _dst: &str, smac: &str, sum: &mut 
                 }
             }
         }
+        1 if l4.len() >= 8 && l4[0] == 5 => {
+            count("ICMP");
+            let gw = Ipv4Addr::new(l4[4], l4[5], l4[6], l4[7]);
+            *sum.icmp_redirects.entry(format!("{src} → шлюз {gw}")).or_insert(0) += 1;
+            ("ICMP".into(), format!("Redirect: предлагает шлюз {gw}"))
+        }
         1 if !l4.is_empty() => {
             count("ICMP");
             let t = match l4[0] {
@@ -489,6 +517,11 @@ fn transport(proto: u8, l4: &[u8], src: &str, _dst: &str, smac: &str, sum: &mut 
                 _ => "",
             };
             ("ICMP".into(), format!("тип {} {t}", l4[0]))
+        }
+        58 if !l4.is_empty() && l4[0] == 134 => {
+            count("ICMPv6");
+            *sum.ipv6_ra.entry(format!("{src} ({smac})")).or_insert(0) += 1;
+            ("ICMPv6".into(), "тип 134 RA — объявление маршрутизатора".into())
         }
         58 if !l4.is_empty() => {
             count("ICMPv6");

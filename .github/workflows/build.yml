@@ -58,6 +58,9 @@ jobs:
           $ping = & $cli ping 127.0.0.1 --set cycles=2 --set interval_ms=100 --json -q | Out-String | ConvertFrom-Json
           if ($ping.hops[0].recv -lt 1) { throw "ICMP ping to 127.0.0.1 failed: $($ping | ConvertTo-Json -Depth 5)" }
           & $cli dns example.com A '@8.8.8.8' -q; if ($LASTEXITCODE) { throw "dns: $LASTEXITCODE" }
+          $calc = & $cli calc 10.0.0.0/22 /24 | Out-String
+          if ($calc -notmatch '10.0.3.0/24') { throw "calc: $calc" }
+          & $cli playbook list; if ($LASTEXITCODE) { throw "playbook: $LASTEXITCODE" }
 
       # Окно открывается и выводит изображение через DirectX 12 (на сервере без
       # видеокарты — программный адаптер Microsoft), затем закрывается само.
@@ -207,6 +210,8 @@ jobs:
           $cli mtr 127.0.0.1 --set mode=Udp --set cycles=2 --set interval_ms=100 --json -q > mtr.json
           python3 -c "import json; r=json.load(open('mtr.json')); assert r['hops'][0]['recv'] >= 1, r"
           $cli dns example.com A @8.8.8.8 -q
+          $cli calc 10.0.0.0/22 /24 | grep -q 10.0.3.0/24
+          $cli playbook list
 
       - uses: actions/upload-artifact@v4
         with:
@@ -283,7 +288,7 @@ jobs:
           cp art/proxy-scanner-windows-x64/*.exe art/masscan64-windows-x64/masscan64.exe "$w/"
           cp art/masscan64-windows-x64/LICENSE "$w/masscan-LICENSE"
           cp release/proxy-scanner.ps1 release/proxy-scanner.cmd release/README.md docs/TOOLS.md "$w/"
-          cp art/proxy-scanner-linux-x64/proxy-scanner art/proxy-scanner-linux-x64/proxy-scanner-cli art/masscan-linux-x64/masscan "$l/"
+          cp art/proxy-scanner-linux-x64/proxy-scanner art/proxy-scanner-linux-x64/proxy-scanner-cli art/masscan-linux-x64/bin/masscan "$l/"
           cp art/masscan-linux-x64/LICENSE "$l/masscan-LICENSE"
           cp release/proxy-scanner.sh release/README.md docs/TOOLS.md "$l/"
           chmod +x "$l/proxy-scanner" "$l/proxy-scanner-cli" "$l/masscan" "$l/proxy-scanner.sh"

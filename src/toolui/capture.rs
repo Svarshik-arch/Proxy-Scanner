@@ -96,6 +96,43 @@ impl Panel {
         self.task = Some(Task::spawn(env.rt, &env.ctx, move |s, c| capture::run(cfg, s, c)));
     }
 
+    /// Короткие органы управления для «Угроз»: интерфейс и прослушивание служебного трафика.
+    pub fn listen_ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {
+        if self.devices.is_none() {
+            self.devices = Some(capture::Pcap::load().and_then(|p| p.devices()));
+        }
+        match self.devices.as_ref().unwrap() {
+            Err(e) => {
+                ui.colored_label(RED, e);
+                return;
+            }
+            Ok(devs) => {
+                ui.label("Интерфейс");
+                let current = devs.iter().find(|d| d.name == self.cfg.device).map(|d| d.label()).unwrap_or("автоматически".into());
+                egui::ComboBox::from_id_salt("thr_dev").width(ui.available_width()).selected_text(current).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.cfg.device, String::new(), "автоматически");
+                    for d in devs {
+                        ui.selectable_value(&mut self.cfg.device, d.name.clone(), d.label());
+                    }
+                });
+            }
+        }
+        let (start, stop) = super::run_button(ui, self.busy(), "Слушать сегмент");
+        if start {
+            self.cfg.filter = capture::PASSIVE_FILTER.into();
+            self.start(env);
+        }
+        if stop && let Some(t) = &self.task {
+            t.cancel();
+        }
+        if !self.status.is_empty() {
+            ui.weak(&self.status);
+        }
+        if self.summary.packets > 0 {
+            ui.weak(format!("пакетов: {}", self.summary.packets));
+        }
+    }
+
     pub fn settings_ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {
         if self.devices.is_none() {
             self.devices = Some(capture::Pcap::load().and_then(|p| p.devices()));

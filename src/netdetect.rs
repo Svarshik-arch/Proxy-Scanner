@@ -735,6 +735,13 @@ pub fn detect_all(target: Option<Ipv4Addr>, masscan: Option<&Path>, want_mac: bo
     d
 }
 
+/// Подсеть этой машины (по адресу, с которого уходит трафик наружу), например `10.0.0.0/24`.
+pub fn detect_local_cidr() -> Option<String> {
+    let d = detect_all(None, None, false);
+    let (ip, p) = (d.source_ip?, d.prefix_len?);
+    Some(crate::targets::network_cidr(ip, p.clamp(16, 32)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,3 +860,4 @@ mod tests {
         assert_eq!(l[1].description, "VirtualBox Host-Only Ethernet Adapter");
     }
 }
+

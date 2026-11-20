@@ -22,9 +22,14 @@ pub mod netmap;
 pub mod notify;
 pub mod service;
 pub mod shares;
+pub mod sitecheck;
+pub mod snmp;
 pub mod oui;
+pub mod threats;
 pub mod tls;
 pub mod urlcheck;
+pub mod watch;
+pub mod wol;
 pub mod services;
 pub mod tlsaudit;
 

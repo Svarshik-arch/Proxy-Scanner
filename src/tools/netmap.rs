@@ -12,6 +12,8 @@ pub struct Options {
     pub hosts: bool,
     pub trace: bool,
     pub services: bool,
+    /// Связи по захваченному трафику.
+    pub traffic: bool,
 }
 
 impl Default for Options {
@@ -20,6 +22,7 @@ impl Default for Options {
             hosts: true,
             trace: true,
             services: true,
+            traffic: true,
         }
     }
 }
@@ -91,6 +94,54 @@ impl Builder {
             n.warning |= warning;
         }
     }
+}
+
+fn my_nets_contain(nets: &[String], ip: Ipv4Addr) -> bool {
+    nets.iter().any(|n| crate::targets::parse_targets(n).map(|t| t.contains(ip)).unwrap_or(false))
+}
+
+/// Узел из строки мониторинга (`tcp 10.0.0.5:3389`, `http https://10.0.0.7/`, `ping 10.0.0.1`).
+fn monitor_host(line: &str) -> Option<Ipv4Addr> {
+    let target = line.split_whitespace().nth(1)?;
+    let t = target.split("://").last()?;
+    let host = t.split(['/', ':']).next()?;
+    host.parse().ok()
+}
+
+/// Самые нагруженные пары адресов из захвата: (a, b, байт).
+pub fn flows(s: &Session, limit: usize) -> Vec<(Ipv4Addr, Ipv4Addr, u64)> {
+    let Some(c) = &s.tools.capture else { return Vec::new() };
+    let mut v: Vec<(Ipv4Addr, Ipv4Addr, u64)> = c
+        .talk
+        .iter()
+        .filter_map(|(k, n)| {
+            let (a, z) = k.split_once(" ↔ ")?;
+            Some((a.parse().ok()?, z.parse().ok()?, *n))
+        })
+        .collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.2));
+    v.truncate(limit);
+    v
+}
+
+/// Нагрузка на связях для живой карты: (ключ a, ключ b, доля 0..1, тревога).
+pub fn heat(s: &Session) -> Vec<(String, String, f32, bool)> {
+    let f = flows(s, 60);
+    let max = f.first().map(|x| x.2).unwrap_or(1).max(1) as f32;
+    let failing: std::collections::BTreeSet<Ipv4Addr> = s
+        .tools
+        .monitor
+        .iter()
+        .flat_map(|m| m.states.iter())
+        .filter(|st| st.status == crate::tools::monitor::Status::Fail)
+        .filter_map(|st| monitor_host(&st.line))
+        .collect();
+    f.into_iter()
+        .map(|(a, z, n)| {
+            let share = ((n as f32).ln_1p() / max.ln_1p()).clamp(0.05, 1.0);
+            (ip_key(&a.to_string()), ip_key(&z.to_string()), share, failing.contains(&a) || failing.contains(&z))
+        })
+        .collect()
 }
 
 fn ip_key(ip: &str) -> String {
@@ -228,6 +279,78 @@ pub fn build(s: &Session, o: Options) -> Vec<MapNode> {
         let net = subnet(&mut b, r.ip);
         b.add(&ip_key(&r.ip.to_string()), MapKind::Proxy, &r.ip.to_string(), vec![format!("{}:{} {}", r.ip, r.port, r.kind.label())], Some(net));
         b.mark(&ip_key(&r.ip.to_string()), !r.probe.auth_required, false);
+    }
+
+    // Коммутаторы (SNMP): узел привязывается к порту коммутатора.
+    if let Some(sn) = &t.snmp {
+        let mac_ip: BTreeMap<String, Ipv4Addr> = t
+            .discovery
+            .iter()
+            .flat_map(|d| d.hosts.iter())
+            .filter_map(|h| Some((crate::tools::snmp::norm_mac(h.mac.as_deref()?), h.ip)))
+            .chain(t.watch.iter().filter_map(|w| w.last.as_ref()).flat_map(|l| l.hosts.iter()).filter_map(|(ip, h)| Some((crate::tools::snmp::norm_mac(h.mac.as_deref()?), *ip))))
+            .collect();
+        for sw in sn.switches.iter().filter(|s| s.error.is_none()) {
+            let key = sw.address.parse::<Ipv4Addr>().map(|a| ip_key(&a.to_string())).unwrap_or_else(|_| format!("sw:{}", sw.address));
+            let label = if sw.name.is_empty() { sw.address.clone() } else { sw.name.clone() };
+            let parent = first_router.clone().filter(|r| *r != key).or(Some(me.clone()));
+            b.add(&key, MapKind::Router, &label, vec![format!("коммутатор, {} MAC", sw.entries.len())], parent);
+            for e in sw.entries.iter().filter(|e| !e.uplink) {
+                if let Some(ip) = mac_ip.get(&e.mac) {
+                    let hk = ip_key(&ip.to_string());
+                    if !b.nodes.contains_key(&hk) {
+                        let net = subnet(&mut b, *ip);
+                        b.add(&hk, MapKind::Host, &ip.to_string(), vec![], Some(net));
+                    }
+                    let where_ = format!("{label} порт {}{}", e.port, e.vlan.map(|v| format!(", VLAN {v}")).unwrap_or_default());
+                    b.add(&hk, MapKind::Host, "", vec![format!("воткнут: {where_}")], Some(key.clone()));
+                }
+            }
+        }
+    }
+
+    // Живые данные: сбои мониторинга, тревоги наблюдения, трафик.
+    if let Some(m) = &t.monitor {
+        for st in &m.states {
+            if let Some(ip) = monitor_host(&st.line) {
+                let key = ip_key(&ip.to_string());
+                let fail = st.status == crate::tools::monitor::Status::Fail;
+                let warn = st.status == crate::tools::monitor::Status::Warn;
+                if !b.nodes.contains_key(&key) && (fail || warn) {
+                    let net = subnet(&mut b, ip);
+                    b.add(&key, MapKind::Server, &ip.to_string(), vec![], Some(net));
+                }
+                b.add(&key, MapKind::Host, "", vec![format!("мониторинг: {} — {}", st.line, st.status.label())], None);
+                b.mark(&key, fail, warn);
+            }
+        }
+    }
+    if let Some(w) = &t.watch {
+        for c in w.changes.iter().rev().take(200) {
+            let key = ip_key(&c.host.to_string());
+            if b.nodes.contains_key(&key) {
+                b.add(&key, MapKind::Host, "", vec![format!("изменение: {} {}", c.kind.label(), c.detail)], None);
+                b.mark(&key, false, c.alarm);
+            }
+        }
+    }
+    if o.traffic {
+        for (a, z, _) in flows(s, 60) {
+            let (ka, kz) = (ip_key(&a.to_string()), ip_key(&z.to_string()));
+            for (k, ip) in [(&ka, a), (&kz, z)] {
+                if !b.nodes.contains_key(k) && (ip.is_private() || my_nets_contain(&my_nets, ip)) {
+                    let net = subnet(&mut b, ip);
+                    b.add(k, MapKind::Host, &ip.to_string(), vec!["виден в трафике".into()], Some(net));
+                }
+            }
+            if b.nodes.contains_key(&kz)
+                && let Some(n) = b.nodes.get_mut(&ka)
+                && n.parent.as_ref() != Some(&kz)
+                && !n.links.contains(&kz)
+            {
+                n.links.push(kz.clone());
+            }
+        }
     }
 
     let mut out = Vec::new();

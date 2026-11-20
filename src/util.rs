@@ -233,3 +233,11 @@ fn resolve_in_place(path: &str) -> PathBuf {
 pub fn file_exists(path: &Path) -> bool {
     path.is_file()
 }
+
+/// Открыть файл или папку системной программой (проводник, xdg-open).
+pub fn open_path(p: &Path) {
+    #[cfg(windows)]
+    let _ = run_cmd("explorer.exe", &[&p.display().to_string()]);
+    #[cfg(not(windows))]
+    let _ = Command::new("xdg-open").arg(p).spawn();
+}

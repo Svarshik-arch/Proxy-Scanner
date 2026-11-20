@@ -144,7 +144,7 @@ fn looks_blocked(body: &str) -> bool {
         .any(|m| b.contains(m))
 }
 
-async fn check(proxy: &str, rule: &UrlRule, cfg: &Config, direct_issuer: Option<String>) -> Row {
+pub async fn check(proxy: &str, rule: &UrlRule, cfg: &Config, direct_issuer: Option<String>) -> Row {
     let hc = http::Config {
         url: rule.url.clone(),
         method: "GET".into(),

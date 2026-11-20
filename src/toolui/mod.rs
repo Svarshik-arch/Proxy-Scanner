@@ -14,10 +14,15 @@ mod map;
 mod matrix;
 mod monitor;
 mod mtr;
+mod playbooks;
 mod services;
 mod shares;
+mod sitecheck;
+mod switches;
+mod threats;
 mod tls;
 mod urlcheck;
+mod watch;
 
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -50,10 +55,16 @@ pub enum Tool {
     Shares,
     Map,
     Capture,
+    SiteCheck,
+    Watch,
+    Threats,
+    Switches,
+    Playbooks,
+    Overview,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 17] = [
+    pub const ALL: [Tool; 23] = [
         Tool::Host,
         Tool::Mtr,
         Tool::Discovery,
@@ -71,6 +82,12 @@ impl Tool {
         Tool::Shares,
         Tool::Map,
         Tool::Capture,
+        Tool::SiteCheck,
+        Tool::Watch,
+        Tool::Threats,
+        Tool::Switches,
+        Tool::Playbooks,
+        Tool::Overview,
     ];
 
     pub fn title(self) -> &'static str {
@@ -92,6 +109,12 @@ impl Tool {
             Tool::Shares => "Общие ресурсы",
             Tool::Map => "Карта",
             Tool::Capture => "Трафик",
+            Tool::SiteCheck => "Почему не открывается",
+            Tool::Watch => "Наблюдение",
+            Tool::Threats => "Угрозы",
+            Tool::Switches => "Коммутаторы",
+            Tool::Playbooks => "Сценарии",
+            Tool::Overview => "Обзор",
         }
     }
 
@@ -114,6 +137,12 @@ impl Tool {
             Tool::Shares => "SMB-шары и NFS-экспорты на узлах; доступ без пароля",
             Tool::Map => "Карта сети из собранных данных: шлюзы, путь, подсети, серверы, контроллеры",
             Tool::Capture => "Захват пакетов и прослушивание: коммутатор и порт (LLDP/CDP), DHCP-серверы, подмена ARP, pcapng",
+            Tool::SiteCheck => "Сквозная проверка адреса: DNS → TCP → TLS → HTTP → прокси/PAC; вывод, что мешает",
+            Tool::Watch => "Опрос подсетей по расписанию: новые и пропавшие узлы, смена MAC, порты, сертификаты",
+            Tool::Threats => "Атаки и посторонние устройства в сегменте по служебному трафику",
+            Tool::Switches => "SNMP: какой MAC за каким портом и в каком VLAN; соседи LLDP",
+            Tool::Playbooks => "Последовательность проверок одной кнопкой: приёмка сегмента, домен, аудит",
+            Tool::Overview => "Состояние сети одним экраном: тревоги, сбои, угрозы, сертификаты",
         }
     }
 
@@ -136,6 +165,12 @@ impl Tool {
             Tool::Shares => "shares",
             Tool::Map => "map",
             Tool::Capture => "capture",
+            Tool::SiteCheck => "sitecheck",
+            Tool::Watch => "watch",
+            Tool::Threats => "threats",
+            Tool::Switches => "snmp",
+            Tool::Playbooks => "playbooks",
+            Tool::Overview => "overview",
         }
     }
 }
@@ -146,6 +181,12 @@ pub enum Nav {
     Send(Tool, String),
     /// Открыть раздел прокси с целями.
     Proxy(String),
+    /// Открыть инструмент, ничего не меняя.
+    Open(Tool),
+    /// Разбудить узел (Wake-on-LAN).
+    Wake(String),
+    /// Где воткнут узел (по таблицам коммутаторов).
+    Locate(String),
 }
 
 /// Общий контекст для панелей на кадр.
@@ -311,6 +352,9 @@ pub struct Prefs {
     pub urlcheck: crate::tools::urlcheck::Config,
     pub shares: crate::tools::shares::Config,
     pub capture: crate::tools::capture::Config,
+    pub sitecheck: crate::tools::sitecheck::Config,
+    pub watch: crate::tools::watch::Config,
+    pub snmp: crate::tools::snmp::Config,
 }
 
 /// Результаты инструментов для файла сессии.
@@ -333,6 +377,9 @@ pub struct Results {
     pub shares: Option<crate::tools::shares::Report>,
     /// Сводка прослушивания (без самих пакетов).
     pub capture: Option<crate::tools::capture::Summary>,
+    pub sitecheck: Option<crate::tools::sitecheck::Report>,
+    pub snmp: Option<crate::tools::snmp::Report>,
+    pub watch: Option<crate::tools::watch::Report>,
 }
 
 pub use capture::render_summary as render_capture_summary;
@@ -359,6 +406,10 @@ pub struct Workbench {
     shares: shares::Panel,
     map: map::Panel,
     capture: capture::Panel,
+    sitecheck: sitecheck::Panel,
+    watch: watch::Panel,
+    switches: switches::Panel,
+    playbooks: playbooks::Panel,
     /// Снимок текущей сессии и архив — для сертификатов и сравнения.
     current: Option<crate::session::Session>,
     archive: Vec<(String, std::path::PathBuf)>,
@@ -405,6 +456,10 @@ impl Workbench {
             shares: shares::Panel::new(prefs.shares),
             map: map::Panel::default(),
             capture: capture::Panel::new(prefs.capture),
+            sitecheck: sitecheck::Panel::new(prefs.sitecheck),
+            watch: watch::Panel::new(prefs.watch),
+            switches: switches::Panel::new(prefs.snmp),
+            playbooks: playbooks::Panel::default(),
             current: None,
             archive: Vec::new(),
             palette: Palette::default(),
@@ -426,6 +481,9 @@ impl Workbench {
         self.urlcheck.cfg = p.urlcheck;
         self.shares.cfg = p.shares;
         self.capture.cfg = p.capture;
+        self.sitecheck.cfg = p.sitecheck;
+        self.watch.cfg = p.watch;
+        self.switches.cfg = p.snmp;
     }
 
     pub fn prefs(&self) -> Prefs {
@@ -443,6 +501,9 @@ impl Workbench {
             urlcheck: self.urlcheck.cfg.clone(),
             shares: self.shares.cfg.clone(),
             capture: self.capture.cfg.clone(),
+            sitecheck: self.sitecheck.cfg.clone(),
+            watch: self.watch.cfg.clone(),
+            snmp: self.switches.cfg.clone(),
         }
     }
 
@@ -462,7 +523,15 @@ impl Workbench {
             urlcheck: (!self.urlcheck.report.rows.is_empty()).then(|| self.urlcheck.report.clone()),
             shares: (!self.shares.report.hosts.is_empty()).then(|| self.shares.report.clone()),
             capture: (self.capture.summary.packets > 0).then(|| self.capture.summary.clone()),
+            sitecheck: (!self.sitecheck.report.steps.is_empty()).then(|| self.sitecheck.report.clone()),
+            snmp: (!self.switches.report.switches.is_empty()).then(|| self.switches.report.clone()),
+            watch: self.watch.report.last.is_some().then(|| self.watch.report.clone()),
         }
+    }
+
+    /// Есть ли что сохранять в сессию.
+    pub fn has_results(&self) -> bool {
+        serde_json::to_value(self.results()).ok().and_then(|v| v.as_object().map(|m| m.values().any(|x| !x.is_null()))).unwrap_or(false)
     }
 
     pub fn restore_results(&mut self, r: Results) {
@@ -508,6 +577,15 @@ impl Workbench {
         if let Some(v) = r.capture {
             self.capture.summary = v;
         }
+        if let Some(v) = r.sitecheck {
+            self.sitecheck.report = v;
+        }
+        if let Some(v) = r.snmp {
+            self.switches.report = v;
+        }
+        if let Some(v) = r.watch {
+            self.watch.report = v;
+        }
     }
 
     pub fn clear_results(&mut self) {
@@ -527,6 +605,9 @@ impl Workbench {
         self.urlcheck.report = Default::default();
         self.shares.report = Default::default();
         self.capture.summary = Default::default();
+        self.sitecheck.report = Default::default();
+        self.switches.report = Default::default();
+        self.watch.report = Default::default();
     }
 
     /// Контекст для «Сертификатов» и «Сравнения»: снимок сессии и архив.
@@ -554,6 +635,16 @@ impl Workbench {
         changed |= self.urlcheck.poll();
         changed |= self.shares.poll();
         changed |= self.capture.poll();
+        changed |= self.sitecheck.poll();
+        changed |= self.watch.poll();
+        changed |= self.switches.poll();
+        if self.playbooks.poll() {
+            changed = true;
+            if let Some(r) = self.playbooks.finished.take() {
+                self.restore_results(r);
+                self.message = Some("сценарий выполнен — результаты во вкладках".into());
+            }
+        }
         changed
     }
 
@@ -578,8 +669,12 @@ impl Workbench {
             Tool::Certs | Tool::Compare => false,
             Tool::UrlCheck => self.urlcheck.busy(),
             Tool::Shares => self.shares.busy(),
-            Tool::Map => false,
-            Tool::Capture => self.capture.busy(),
+            Tool::Map | Tool::Overview => false,
+            Tool::Capture | Tool::Threats => self.capture.busy(),
+            Tool::SiteCheck => self.sitecheck.busy(),
+            Tool::Watch => self.watch.busy(),
+            Tool::Switches => self.switches.busy(),
+            Tool::Playbooks => self.playbooks.busy(),
         }
     }
 
@@ -637,6 +732,25 @@ impl Workbench {
                 }
                 return (s.packets > 0).then(|| s.packets.to_string());
             }
+            Tool::Threats => {
+                let n = crate::tools::threats::assess(&self.capture.summary).iter().filter(|t| t.level != crate::tools::threats::Level::Low).count();
+                return (n > 0).then(|| format!("⚠{n}"));
+            }
+            Tool::SiteCheck => {
+                if self.sitecheck.report.verdict.is_empty() {
+                    return None;
+                }
+                return Some(if self.sitecheck.report.ok { "✔".into() } else { "✖".into() });
+            }
+            Tool::Watch => {
+                let a = self.watch.alarms();
+                if a > 0 {
+                    return Some(format!("⚠{a}"));
+                }
+                self.watch.report.changes.len()
+            }
+            Tool::Switches => self.switches.report.switches.iter().map(|s| s.entries.len()).sum(),
+            Tool::Playbooks | Tool::Overview => return None,
         };
         (n > 0).then(|| n.to_string())
     }
@@ -710,11 +824,23 @@ impl Workbench {
             Tool::Shares => self.shares.settings_ui(ui, &mut env),
             Tool::Map => self.map.settings_ui(ui, &mut env),
             Tool::Capture => self.capture.settings_ui(ui, &mut env),
+            Tool::SiteCheck => self.sitecheck.settings_ui(ui, &mut env),
+            Tool::Watch => self.watch.settings_ui(ui, &mut env),
+            Tool::Threats => threats::settings_ui(&mut self.capture, ui, &mut env),
+            Tool::Switches => {
+                let gw: Vec<String> = self.host.report.iter().flat_map(|r| r.interfaces.iter()).flat_map(|i| i.gateways.iter().cloned()).filter(|g| g.parse::<std::net::Ipv4Addr>().is_ok_and(|a| !a.is_unspecified())).collect();
+                self.switches.settings_ui(ui, &mut env, &gw)
+            }
+            Tool::Playbooks => self.playbooks.settings_ui(ui, &mut env),
+            Tool::Overview => overview_settings(ui),
         }
         nav
     }
 
     pub fn results_ui(&mut self, t: Tool, ui: &mut egui::Ui, rt: &Handle) -> Option<Nav> {
+        if t == Tool::Overview {
+            return self.overview_ui(ui).map(Nav::Open);
+        }
         let mut nav = None;
         let mut env = Self::env(
             &mut self.store,
@@ -745,6 +871,26 @@ impl Workbench {
             Tool::Shares => self.shares.results_ui(ui, &mut env),
             Tool::Map => self.map.results_ui(ui, &mut env),
             Tool::Capture => self.capture.results_ui(ui, &mut env),
+            Tool::SiteCheck => self.sitecheck.results_ui(ui, &mut env),
+            Tool::Watch => self.watch.results_ui(ui, &mut env),
+            Tool::Threats => threats::results_ui(&self.capture, ui),
+            Tool::Switches => {
+                let names = |mac: &str| -> Option<(String, String)> {
+                    let m = crate::tools::snmp::norm_mac(mac);
+                    if let Some(h) = self.discovery.report.hosts.iter().find(|h| h.mac.as_deref().map(crate::tools::snmp::norm_mac).as_deref() == Some(m.as_str())) {
+                        return Some((h.ip.to_string(), h.best_name()));
+                    }
+                    if let Some(last) = &self.watch.report.last
+                        && let Some((ip, h)) = last.hosts.iter().find(|(_, h)| h.mac.as_deref().map(crate::tools::snmp::norm_mac).as_deref() == Some(m.as_str()))
+                    {
+                        return Some((ip.to_string(), h.name.clone().unwrap_or_default()));
+                    }
+                    None
+                };
+                self.switches.results_ui(ui, &mut env, &names)
+            }
+            Tool::Playbooks => self.playbooks.results_ui(ui, &mut env),
+            Tool::Overview => {}
         }
         nav
     }
@@ -780,8 +926,11 @@ impl Workbench {
             Tool::Audit => presets::apply(&mut self.audit.cfg, &p.values),
             Tool::Monitor => presets::apply(&mut self.monitor.cfg, &p.values),
             Tool::Matrix => presets::apply(&mut self.matrix.cfg, &p.values),
-            Tool::Certs | Tool::Compare | Tool::Map => Ok(()),
+            Tool::Certs | Tool::Compare | Tool::Map | Tool::Threats | Tool::Playbooks | Tool::Overview => Ok(()),
             Tool::Capture => presets::apply(&mut self.capture.cfg, &p.values),
+            Tool::SiteCheck => presets::apply(&mut self.sitecheck.cfg, &p.values),
+            Tool::Watch => presets::apply(&mut self.watch.cfg, &p.values),
+            Tool::Switches => presets::apply(&mut self.switches.cfg, &p.values),
             Tool::UrlCheck => presets::apply(&mut self.urlcheck.cfg, &p.values),
             Tool::Shares => presets::apply(&mut self.shares.cfg, &p.values),
         };
@@ -789,6 +938,175 @@ impl Workbench {
             Ok(()) => format!("применён пресет «{}»", p.name),
             Err(e) => e,
         });
+    }
+
+    /// Обзор: карточки по инструментам контроля сети.
+    fn overview_ui(&self, ui: &mut egui::Ui) -> Option<Tool> {
+        let mut open = None;
+        use crate::tools::monitor::Status as MS;
+        use crate::tools::threats::{self, Level};
+        let mut cards: Vec<(Tool, Color32, String, Vec<String>)> = Vec::new();
+        let muted = ui.visuals().weak_text_color();
+        // Наблюдение.
+        let w = &self.watch;
+        let alarms = w.alarms();
+        let mut lines: Vec<String> = w
+            .report
+            .changes
+            .iter()
+            .rev()
+            .take(5)
+            .map(|c| format!("{} {} — {} {}", crate::session::format_time(c.at), c.host, c.kind.label(), c.detail))
+            .collect();
+        let (color, head) = match (&w.report.last, alarms) {
+            (None, _) if !w.busy() => (muted, "не запущено".to_string()),
+            (None, _) => (AMBER, "первый опрос…".to_string()),
+            (Some(l), 0) => (GREEN, format!("{} узлов, тревог нет", l.hosts.len())),
+            (Some(l), a) => (RED, format!("{} узлов, тревог: {a}", l.hosts.len())),
+        };
+        if w.busy() {
+            lines.insert(0, "идёт наблюдение".into());
+        }
+        cards.push((Tool::Watch, color, head, lines));
+        // Мониторинг.
+        let m = &self.monitor.report;
+        let fails: Vec<String> = m.states.iter().filter(|s| s.status == MS::Fail).map(|s| format!("✖ {}", s.line)).collect();
+        let warns = m.states.iter().filter(|s| s.status == MS::Warn).count();
+        let (color, head) = if m.states.is_empty() {
+            (muted, "не запущен".to_string())
+        } else if !fails.is_empty() {
+            (RED, format!("сбоев: {}, внимание: {warns}, проверок: {}", fails.len(), m.states.len()))
+        } else if warns > 0 {
+            (AMBER, format!("внимание: {warns} из {}", m.states.len()))
+        } else {
+            (GREEN, format!("все {} проверок в норме", m.states.len()))
+        };
+        cards.push((Tool::Monitor, color, head, fails.into_iter().take(5).collect()));
+        // Угрозы.
+        let t = threats::assess(&self.capture.summary);
+        let high = t.iter().filter(|x| x.level == Level::High).count();
+        let (color, head) = if self.capture.summary.packets == 0 {
+            (muted, if self.capture.busy() { "слушаю…".to_string() } else { "сегмент не прослушивался".to_string() })
+        } else if high > 0 {
+            (RED, format!("высокая важность: {high}"))
+        } else if !t.is_empty() {
+            (AMBER, format!("находок: {}", t.len()))
+        } else {
+            (GREEN, "угроз не найдено".to_string())
+        };
+        cards.push((Tool::Threats, color, head, t.iter().take(4).map(|x| format!("{} — {}", x.level.label(), x.title)).collect()));
+        // Сертификаты.
+        let exp: Vec<String> = self
+            .certs
+            .certs
+            .iter()
+            .filter(|c| c.days_left.is_some_and(|d| d < self.certs.warn_days))
+            .take(5)
+            .map(|c| format!("{} дн. — {}", c.days_left.unwrap_or_default(), c.subject))
+            .collect();
+        let (color, head) = if self.certs.certs.is_empty() {
+            (muted, "сертификатов в сессии нет".to_string())
+        } else if !exp.is_empty() {
+            (RED, format!("истекают: {}", self.certs.certs.iter().filter(|c| c.days_left.is_some_and(|d| d < self.certs.warn_days)).count()))
+        } else {
+            (GREEN, format!("{} сертификатов, сроки в порядке", self.certs.certs.len()))
+        };
+        cards.push((Tool::Certs, color, head, exp));
+        // Аудит.
+        let a = &self.audit.report;
+        let h = a.count(crate::tools::tlsaudit::Severity::High);
+        let (color, head) = if a.services.is_empty() {
+            (muted, "аудит не проводился".to_string())
+        } else if h > 0 {
+            (RED, format!("высокая важность: {h}, всего находок: {}", a.issues.len()))
+        } else {
+            (GREEN, format!("находок: {}", a.issues.len()))
+        };
+        cards.push((Tool::Audit, color, head, a.issues.iter().take(4).map(|i| format!("{} {}", i.ip, i.title)).collect()));
+        // Сценарии.
+        let head = match &self.playbooks.last_run {
+            Some((n, at)) => format!("последний: «{n}» {}", crate::session::format_time(*at)),
+            None => "ещё не запускались".to_string(),
+        };
+        cards.push((Tool::Playbooks, if self.playbooks.busy() { AMBER } else { muted }, head, Vec::new()));
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let w = ui.available_width();
+            let cols = if w > 980.0 { 3 } else if w > 620.0 { 2 } else { 1 };
+            ui.columns(cols, |columns| {
+                for (i, (tool, color, head, lines)) in cards.iter().enumerate() {
+                    let ui = &mut columns[i % cols];
+                    let r = egui::Frame::group(ui.style())
+                        .stroke(egui::Stroke::new(if *color == muted { 1.0 } else { 1.5 }, *color))
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.set_min_height(120.0);
+                            ui.label(RichText::new(tool.title()).heading());
+                            ui.add(egui::Label::new(RichText::new(head).strong().color(*color)).wrap());
+                            for l in lines {
+                                ui.add(egui::Label::new(RichText::new(l).small()).truncate());
+                            }
+                        })
+                        .response
+                        .interact(egui::Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Открыть");
+                    if r.clicked() {
+                        open = Some(*tool);
+                    }
+                    ui.add_space(8.0);
+                }
+            });
+        });
+        open
+    }
+
+    /// MAC узла из того, что уже собрано: «Узлы», «Наблюдение», ARP-таблица, прослушивание.
+    pub fn find_mac(&self, ip: &str) -> Option<String> {
+        let addr: std::net::Ipv4Addr = ip.parse().ok()?;
+        if let Some(m) = self.discovery.report.hosts.iter().find(|h| h.ip == addr).and_then(|h| h.mac.clone()) {
+            return Some(m);
+        }
+        if let Some(m) = self.watch.report.last.as_ref().and_then(|l| l.hosts.get(&addr)).and_then(|h| h.mac.clone()) {
+            return Some(m);
+        }
+        if let Some(m) = self.host.report.as_ref().and_then(|r| r.neighbors.iter().find(|n| n.ip == ip)).map(|n| n.mac.clone()) {
+            return Some(m);
+        }
+        self.capture.summary.arp.get(ip).and_then(|v| v.first().cloned())
+    }
+
+    /// Разбудить узел (Wake-on-LAN) — сообщение для строки состояния.
+    pub fn wake(&mut self, rt: &Handle, ip: &str) -> String {
+        let Some(mac) = self.find_mac(ip) else {
+            return format!("{ip}: MAC неизвестен — найдите узел в «Узлах» или «Наблюдении», пока он включён");
+        };
+        let addr = ip.parse().ok();
+        match rt.block_on(crate::tools::wol::wake(&mac, addr)) {
+            Ok(m) => m,
+            Err(e) => format!("Wake-on-LAN: {e}"),
+        }
+    }
+
+    /// Где воткнут узел — сообщение для строки состояния.
+    pub fn locate(&self, ip: &str) -> String {
+        let Some(mac) = self.find_mac(ip) else {
+            return format!("{ip}: MAC неизвестен — запустите «Узлы» в этой подсети");
+        };
+        if self.switches.report.switches.is_empty() {
+            return format!("{ip} ({mac}): опросите коммутаторы на вкладке «Коммутаторы» (SNMP)");
+        }
+        match self.switches.report.locate(&mac) {
+            Some(l) => format!(
+                "{ip} ({mac}) воткнут в {} порт {}{}{}",
+                l.switch,
+                l.port,
+                l.vlan.map(|v| format!(", VLAN {v}")).unwrap_or_default(),
+                if l.alias.is_empty() { String::new() } else { format!(" «{}»", l.alias) }
+            ),
+            None => format!("{ip} ({mac}) не найден в таблицах опрошенных коммутаторов"),
+        }
     }
 
     /// Узел передан из другого инструмента или раздела.
@@ -828,7 +1146,10 @@ impl Workbench {
                 }
                 self.matrix.cfg.rules.push_str(&line);
             }
-            Tool::Certs | Tool::Compare | Tool::Map => {}
+            Tool::Certs | Tool::Compare | Tool::Map | Tool::Threats | Tool::Playbooks | Tool::Overview => {}
+            Tool::SiteCheck => self.sitecheck.cfg.url = host.to_string(),
+            Tool::Watch => self.watch.cfg.targets = host.split(':').next().unwrap_or(host).to_string(),
+            Tool::Switches => self.switches.cfg.switches = host.split(':').next().unwrap_or(host).to_string(),
             Tool::Capture => self.capture.cfg.filter = format!("host {}", host.split(':').next().unwrap_or(host)),
             Tool::Shares => self.shares.cfg.targets = host.split(':').next().unwrap_or(host).to_string(),
             Tool::UrlCheck => {
@@ -893,6 +1214,15 @@ impl Workbench {
         }
         if let Some(v) = get("shares") {
             presets::apply(&mut self.shares.cfg, &v)?;
+        }
+        if let Some(v) = get("sitecheck") {
+            presets::apply(&mut self.sitecheck.cfg, &v)?;
+        }
+        if let Some(v) = get("watch") {
+            presets::apply(&mut self.watch.cfg, &v)?;
+        }
+        if let Some(v) = get("snmp") {
+            presets::apply(&mut self.switches.cfg, &v)?;
         }
         Ok(())
     }
@@ -961,16 +1291,49 @@ impl Workbench {
             .resizable(false)
             .title_bar(false)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
-            .fixed_size([480.0, 380.0])
+            .fixed_size([520.0, 440.0])
             .show(ctx, |ui| {
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.palette.query)
-                        .hint_text("инструмент, пресет или узел…")
+                        .hint_text("инструмент, пресет, узел… или 10.0.0.0/22 — калькулятор подсетей")
                         .desired_width(f32::INFINITY),
                 );
                 if self.palette.focus {
                     r.request_focus();
                     self.palette.focus = false;
+                }
+                // Калькулятор подсетей прямо в строке перехода.
+                if let Some(c) = crate::subnet::calc(&self.palette.query) {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&c.title).strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Копировать").clicked() {
+                                    let mut t: Vec<String> = c.rows.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+                                    t.extend(c.list.iter().cloned());
+                                    ui.ctx().copy_text(t.join("\n"));
+                                }
+                            });
+                        });
+                        egui::Grid::new("calc_rows").num_columns(2).show(ui, |ui| {
+                            for (k, v) in &c.rows {
+                                ui.weak(k);
+                                ui.monospace(v);
+                                ui.end_row();
+                            }
+                        });
+                        if !c.list.is_empty() {
+                            egui::ScrollArea::vertical().id_salt("calc_list").max_height(120.0).show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for n in &c.list {
+                                        ui.monospace(n);
+                                    }
+                                });
+                            });
+                        }
+                    });
+                    ui.weak("Ещё: «10.0.0.0/22 /24» — разбить, «10.0.1.5 в 10.0.0.0/22», диапазон «a-b», несколько сетей — суммировать.");
                 }
                 let q = self.palette.query.to_lowercase();
                 let matches = |s: &str| q.is_empty() || s.to_lowercase().contains(&q);
@@ -1137,6 +1500,55 @@ pub fn send_menu(ui: &mut egui::Ui, host: &str, nav: &mut Option<Nav>, except: T
         *nav = Some(Nav::Proxy(host.split(':').next().unwrap_or(host).to_string()));
         ui.close();
     }
+    if ui.button("→ Почему не открывается").clicked() {
+        *nav = Some(Nav::Send(Tool::SiteCheck, host.to_string()));
+        ui.close();
+    }
+    let ip = host.split(':').next().unwrap_or(host).to_string();
+    if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+        ui.separator();
+        if ui.button("Где воткнут? (коммутатор, порт)").on_hover_text("По таблицам MAC-адресов коммутаторов (вкладка «Коммутаторы»)").clicked() {
+            *nav = Some(Nav::Locate(ip.clone()));
+            ui.close();
+        }
+        if ui.button("Разбудить (Wake-on-LAN)").on_hover_text("MAC берётся из «Узлов», «Наблюдения» или ARP-таблицы").clicked() {
+            *nav = Some(Nav::Wake(ip));
+            ui.close();
+        }
+    }
+}
+
+/// Подсказка калькулятора подсетей под полем адресов (если там одна сеть).
+pub fn subnet_hint(ui: &mut egui::Ui, text: &str) {
+    let t = text.trim();
+    if t.contains(',') || t.contains('\n') {
+        return;
+    }
+    if let Some(h) = crate::subnet::hint(t) {
+        ui.weak(h);
+    }
+}
+
+/// Блок «Уведомления» (syslog, почта, файл).
+pub fn alerts_ui(ui: &mut egui::Ui, a: &mut crate::tools::notify::Alerts, id: &str, what: &str) {
+    let configured = !a.is_empty();
+    egui::CollapsingHeader::new(if configured { "Уведомления ✔" } else { "Уведомления" }).id_salt(id).show(ui, |ui| {
+        ui.weak(what);
+        egui::Grid::new((id, "g")).num_columns(2).show(ui, |ui| {
+            labeled(ui, "Syslog", |ui| ui.add(egui::TextEdit::singleline(&mut a.syslog).hint_text("10.0.0.50:514")));
+            labeled(ui, "Почта: SMTP", |ui| ui.add(egui::TextEdit::singleline(&mut a.smtp).hint_text("mail.corp.local:25")));
+            labeled(ui, "От кого", |ui| ui.add(egui::TextEdit::singleline(&mut a.mail_from).hint_text("monitor@corp.local")));
+            labeled(ui, "Кому", |ui| ui.add(egui::TextEdit::singleline(&mut a.mail_to).hint_text("noc@corp.local, …")));
+            labeled(ui, "Файл журнала", |ui| ui.add(egui::TextEdit::singleline(&mut a.log_file).hint_text("журнал.log")));
+        });
+        ui.checkbox(&mut a.on_warn, "Сообщать и о неопасных изменениях");
+    });
+}
+
+fn overview_settings(ui: &mut egui::Ui) {
+    ui.weak("Сводка по всем инструментам контроля. Щелчок по карточке — переход к подробностям.");
+    ui.add_space(4.0);
+    ui.weak("Чтобы обзор наполнился: запустите «Наблюдение» за подсетями, «Мониторинг» важных узлов и «Угрозы» (прослушивание сегмента).");
 }
 
 /// Таблица с заголовками; возвращает индекс строки, по которой щёлкнули.

@@ -35,6 +35,13 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("urls", "urlcheck", "проверка списка адресов через прокси: urls список.txt --set proxies=10.0.0.10:3128"),
     ("shares", "shares", "SMB-шары и NFS-экспорты: shares УЗЛЫ [--set login=Account --set user=…]"),
     ("capture", "capture", "захват пакетов: capture [--set filter=…] [--set seconds=60] [-o файл.pcapng]; без -o — сводка"),
+    ("site", "sitecheck", "почему не открывается сайт: site portal.corp.local [--set proxies=10.0.0.10:3128]"),
+    ("watch", "watch", "наблюдение за изменениями: watch 10.0.0.0/24 [--set interval_min=60] (Ctrl+C — стоп)"),
+    ("threats", "capture", "угрозы в сегменте по прослушиванию: threats [--set seconds=300]"),
+    ("snmp", "snmp", "таблицы коммутаторов: snmp 10.0.0.2 [--set community=…]; snmp 10.0.0.2 locate MAC"),
+    ("wol", "", "разбудить узел: wol AA:BB:CC:DD:EE:FF [10.0.0.25]"),
+    ("calc", "", "калькулятор подсетей: calc 10.0.1.5/22 | calc 10.0.0.0/22 /24 | calc 10.0.0.5-10.0.0.70"),
+    ("playbook", "", "сценарий: playbook файл.json|«имя встроенного» [-o отчёт.html]; playbook list"),
     ("listen", "", "слушатель для проверки доступа сюда: listen 443,1433"),
     ("certs", "", "сертификаты из файла сессии: certs сессия.json [-o certs.csv]"),
     ("compare", "", "сравнение сессий: compare было.json стало.json"),
@@ -326,6 +333,13 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "urls" => cmd_urls(&o, &store),
         "shares" => cmd_shares(&o, &store),
         "capture" => cmd_capture(&o, &store),
+        "site" => cmd_site(&o, &store),
+        "watch" => cmd_watch(&o, &store),
+        "threats" => cmd_threats(&o, &store),
+        "snmp" => cmd_snmp(&o, &store),
+        "wol" => cmd_wol(&o),
+        "calc" => cmd_calc(&o),
+        "playbook" => cmd_playbook(&o, &store),
         "listen" => cmd_listen(&o),
         "certs" => cmd_certs(&o),
         "compare" => cmd_compare(&o),
@@ -732,6 +746,210 @@ fn cmd_capture(o: &Opts, store: &Store) -> Result<(), String> {
         return std::fs::write(path, capture::pcapng(&raws, linktype as u16)).map_err(|e| format!("{path}: {e}"));
     }
     emit(o, &sum, crate::toolui::render_capture_summary)
+}
+
+fn cmd_site(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::sitecheck;
+    if o.fields {
+        print!("{}", fields::<sitecheck::Config>());
+        return Ok(());
+    }
+    let cfg: sitecheck::Config = configure("sitecheck", o, store, targets_json("url", o))?;
+    let mut r = sitecheck::Report { url: cfg.url.clone(), ..Default::default() };
+    let quiet = o.quiet;
+    drive(o, |s, c| sitecheck::run(cfg, s, c), |e| match e {
+        sitecheck::Event::Step(x) => {
+            eprint_line(quiet, &format!("{} {} {} {}", x.status.mark(), x.stage, x.title, x.detail));
+            r.steps.push(*x);
+        }
+        sitecheck::Event::Verdict(v, ok) => {
+            r.verdict = v;
+            r.ok = ok;
+        }
+        sitecheck::Event::Log(m) => eprint_line(false, &m),
+    })?;
+    emit(o, &r, sitecheck::render_text)
+}
+
+fn cmd_watch(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::watch;
+    if o.fields {
+        print!("{}", fields::<watch::Config>());
+        return Ok(());
+    }
+    let cfg: watch::Config = configure("watch", o, store, targets_json("targets", o))?;
+    let mut r = watch::Report::default();
+    let quiet = o.quiet;
+    drive(o, |s, c| watch::run(cfg, None, s, c), |e| match e {
+        watch::Event::Log(m) => eprint_line(quiet, &m),
+        watch::Event::Cycle(n) => {
+            r.cycles = n;
+            eprint_line(quiet, &format!("опрос №{n}…"));
+        }
+        watch::Event::Snapshot(snap) => {
+            eprint_line(quiet, &format!("узлов: {}", snap.hosts.len()));
+            if r.baseline.is_none() {
+                r.baseline = Some((*snap).clone());
+            }
+            r.last = Some(*snap);
+        }
+        watch::Event::Change(ch) => {
+            println!(
+                "{} {} {} {} {}",
+                crate::session::format_time(ch.at),
+                if ch.alarm { "!!" } else { "  " },
+                ch.host,
+                ch.kind.label(),
+                ch.detail
+            );
+            r.changes.push(*ch);
+        }
+        watch::Event::Next(at) => eprint_line(quiet, &format!("следующий опрос: {}", crate::session::format_time(at))),
+    })?;
+    if o.out.is_some() || o.json {
+        return emit(o, &r, watch::render_text);
+    }
+    Ok(())
+}
+
+fn cmd_threats(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::{capture, threats};
+    let mut cfg: capture::Config = configure("capture", o, store, json!({}))?;
+    cfg.filter = capture::PASSIVE_FILTER.into();
+    if !o.sets.iter().any(|(k, _)| k == "seconds") && cfg.seconds == 0 {
+        cfg.seconds = 300;
+    }
+    let mut sum = capture::Summary::default();
+    let mut linktype = 1;
+    let quiet = o.quiet;
+    if !quiet {
+        eprintln!("прослушивание {} с… Ctrl+C — стоп раньше", cfg.seconds);
+    }
+    drive(&Opts { out: None, ..Default::default() }, |s, c| capture::run(cfg, s, c), |e| match e {
+        capture::Event::Log(m) => eprint_line(quiet, &m),
+        capture::Event::Started(l) => linktype = l,
+        capture::Event::Packets(_, r) => {
+            for raw in &r {
+                sum.packets += 1;
+                capture::dissect(&raw.data, linktype, &mut sum);
+            }
+        }
+        capture::Event::Stopped(m) => eprint_line(quiet, &m),
+    })?;
+    let list = threats::assess(&sum);
+    emit(o, &list, |l| threats::render_text(l))
+}
+
+fn cmd_snmp(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::snmp;
+    if o.fields {
+        print!("{}", fields::<snmp::Config>());
+        return Ok(());
+    }
+    let (switches, locate) = match o.positional.iter().position(|p| p == "locate") {
+        Some(i) => (o.positional[..i].to_vec(), o.positional.get(i + 1).cloned()),
+        None => (o.positional.clone(), None),
+    };
+    let primary = if switches.is_empty() { json!({}) } else { json!({ "switches": switches.join(", ") }) };
+    let cfg: snmp::Config = configure("snmp", o, store, primary)?;
+    let mut r = snmp::Report::default();
+    let quiet = o.quiet;
+    drive(o, |s, c| snmp::run(cfg, s, c), |e| match e {
+        snmp::Event::Log(m) => eprint_line(quiet, &m),
+        snmp::Event::Switch(x) => r.switches.push(*x),
+    })?;
+    if let Some(mac) = locate {
+        return match r.locate(&mac) {
+            Some(l) => {
+                println!("{mac}: {} порт {}{}{}", l.switch, l.port, l.vlan.map(|v| format!(" VLAN {v}")).unwrap_or_default(), if l.alias.is_empty() { String::new() } else { format!(" «{}»", l.alias) });
+                Ok(())
+            }
+            None => Err(format!("{mac} не найден в таблицах коммутаторов")),
+        };
+    }
+    emit(o, &r, |r| {
+        let mut s = String::new();
+        for sw in &r.switches {
+            s += &format!("{} {} {}\n", sw.address, sw.name, sw.error.clone().unwrap_or_default());
+            for e in &sw.entries {
+                s += &format!(
+                    "  {:<17} VLAN {:<5} {:<14} {}{}\n",
+                    e.mac,
+                    e.vlan.map(|v| v.to_string()).unwrap_or("-".into()),
+                    e.port,
+                    if e.uplink { format!("магистраль ({} MAC) ", e.macs_on_port) } else { String::new() },
+                    e.port_alias
+                );
+            }
+        }
+        s
+    })
+}
+
+fn cmd_wol(o: &Opts) -> Result<(), String> {
+    let mac = o.positional.first().ok_or("укажите MAC: wol AA:BB:CC:DD:EE:FF [последний адрес узла]")?;
+    let ip = o.positional.get(1).and_then(|s| s.parse().ok());
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    let m = rt.block_on(crate::tools::wol::wake(mac, ip))?;
+    println!("{m}");
+    Ok(())
+}
+
+fn cmd_calc(o: &Opts) -> Result<(), String> {
+    let q = o.positional.join(" ");
+    let c = crate::subnet::calc(&q).ok_or("не понял: calc 10.0.1.5/22 | calc 10.0.0.0/22 /24 | calc 10.0.1.5 в 10.0.0.0/22 | calc a-b")?;
+    println!("{}", c.title);
+    for (k, v) in &c.rows {
+        println!("  {k:<26} {v}");
+    }
+    for n in &c.list {
+        println!("  {n}");
+    }
+    Ok(())
+}
+
+fn cmd_playbook(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::playbook;
+    let arg = o.positional.first().ok_or("укажите сценарий: playbook файл.json | playbook list")?;
+    let all: Vec<playbook::Playbook> = playbook::builtin().into_iter().chain(playbook::load_user().into_iter().map(|x| x.1)).collect();
+    if arg == "list" {
+        for p in &all {
+            println!("{} — {}", p.name, p.description);
+        }
+        return Ok(());
+    }
+    let pb = if std::path::Path::new(arg).is_file() {
+        let t = std::fs::read_to_string(arg).map_err(|e| format!("{arg}: {e}"))?;
+        serde_json::from_str::<playbook::Playbook>(&t).map_err(|e| format!("{arg}: {e}"))?
+    } else {
+        all.into_iter().find(|p| p.name.eq_ignore_ascii_case(arg)).ok_or_else(|| format!("сценарий «{arg}» не найден (playbook list)"))?
+    };
+    let subnet = crate::netdetect::detect_local_cidr();
+    let quiet = o.quiet;
+    let mut results = None;
+    let steps: Vec<String> = pb.steps.iter().map(|s| s.label()).collect();
+    let name = pb.name.clone();
+    let store = store.clone();
+    drive(&Opts { out: None, ..Default::default() }, |s, c| playbook::execute(pb, store, subnet, s, c), |e| match e {
+        playbook::Event::Step(i, t) => eprint_line(quiet, &format!("{}. {t}…", i + 1)),
+        playbook::Event::Done(i, t) => println!("{}. {}: {t}", i + 1, steps.get(i).cloned().unwrap_or_default()),
+        playbook::Event::Log(m) => eprint_line(quiet, &m),
+        playbook::Event::Finished(r) => results = Some(*r),
+    })?;
+    let Some(r) = results else { return Ok(()) };
+    if let Some(path) = &o.out {
+        let mut s = crate::session::Session::new(&crate::model::Settings::default(), None, Vec::new());
+        s.tools = r;
+        if path.to_ascii_lowercase().ends_with(".json") {
+            crate::session::save(std::path::Path::new(path), &s)?;
+        } else {
+            std::fs::write(path, crate::report::html(&s, &name)).map_err(|e| format!("{path}: {e}"))?;
+        }
+        if !quiet {
+            eprintln!("сохранено: {path}");
+        }
+    }
+    Ok(())
 }
 
 fn cmd_listen(o: &Opts) -> Result<(), String> {

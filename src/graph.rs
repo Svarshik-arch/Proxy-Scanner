@@ -186,6 +186,8 @@ pub struct GraphView {
     dragging: Option<usize>,
     lens: f32,
     settings_open: bool,
+    /// Живая карта: нагрузка на связях (ключи узлов → доля 0..1, тревога).
+    heat: std::collections::HashMap<(String, String), (f32, bool)>,
 }
 
 impl Default for GraphView {
@@ -204,6 +206,7 @@ impl Default for GraphView {
             dragging: None,
             lens: 0.0,
             settings_open: false,
+            heat: Default::default(),
             map_mode: false,
         }
     }
@@ -643,6 +646,19 @@ impl GraphView {
     }
 
     /// Карта сети из узлов [`MapNode`].
+    /// Нагрузка на связях живой карты (обновляется без перестройки раскладки).
+    pub fn set_heat(&mut self, v: Vec<(String, String, f32, bool)>) {
+        self.heat = v.into_iter().map(|(a, b, w, alert)| ((a, b), (w, alert))).collect();
+    }
+
+    fn edge_heat(&self, e: &Edge) -> Option<(f32, bool)> {
+        if self.heat.is_empty() {
+            return None;
+        }
+        let (a, b) = (&self.nodes[e.a].key, &self.nodes[e.b].key);
+        self.heat.get(&(a.clone(), b.clone())).or_else(|| self.heat.get(&(b.clone(), a.clone()))).copied()
+    }
+
     pub fn ui_map(&mut self, ui: &mut Ui, nodes: &[MapNode], s: &mut GraphSettings) -> GraphOutput {
         self.sync_map(nodes, s);
         self.map_mode = true;
@@ -825,6 +841,20 @@ impl GraphView {
             } else {
                 (pal.link.gamma_multiply(fade), link_w)
             };
+            if let Some((share, alert)) = self.edge_heat(e) {
+                // Живая связь: толщина по объёму трафика, бегущие точки по направлению потока.
+                let hot = if alert { Color32::from_rgb(230, 80, 70) } else { pal.accent };
+                painter.line_segment([pa, pb], Stroke::new(w + 3.5 * share, hot.gamma_multiply(0.35 + 0.5 * share * fade)));
+                let t = ui.input(|i| i.time) as f32;
+                let len = (pb - pa).length().max(1.0);
+                let dots = ((len / 40.0) as usize).clamp(1, 12);
+                for k in 0..dots {
+                    let f = ((t * (0.25 + 0.6 * share) * 60.0 / len) + k as f32 / dots as f32).fract();
+                    painter.circle_filled(pa + (pb - pa) * f, 1.5 + 1.5 * share, hot.gamma_multiply(fade));
+                }
+                animating = true;
+                continue;
+            }
             painter.line_segment([pa, pb], Stroke::new(w, color));
         }
 
