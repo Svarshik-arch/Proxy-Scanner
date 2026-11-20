@@ -6,6 +6,7 @@
 
 pub mod ad;
 pub mod audit;
+pub mod capture;
 pub mod certs;
 pub mod compare;
 pub mod dns;

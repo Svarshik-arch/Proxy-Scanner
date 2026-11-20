@@ -34,6 +34,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("matrix", "matrix", "матрица доступности: matrix правила.txt (узел:порт open|closed)"),
     ("urls", "urlcheck", "проверка списка адресов через прокси: urls список.txt --set proxies=10.0.0.10:3128"),
     ("shares", "shares", "SMB-шары и NFS-экспорты: shares УЗЛЫ [--set login=Account --set user=…]"),
+    ("capture", "capture", "захват пакетов: capture [--set filter=…] [--set seconds=60] [-o файл.pcapng]; без -o — сводка"),
     ("listen", "", "слушатель для проверки доступа сюда: listen 443,1433"),
     ("certs", "", "сертификаты из файла сессии: certs сессия.json [-o certs.csv]"),
     ("compare", "", "сравнение сессий: compare было.json стало.json"),
@@ -324,6 +325,7 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "matrix" => cmd_matrix(&o, &store),
         "urls" => cmd_urls(&o, &store),
         "shares" => cmd_shares(&o, &store),
+        "capture" => cmd_capture(&o, &store),
         "listen" => cmd_listen(&o),
         "certs" => cmd_certs(&o),
         "compare" => cmd_compare(&o),
@@ -684,6 +686,52 @@ fn cmd_shares(o: &Opts, store: &Store) -> Result<(), String> {
         }
     })?;
     emit(o, &report, shares::render_text)
+}
+
+fn cmd_capture(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::capture;
+    if o.fields {
+        print!("{}", fields::<capture::Config>());
+        return Ok(());
+    }
+    if o.positional.first().map(String::as_str) == Some("devices") {
+        for d in capture::Pcap::load()?.devices()? {
+            println!("{}\t{}", d.name, d.label());
+        }
+        return Ok(());
+    }
+    let cfg: capture::Config = configure("capture", o, store, json!({}))?;
+    let mut sum = capture::Summary::default();
+    let mut raws = Vec::new();
+    let mut linktype = 1;
+    let quiet = o.quiet;
+    if !quiet {
+        eprintln!("захват… Ctrl+C — стоп");
+    }
+    drive(&Opts { out: None, ..Default::default() }, |s, c| capture::run(cfg, s, c), |e| match e {
+        capture::Event::Log(m) => eprint_line(quiet, &m),
+        capture::Event::Started(l) => linktype = l,
+        capture::Event::Packets(p, r) => {
+            for raw in &r {
+                sum.packets += 1;
+                sum.bytes += raw.len as u64;
+                capture::dissect(&raw.data, linktype, &mut sum);
+            }
+            if !quiet {
+                for x in &p {
+                    eprintln!("{:>9.3} {:<20} {:<20} {:<7} {}", x.t, x.src, x.dst, x.proto, x.info);
+                }
+            }
+            raws.extend(r);
+        }
+        capture::Event::Stopped(m) => eprint_line(quiet, &m),
+    })?;
+    if let Some(path) = &o.out
+        && path.to_ascii_lowercase().ends_with(".pcapng")
+    {
+        return std::fs::write(path, capture::pcapng(&raws, linktype as u16)).map_err(|e| format!("{path}: {e}"));
+    }
+    emit(o, &sum, crate::toolui::render_capture_summary)
 }
 
 fn cmd_listen(o: &Opts) -> Result<(), String> {

@@ -45,15 +45,15 @@ impl Panel {
 
     pub fn results_ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {
         let out = self.graph.ui_map(ui, &self.nodes, &mut self.settings);
-        if let Some(label) = out.map_activate {
-            if let Some(n) = self.nodes.iter().find(|n| n.label == label) {
-                let target = n.key.strip_prefix("ip:").unwrap_or(&n.label).to_string();
-                *env.nav = Some(match n.kind {
-                    MapKind::Subnet => Nav::Send(Tool::Discovery, n.label.clone()),
-                    MapKind::Me => return,
-                    _ => Nav::Send(Tool::Mtr, target),
-                });
-            }
+        if let Some(label) = out.map_activate
+            && let Some(n) = self.nodes.iter().find(|n| n.label == label)
+        {
+            let target = n.key.strip_prefix("ip:").unwrap_or(&n.label).to_string();
+            *env.nav = Some(match n.kind {
+                MapKind::Subnet => Nav::Send(Tool::Discovery, n.label.clone()),
+                MapKind::Me => return,
+                _ => Nav::Send(Tool::Mtr, target),
+            });
         }
     }
 }

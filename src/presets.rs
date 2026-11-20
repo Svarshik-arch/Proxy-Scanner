@@ -31,6 +31,7 @@ pub const TOOLS: &[(&str, &str)] = &[
     ("matrix", "Доступность"),
     ("urlcheck", "Проверка URL"),
     ("shares", "Общие ресурсы"),
+    ("capture", "Трафик"),
 ];
 
 /// Поля, которые никогда не попадают в пользовательский пресет: они описывают
@@ -247,6 +248,12 @@ pub fn builtin() -> Vec<Preset> {
             "urls": "+ https://www.gosuslugi.ru/\n- https://www.torproject.org/\n- https://www.dropbox.com/\n- https://mega.nz/\n- https://web.telegram.org/\n- https://www.speedtest.net/"
         })),
         p("urlcheck", "Через прокси под текущим пользователем", "NTLM/Kerberos через SSPI", json!({ "auth": "Auto", "current_user": true })),
+        // --- Трафик ---
+        p("capture", "Прослушивание служебных протоколов", "Коммутатор и порт (LLDP/CDP), DHCP, STP, ARP, запросы имён", json!({
+            "filter": crate::tools::capture::PASSIVE_FILTER, "seconds": 120
+        })),
+        p("capture", "Весь трафик, 1 минута", "Для сохранения в pcapng и разбора в Wireshark", json!({ "filter": "", "seconds": 60 })),
+        p("capture", "DNS и TLS (какие сайты открываются)", "", json!({ "filter": "udp port 53 or tcp port 443", "seconds": 0 })),
         // --- Общие ресурсы ---
         p("shares", "Анонимный доступ", "Что видно и доступно без пароля — находка для аудита", json!({ "login": "Anonymous", "check_access": true })),
         p("shares", "Только SMB", "", json!({ "smb": true, "nfs": false })),
@@ -507,6 +514,7 @@ mod tests {
                 "matrix" => check::<crate::tools::matrix::Config>(v, what),
                 "urlcheck" => check::<crate::tools::urlcheck::Config>(v, what),
                 "shares" => check::<crate::tools::shares::Config>(v, what),
+                "capture" => check::<crate::tools::capture::Config>(v, what),
                 other => panic!("{what}: неизвестный инструмент {other}"),
             }
         }

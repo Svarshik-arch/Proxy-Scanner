@@ -103,7 +103,7 @@ impl Group {
     fn hint(self) -> &'static str {
         match self {
             Group::Proxy => "Поиск и проверка прокси, проверка адресов через прокси, обход прокси, PAC/WPAD",
-            Group::Network => "Эта машина, трассировка, узлы в сети, доступность портов, карта сети",
+            Group::Network => "Эта машина, трассировка, узлы, доступность портов, трафик, карта сети",
             Group::Services => "DNS, HTTP, сервисы и версии, TLS, домен AD, общие ресурсы",
             Group::Audit => "Небезопасные настройки, сертификаты, сравнение с прошлой проверкой",
             Group::Monitor => Tool::Monitor.hint(),
@@ -118,6 +118,7 @@ impl Group {
                 Section::Tool(Tool::Mtr),
                 Section::Tool(Tool::Discovery),
                 Section::Tool(Tool::Matrix),
+                Section::Tool(Tool::Capture),
                 Section::Tool(Tool::Map),
             ],
             Group::Services => &[

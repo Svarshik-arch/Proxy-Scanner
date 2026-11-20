@@ -3342,6 +3342,7 @@ dependencies = [
  "egui_extras",
  "hmac",
  "libc",
+ "libloading",
  "md-5",
  "md4",
  "miniz_oxide 0.8.9",
