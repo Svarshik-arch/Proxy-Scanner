@@ -110,7 +110,7 @@ impl Panel {
                 ui.colored_label(color, format!("• {}", f.text));
             }
             ui.add_space(6.0);
-            for dc in &r.dcs {
+            for (dn, dc) in r.dcs.iter().enumerate() {
                 let ok_ports = dc.ports.iter().filter(|p| p.open).count();
                 let title = format!(
                     "{}  {}  ·  портов {}/{}",
@@ -120,7 +120,7 @@ impl Panel {
                     dc.ports.len()
                 );
                 let resp = egui::CollapsingHeader::new(RichText::new(title).strong())
-                    .id_salt(("dc", &dc.host))
+                    .id_salt(("dc", dn))
                     .default_open(r.dcs.len() <= 3)
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -130,7 +130,7 @@ impl Panel {
                                     .on_hover_text(format!("{}{}", p.purpose, p.error.as_ref().map(|e| format!(": {e}")).unwrap_or_default()));
                             }
                         });
-                        egui::Grid::new(("dc_g", &dc.host)).num_columns(2).show(ui, |ui| {
+                        egui::Grid::new(("dc_g", dn)).num_columns(2).show(ui, |ui| {
                             let mut row = |k: &str, v: RichText| {
                                 ui.weak(k);
                                 ui.label(v);

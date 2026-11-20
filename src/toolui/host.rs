@@ -73,7 +73,7 @@ impl Panel {
             egui::CollapsingHeader::new(RichText::new(format!("Интерфейсы ({})", r.interfaces.len())).strong())
                 .default_open(true)
                 .show(ui, |ui| {
-                    for i in &r.interfaces {
+                    for (n, i) in r.interfaces.iter().enumerate() {
                         if !i.up && i.addrs.is_empty() {
                             continue;
                         }
@@ -93,7 +93,7 @@ impl Panel {
                                 ui.label(format!("{s} Мбит/с"));
                             }
                         });
-                        egui::Grid::new(("if", &i.name)).num_columns(2).show(ui, |ui| {
+                        egui::Grid::new(("if", n)).num_columns(2).show(ui, |ui| {
                             let mut row = |k: &str, v: String| {
                                 if !v.is_empty() {
                                     ui.weak(k);
