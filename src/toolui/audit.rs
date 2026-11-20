@@ -79,6 +79,18 @@ impl Panel {
             }
         });
         super::multiline(ui, &mut c.targets, 2, "10.0.0.0/24, srv01.corp.local");
+        match super::from_scan(
+            ui,
+            &env.scan,
+            &[
+                (format!("найденные узлы ({})", env.scan.hosts().len()), "Только узлы, где сканирование нашло открытые порты — быстрее"),
+                ("вся сеть сканирования".into(), "Те же сети и диапазоны, что сканировались на вкладке «Прокси»"),
+            ],
+        ) {
+            Some(0) => c.targets = env.scan.hosts_text(),
+            Some(1) => c.targets = env.scan.targets.clone(),
+            _ => {}
+        }
         ui.add_space(4.0);
         let (start, stop) = super::run_button(ui, self.busy(), "Начать аудит");
         if start {

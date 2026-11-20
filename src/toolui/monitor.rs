@@ -76,6 +76,43 @@ impl Panel {
                 c.checks = EXAMPLE.into();
             }
         });
+        let proxies = env.scan.http_proxies();
+        let web = env.scan.web_urls();
+        let (tls_hosts, _) = env.scan.tls();
+        let mut add: Vec<String> = Vec::new();
+        match super::from_scan(
+            ui,
+            &env.scan,
+            &[
+                (format!("прокси ({})", proxies.len()), "Проверка порта каждого найденного прокси: tcp адрес:порт"),
+                (format!("сайты ({})", web.len()), "HTTP-проверка найденных веб-серверов"),
+                (format!("узлы ping ({})", env.scan.hosts().len()), "Ping всех узлов из сканирования"),
+                (format!("сертификаты ({})", tls_hosts.len()), "Срок сертификатов на найденных TLS-портах"),
+            ],
+        ) {
+            Some(0) => add = proxies.iter().map(|p| format!("tcp {p}")).collect(),
+            Some(1) => add = web.iter().map(|u| format!("http {u}")).collect(),
+            Some(2) => add = env.scan.hosts().iter().map(|h| format!("ping {h}")).collect(),
+            Some(3) => {
+                add = env
+                    .scan
+                    .found
+                    .iter()
+                    .filter(|f| tls_hosts.contains(&f.ip) && (f.tls || [443, 636, 8443, 9443, 993, 995, 465, 3269].contains(&f.port)))
+                    .map(|f| format!("tls {}:{}", f.ip, f.port))
+                    .collect()
+            }
+            _ => {}
+        }
+        for line in add {
+            if !c.checks.lines().any(|l| l.trim() == line) {
+                if !c.checks.is_empty() && !c.checks.ends_with('\n') {
+                    c.checks.push('\n');
+                }
+                c.checks.push_str(&line);
+                c.checks.push('\n');
+            }
+        }
         ui.add(
             egui::TextEdit::multiline(&mut c.checks)
                 .font(egui::TextStyle::Monospace)

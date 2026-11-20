@@ -70,6 +70,25 @@ impl Panel {
         let c = &mut self.cfg;
         ui.label("Узлы");
         super::multiline(ui, &mut c.targets, 2, "portal.corp.local, 10.0.0.0/24");
+        let (tls_hosts, tls_ports) = env.scan.tls();
+        match super::from_scan(
+            ui,
+            &env.scan,
+            &[
+                (format!("узлы с TLS ({})", tls_hosts.len()), "Узлы, где сканирование нашло HTTPS и другие TLS-порты"),
+                (format!("все найденные ({})", env.scan.hosts().len()), "Все узлы и открытые порты из сканирования"),
+            ],
+        ) {
+            Some(0) => {
+                c.targets = tls_hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>().join(", ");
+                c.ports = tls_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+            }
+            Some(1) => {
+                c.targets = env.scan.hosts_text();
+                c.ports = env.scan.ports_text();
+            }
+            _ => {}
+        }
         ui.label("Порты");
         super::singleline(ui, &mut c.ports, "443,8443,636");
         ui.checkbox(&mut c.ciphers, "Перебирать наборы шифров (дольше)");

@@ -63,6 +63,19 @@ impl Panel {
             }
         });
         super::multiline(ui, &mut c.targets, 2, "192.168.1.0/24, 10.0.0.1-10.0.0.50");
+        let scan = &env.scan;
+        match super::from_scan(
+            ui,
+            scan,
+            &[
+                ("сеть сканирования".into(), "Те же сети и диапазоны, что сканировались на вкладке «Прокси»"),
+                (format!("найденные узлы ({})", scan.hosts().len()), "Узлы, где сканирование нашло открытые порты"),
+            ],
+        ) {
+            Some(0) => c.targets = scan.targets.clone(),
+            Some(1) => c.targets = scan.hosts_text(),
+            _ => {}
+        }
         match crate::targets::parse_targets(&c.targets) {
             Ok(t) if t.total_hosts() > 65536 => {
                 ui.colored_label(RED, "больше /16");

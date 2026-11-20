@@ -61,14 +61,21 @@ impl Panel {
         let c = &mut self.cfg;
         ui.label("Узлы");
         super::multiline(ui, &mut c.targets, 2, "10.0.0.0/24, srv01.corp.local");
-        if !env.proxy_open.is_empty() && ui.small_button(format!("взять {} открытых портов из сканирования прокси", env.proxy_open.len())).clicked() {
-            let mut ips: Vec<String> = env.proxy_open.iter().map(|(ip, _)| ip.to_string()).collect();
-            ips.dedup();
-            let mut ports: Vec<u16> = env.proxy_open.iter().map(|(_, p)| *p).collect();
-            ports.sort();
-            ports.dedup();
-            c.targets = ips.join(", ");
-            c.tcp_ports = ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+        let scan = &env.scan;
+        match super::from_scan(
+            ui,
+            scan,
+            &[
+                (format!("найденные узлы и порты ({})", scan.hosts().len()), "Узлы и открытые порты, которые нашло сканирование"),
+                ("вся сеть сканирования".into(), "Те же сети и диапазоны, что сканировались на вкладке «Прокси»"),
+            ],
+        ) {
+            Some(0) => {
+                c.targets = scan.hosts_text();
+                c.tcp_ports = scan.ports_text();
+            }
+            Some(1) => c.targets = scan.targets.clone(),
+            _ => {}
         }
         ui.label("TCP-порты");
         super::multiline(ui, &mut c.tcp_ports, 2, "22,80,443,445,3389");

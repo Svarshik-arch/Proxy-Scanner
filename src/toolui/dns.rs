@@ -60,6 +60,16 @@ impl Panel {
         let c = &mut self.cfg;
         ui.label("Имена (или IP — для PTR)");
         super::multiline(ui, &mut c.names, 3, "example.com\n_ldap._tcp.dc._msdcs.{domain}\n10.0.0.1");
+        if super::from_scan(
+            ui,
+            &env.scan,
+            &[(format!("имена найденных узлов (PTR, {})", env.scan.hosts().len()), "Обратные записи для узлов из сканирования")],
+        )
+        .is_some()
+        {
+            c.names = env.scan.hosts().iter().map(|h| h.to_string()).collect::<Vec<_>>().join("\n");
+            c.types = "PTR".into();
+        }
         ui.label("Типы записей");
         super::singleline(ui, &mut c.types, "A AAAA MX");
         ui.horizontal_wrapped(|ui| {

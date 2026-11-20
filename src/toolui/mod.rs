@@ -159,10 +159,139 @@ pub struct Env<'a> {
     pub message: &'a mut Option<String>,
     /// Подсеть этой машины (для «Моя подсеть»).
     pub local_cidr: Option<String>,
-    /// Открытые порты из сканирования прокси.
-    pub proxy_open: Vec<(std::net::Ipv4Addr, u16)>,
+    /// Что нашло сканирование на вкладке «Прокси».
+    pub scan: ScanInfo,
+}
+
+/// Что нашло сканирование на вкладке «Прокси»: для подстановки в другие разделы.
+#[derive(Debug, Clone, Default)]
+pub struct ScanInfo {
+    /// Что сканировалось (сети, диапазоны).
+    pub targets: String,
+    pub found: Vec<Found>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoundKind {
+    HttpProxy,
+    Socks,
+    Web,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Found {
+    pub ip: std::net::Ipv4Addr,
+    pub port: u16,
+    pub kind: FoundKind,
+    /// Отвечает по TLS (есть сертификат или типичный порт HTTPS).
+    pub tls: bool,
+}
+
+const TLS_PORTS: [u16; 8] = [443, 465, 636, 993, 995, 3269, 8443, 9443];
+
+impl ScanInfo {
+    pub fn is_empty(&self) -> bool {
+        self.found.is_empty()
+    }
+    /// Узлы с открытыми портами (без повторов, по порядку адресов).
+    pub fn hosts(&self) -> Vec<std::net::Ipv4Addr> {
+        let mut v: Vec<_> = self.found.iter().map(|f| f.ip).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+    pub fn hosts_text(&self) -> String {
+        self.hosts().iter().map(|h| h.to_string()).collect::<Vec<_>>().join(", ")
+    }
+    fn ports_of(&self, keep: impl Fn(&Found) -> bool) -> Vec<u16> {
+        let mut v: Vec<_> = self.found.iter().filter(|f| keep(f)).map(|f| f.port).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+    pub fn ports_text(&self) -> String {
+        join_ports(&self.ports_of(|_| true))
+    }
+    /// Узлы и порты с TLS.
+    pub fn tls(&self) -> (Vec<std::net::Ipv4Addr>, Vec<u16>) {
+        let is = |f: &Found| f.tls || TLS_PORTS.contains(&f.port);
+        let mut hosts: Vec<_> = self.found.iter().filter(|f| is(f)).map(|f| f.ip).collect();
+        hosts.sort();
+        hosts.dedup();
+        (hosts, self.ports_of(is))
+    }
+    /// Узлы, где открыт один из портов.
+    pub fn hosts_with(&self, ports: &[u16]) -> Vec<std::net::Ipv4Addr> {
+        let mut v: Vec<_> = self.found.iter().filter(|f| ports.contains(&f.port)).map(|f| f.ip).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+    /// Адреса найденных веб-серверов.
+    pub fn web_urls(&self) -> Vec<String> {
+        self.found
+            .iter()
+            .filter(|f| f.kind == FoundKind::Web)
+            .map(|f| {
+                let https = f.tls || TLS_PORTS.contains(&f.port);
+                match (https, f.port) {
+                    (true, 443) => format!("https://{}/", f.ip),
+                    (false, 80) => format!("http://{}/", f.ip),
+                    (true, p) => format!("https://{}:{p}/", f.ip),
+                    (false, p) => format!("http://{}:{p}/", f.ip),
+                }
+            })
+            .collect()
+    }
     /// Найденные HTTP-прокси `ip:порт`.
-    pub http_proxies: Vec<String>,
+    pub fn http_proxies(&self) -> Vec<String> {
+        self.found.iter().filter(|f| f.kind == FoundKind::HttpProxy).map(|f| format!("{}:{}", f.ip, f.port)).collect()
+    }
+    /// Все открытые порты `ip:порт`.
+    pub fn endpoints(&self) -> Vec<String> {
+        self.found.iter().map(|f| format!("{}:{}", f.ip, f.port)).collect()
+    }
+}
+
+fn join_ports(v: &[u16]) -> String {
+    v.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+}
+
+/// Строка кнопок «Из сканирования: …» под полем адресов. Возвращает номер нажатой.
+/// Ничего не показывает, если сканирование ничего не нашло.
+pub fn from_scan(ui: &mut egui::Ui, scan: &ScanInfo, buttons: &[(String, &str)]) -> Option<usize> {
+    if scan.is_empty() {
+        return None;
+    }
+    let mut hit = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.weak("Из сканирования:");
+        for (i, (label, hint)) in buttons.iter().enumerate() {
+            // «(0)» — подставлять нечего.
+            let some = !label.ends_with("(0)");
+            if ui.add_enabled(some, egui::Button::new(label.as_str()).small()).on_hover_text(*hint).clicked() {
+                hit = Some(i);
+            }
+        }
+    });
+    hit
+}
+
+/// Меню выбора одного найденного значения (узел, адрес сайта, прокси).
+pub fn pick_menu(ui: &mut egui::Ui, label: &str, items: &[String]) -> Option<String> {
+    let mut picked = None;
+    ui.menu_button(label, |ui| {
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            for it in items {
+                if ui.button(it).clicked() {
+                    picked = Some(it.clone());
+                    ui.close();
+                }
+            }
+        });
+    });
+    picked
 }
 
 /// Сохраняемые параметры всех инструментов.
@@ -522,7 +651,7 @@ impl Workbench {
         rt: &'a Handle,
         ctx: egui::Context,
         local_cidr: Option<String>,
-        proxy_open: Vec<(std::net::Ipv4Addr, u16)>,
+        scan: ScanInfo,
     ) -> Env<'a> {
         Env {
             rt,
@@ -533,8 +662,7 @@ impl Workbench {
             nav,
             message,
             local_cidr,
-            proxy_open,
-            http_proxies: Vec::new(),
+            scan,
         }
     }
 
@@ -544,8 +672,7 @@ impl Workbench {
         ui: &mut egui::Ui,
         rt: &Handle,
         local_cidr: Option<String>,
-        proxy_open: Vec<(std::net::Ipv4Addr, u16)>,
-        http_proxies: Vec<String>,
+        scan: ScanInfo,
     ) -> Option<Nav> {
         let mut nav = None;
         let mut env = Self::env(
@@ -557,9 +684,8 @@ impl Workbench {
             rt,
             ui.ctx().clone(),
             local_cidr,
-            proxy_open,
+            scan,
         );
-        env.http_proxies = http_proxies;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.heading(t.title());
@@ -599,7 +725,7 @@ impl Workbench {
             rt,
             ui.ctx().clone(),
             None,
-            Vec::new(),
+            ScanInfo::default(),
         );
         match t {
             Tool::Host => self.host.results_ui(ui, &mut env),
@@ -635,7 +761,7 @@ impl Workbench {
             rt,
             ui.ctx().clone(),
             None,
-            Vec::new(),
+            ScanInfo::default(),
         );
         preset_bar(ui, &mut env, tool, cfg);
     }
@@ -1170,5 +1296,36 @@ impl UiNz for egui::Ui {
         if !text.trim().is_empty() {
             self.label(text);
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_info_tests {
+    use super::{Found, FoundKind, ScanInfo};
+
+    fn f(ip: &str, port: u16, kind: FoundKind, tls: bool) -> Found {
+        Found { ip: ip.parse().unwrap(), port, kind, tls }
+    }
+
+    #[test]
+    fn helpers() {
+        let s = ScanInfo {
+            targets: "10.0.0.0/24".into(),
+            found: vec![
+                f("10.0.0.5", 443, FoundKind::Web, true),
+                f("10.0.0.5", 80, FoundKind::Web, false),
+                f("10.0.0.2", 3128, FoundKind::HttpProxy, false),
+                f("10.0.0.9", 8443, FoundKind::Web, false),
+                f("10.0.0.2", 445, FoundKind::Other, false),
+            ],
+        };
+        assert_eq!(s.hosts_text(), "10.0.0.2, 10.0.0.5, 10.0.0.9");
+        assert_eq!(s.ports_text(), "80,443,445,3128,8443");
+        assert_eq!(s.web_urls(), vec!["https://10.0.0.5/", "http://10.0.0.5/", "https://10.0.0.9:8443/"]);
+        assert_eq!(s.http_proxies(), vec!["10.0.0.2:3128"]);
+        let (h, p) = s.tls();
+        assert_eq!(h.len(), 2);
+        assert_eq!(p, vec![443, 8443]);
+        assert_eq!(s.hosts_with(&[445]).len(), 1);
     }
 }

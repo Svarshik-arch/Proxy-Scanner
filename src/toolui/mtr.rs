@@ -64,6 +64,15 @@ impl Panel {
         ui.label("Узел");
         let r = ui.add(egui::TextEdit::singleline(&mut c.target).desired_width(f32::INFINITY).hint_text("10.0.0.1 или имя"));
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if !env.scan.is_empty() {
+            let hosts: Vec<String> = env.scan.hosts().iter().map(|h| h.to_string()).collect();
+            ui.horizontal(|ui| {
+                ui.weak("Из сканирования:");
+                if let Some(h) = super::pick_menu(ui, &format!("узел ({}) ▾", hosts.len()), &hosts) {
+                    c.target = h;
+                }
+            });
+        }
         ui.horizontal(|ui| {
             for m in Mode::ALL {
                 ui.radio_value(&mut c.mode, m, m.label());

@@ -56,10 +56,9 @@ impl Panel {
         let c = &mut self.cfg;
         ui.horizontal_wrapped(|ui| {
             ui.label("Прокси");
-            if !env.http_proxies.is_empty()
-                && ui.small_button(format!("все найденные ({})", env.http_proxies.len())).clicked()
-            {
-                c.proxies = env.http_proxies.join("\n");
+            let proxies = env.scan.http_proxies();
+            if !proxies.is_empty() && ui.small_button(format!("все найденные ({})", proxies.len())).clicked() {
+                c.proxies = proxies.join("\n");
             }
         });
         super::multiline(ui, &mut c.proxies, 2, "10.0.0.10:3128 (пусто — напрямую)");
@@ -69,6 +68,22 @@ impl Panel {
                 c.urls = EXAMPLE.into();
             }
         });
+        let web = env.scan.web_urls();
+        if !web.is_empty()
+            && ui
+                .small_button(format!("найденные веб-серверы ({})", web.len()))
+                .on_hover_text("Добавить адреса веб-серверов из сканирования с ожиданием «+»")
+                .clicked()
+        {
+            for u in web {
+                if !c.urls.contains(&u) {
+                    if !c.urls.is_empty() && !c.urls.ends_with('\n') {
+                        c.urls.push('\n');
+                    }
+                    c.urls.push_str(&format!("+ {u}\n"));
+                }
+            }
+        }
         ui.add(egui::TextEdit::multiline(&mut c.urls).font(egui::TextStyle::Monospace).desired_rows(6).desired_width(f32::INFINITY).hint_text(EXAMPLE));
         if let Err(e) = urlcheck::parse_urls(&c.urls)
             && !c.urls.trim().is_empty()

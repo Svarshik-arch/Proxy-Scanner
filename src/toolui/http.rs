@@ -86,6 +86,24 @@ impl Panel {
             let r = ui.add(egui::TextEdit::singleline(&mut c.url).desired_width(f32::INFINITY).hint_text("https://portal.corp.local/"));
             enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         });
+        let web = env.scan.web_urls();
+        let proxies = env.scan.http_proxies();
+        if !env.scan.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Из сканирования:");
+                if !web.is_empty()
+                    && let Some(u) = super::pick_menu(ui, &format!("сайт ({}) ▾", web.len()), &web)
+                {
+                    c.url = u;
+                }
+                if !proxies.is_empty()
+                    && let Some(p) = super::pick_menu(ui, &format!("через прокси ({}) ▾", proxies.len()), &proxies)
+                {
+                    c.proxy = p;
+                    c.proxy_mode = ProxyMode::Manual;
+                }
+            });
+        }
         let (start, stop) = super::run_button(ui, self.busy(), "Отправить");
         if (start || (enter && !self.busy())) && !self.cfg.url.trim().is_empty() {
             self.start(env);

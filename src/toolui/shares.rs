@@ -57,6 +57,19 @@ impl Panel {
         let c = &mut self.cfg;
         ui.label("Узлы");
         super::multiline(ui, &mut c.targets, 2, "fs01.corp.local, 10.0.0.0/24");
+        let file_hosts = env.scan.hosts_with(&[139, 445, 111, 2049]);
+        match super::from_scan(
+            ui,
+            &env.scan,
+            &[
+                (format!("с SMB/NFS ({})", file_hosts.len()), "Узлы, где открыты порты 139, 445, 111 или 2049"),
+                (format!("все найденные ({})", env.scan.hosts().len()), "Все узлы из сканирования"),
+            ],
+        ) {
+            Some(0) => c.targets = file_hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>().join(", "),
+            Some(1) => c.targets = env.scan.hosts_text(),
+            _ => {}
+        }
         ui.horizontal(|ui| {
             ui.checkbox(&mut c.smb, "SMB");
             ui.checkbox(&mut c.nfs, "NFS");

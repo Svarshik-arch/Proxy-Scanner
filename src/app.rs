@@ -2600,19 +2600,34 @@ impl App {
         }
     }
 
+    /// Что нашло сканирование прокси — для подстановки в другие разделы.
+    fn scan_info(&self) -> toolui::ScanInfo {
+        use toolui::{Found, FoundKind};
+        let found = self
+            .rows
+            .iter()
+            .map(|r| Found {
+                ip: r.ip,
+                port: r.port,
+                kind: match r.kind {
+                    ProxyKind::HttpProxy => FoundKind::HttpProxy,
+                    ProxyKind::Socks4 | ProxyKind::Socks5 => FoundKind::Socks,
+                    ProxyKind::HttpServer => FoundKind::Web,
+                    _ => FoundKind::Other,
+                },
+                tls: r.probe.cert.is_some(),
+            })
+            .collect();
+        toolui::ScanInfo { targets: self.settings.targets.trim().to_string(), found }
+    }
+
     /// Левая панель: параметры прокси-сканера или выбранного инструмента.
     fn ui_left(&mut self, ui: &mut egui::Ui) {
         match self.view.section {
             Section::Tool(t) => {
                 let handle = self.rt.handle().clone();
-                let open: Vec<(Ipv4Addr, u16)> = self.rows.iter().map(|r| (r.ip, r.port)).collect();
-                let proxies: Vec<String> = self
-                    .rows
-                    .iter()
-                    .filter(|r| r.kind == ProxyKind::HttpProxy)
-                    .map(|r| format!("{}:{}", r.ip, r.port))
-                    .collect();
-                let nav = self.bench.settings_ui(t, ui, &handle, self.local_cidr.clone(), open, proxies);
+                let scan = self.scan_info();
+                let nav = self.bench.settings_ui(t, ui, &handle, self.local_cidr.clone(), scan);
                 self.navigate(nav);
             }
             _ => {

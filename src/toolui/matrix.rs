@@ -92,6 +92,22 @@ impl Panel {
                 .desired_width(f32::INFINITY)
                 .hint_text(EXAMPLE),
         );
+        if super::from_scan(
+            ui,
+            &env.scan,
+            &[(
+                format!("открытые порты как правила ({})", env.scan.found.len()),
+                "Каждый найденный открытый порт — правило «open»: проверка с другой машины покажет, где он закрыт",
+            )],
+        )
+        .is_some()
+        {
+            let mut rules = String::from("# открытые порты из сканирования прокси\n");
+            for e in env.scan.endpoints() {
+                rules.push_str(&format!("{e} open\n"));
+            }
+            self.cfg.rules = rules;
+        }
         if let Err(e) = matrix::parse(&self.cfg.rules)
             && !self.cfg.rules.trim().is_empty()
         {
