@@ -59,6 +59,20 @@ jobs:
           if ($ping.hops[0].recv -lt 1) { throw "ICMP ping to 127.0.0.1 failed: $($ping | ConvertTo-Json -Depth 5)" }
           & $cli dns example.com A '@8.8.8.8' -q; if ($LASTEXITCODE) { throw "dns: $LASTEXITCODE" }
 
+      # Окно открывается и выводит изображение через DirectX 12 (на сервере без
+      # видеокарты — программный адаптер Microsoft), затем закрывается само.
+      - name: GUI smoke test (DirectX 12)
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'graphics.txt'
+          $env:PROXY_SCANNER_GRAPHICS_REPORT = $report
+          $p = Start-Process "target/${{ env.TARGET }}/release/proxy-scanner.exe" -PassThru -WorkingDirectory $env:RUNNER_TEMP
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'GUI did not close by itself' }
+          if (-not (Test-Path $report)) { throw 'no graphics report' }
+          $g = Get-Content $report -Raw
+          "graphics: $g"
+          if ($g -notmatch 'Dx12') { throw "expected DirectX 12, got: $g" }
+
       # Скрипт запуска в режиме проверки под Windows PowerShell 5.1
       # (программа не запускается, проверяется разбор аргументов и проверки окружения).
       - name: Launcher script (check mode)

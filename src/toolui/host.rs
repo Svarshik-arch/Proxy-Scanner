@@ -1,6 +1,7 @@
 use egui::RichText;
 
 use super::{Env, GREEN, Nav, Tool};
+use super::UiNz;
 use crate::tools::hostinfo::{self, Report};
 
 #[derive(Default)]
@@ -77,11 +78,13 @@ impl Panel {
                             continue;
                         }
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(&i.name).strong().color(if i.up { GREEN } else { super::AMBER }));
-                            ui.weak(&i.description);
-                            ui.monospace(&i.mac);
+                            if !i.name.is_empty() {
+                                ui.label(RichText::new(&i.name).strong().color(if i.up { GREEN } else { super::AMBER }));
+                            }
+                            ui.weak_nz(&i.description);
+                            ui.mono_nz(&i.mac);
                             if let Some(v) = &i.vendor {
-                                ui.weak(v);
+                                ui.weak_nz(v);
                             }
                             if let Some(m) = i.mtu {
                                 ui.label(format!("MTU {m}"));

@@ -1,6 +1,7 @@
 use egui::RichText;
 
 use super::{AMBER, Env, GREEN, RED, Tool};
+use super::UiNz;
 use crate::tools::Task;
 use crate::tools::mtr::{self, Config, Event, Mode, Report};
 
@@ -124,7 +125,7 @@ impl Panel {
             if let Some(a) = r.address {
                 ui.monospace(a.to_string());
             }
-            ui.weak(&r.method);
+            ui.weak_nz(&r.method);
             ui.label(format!("циклов: {}", r.cycles));
             if self.task.is_some() {
                 ui.spinner();
@@ -139,7 +140,7 @@ impl Panel {
                     None => ui.colored_label(RED, "не определён"),
                 };
                 if let Some(n) = &p.note {
-                    ui.weak(n);
+                    ui.weak_nz(n);
                 }
             })
             .response

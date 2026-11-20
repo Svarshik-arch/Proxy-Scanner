@@ -42,6 +42,23 @@ const RED: Color32 = Color32::from_rgb(220, 70, 70);
 const AMBER: Color32 = Color32::from_rgb(215, 160, 40);
 
 /// Файл с выбранной графикой (читается до создания окна).
+/// Через что идёт вывод изображения: бэкенд и видеокарта (для журнала и проверки в CI).
+fn graphics_info(cc: &eframe::CreationContext<'_>) -> String {
+    if let Some(rs) = &cc.wgpu_render_state {
+        let i = rs.adapter.get_info();
+        return format!("wgpu {:?}, {} ({:?})", i.backend, i.name, i.device_type);
+    }
+    if let Some(gl) = &cc.gl {
+        use eframe::glow::HasContext;
+        // SAFETY: контекст OpenGL текущий в потоке создания окна.
+        let (renderer, version) = unsafe {
+            (gl.get_parameter_string(eframe::glow::RENDERER), gl.get_parameter_string(eframe::glow::VERSION))
+        };
+        return format!("OpenGL {version}, {renderer}");
+    }
+    "неизвестно".into()
+}
+
 fn renderer_file() -> std::path::PathBuf {
     session::default_path().with_file_name("proxy-scanner-graphics.txt")
 }
@@ -264,6 +281,7 @@ pub struct App {
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     log: Vec<String>,
+    close_after_first_frame: bool,
     show_log: bool,
     ifaces: Vec<IfaceEntry>,
     detect_busy: bool,
@@ -400,8 +418,16 @@ impl App {
             bench: Workbench::new(tool_prefs),
             local_cidr: None,
             last_context: None,
+            close_after_first_frame: false,
         };
         app.archive = session::list_archive(&app.session_path);
+        let graphics = graphics_info(cc);
+        app.push_log(format!("графика: {graphics}"));
+        // Проверка в CI: записать, через что идёт вывод, и закрыть окно после первого кадра.
+        if let Ok(path) = std::env::var("PROXY_SCANNER_GRAPHICS_REPORT") {
+            let _ = std::fs::write(path, &graphics);
+            app.close_after_first_frame = true;
+        }
         // Незавершённая сессия рядом с программой (в том числе перенесённая с другого ПК).
         if app.session_path.is_file() {
             match session::load(&app.session_path) {
@@ -1832,9 +1858,14 @@ impl App {
                         ui.close();
                     }
                 };
-                pick(ui, None, "Автоматически", "DirectX 12 / Vulkan на экономичной видеокарте, при ошибке — OpenGL");
-                pick(ui, Some("glow"), "OpenGL", "Если экран мигает или гаснет — выберите этот вариант");
-                pick(ui, Some("wgpu"), "Только DirectX 12 / Vulkan", "");
+                if cfg!(windows) {
+                    pick(ui, None, "Автоматически (DirectX 12)", "DirectX 12, при ошибке — OpenGL");
+                    pick(ui, Some("glow"), "OpenGL", "Если экран мигает или гаснет — попробуйте этот вариант");
+                    pick(ui, Some("vulkan"), "Vulkan", "Только для проверки: на NVIDIA по DisplayPort возможно мигание");
+                } else {
+                    pick(ui, None, "Автоматически", "Vulkan, при ошибке — OpenGL");
+                    pick(ui, Some("glow"), "OpenGL", "");
+                }
                 ui.weak("Применяется после перезапуска");
             });
             ui.separator();
@@ -3667,6 +3698,9 @@ fn cell(ui: &mut egui::Ui, r: &ProxyRow, col: Col) {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.close_after_first_frame && ctx.cumulative_pass_nr() > 2 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.handle_events(ctx);
         if self.bench.poll() {
             self.dirty = true;
@@ -3689,15 +3723,6 @@ impl eframe::App for App {
         if self.busy() {
             // Таймер автосохранения не должен зависеть от активности пользователя.
             ctx.request_repaint_after(Duration::from_secs(1));
-        }
-        // NVIDIA G-Sync / FreeSync включают адаптивную частоту для активного окна.
-        // При отрисовке «по требованию» кадры идут неравномерно (пауза — всплеск
-        // при движении мыши), частота монитора скачет, и по DisplayPort он теряет
-        // синхронизацию и мигает. Пока окно активно, рисуем ровно, с вертикальной
-        // синхронизацией (каждый кадр — на обновление экрана).
-        #[cfg(windows)]
-        if ctx.input(|i| i.focused) {
-            ctx.request_repaint();
         }
     }
 

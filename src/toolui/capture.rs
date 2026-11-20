@@ -1,6 +1,7 @@
 use egui::RichText;
 
 use super::{AMBER, Env, GREEN, RED, Tool};
+use super::UiNz;
 use crate::tools::Task;
 use crate::tools::capture::{self, Config, Device, Event, Packet, Raw, Summary};
 
@@ -213,16 +214,16 @@ impl Panel {
                     ui.label(RichText::new(format!("{} {}", n.protocol, n.device)).strong());
                     ui.label(format!("порт {}", n.port));
                     if !n.port_description.is_empty() {
-                        ui.weak(&n.port_description);
+                        ui.weak_nz(&n.port_description);
                     }
                     if !n.vlan.is_empty() {
                         ui.colored_label(GREEN, format!("VLAN {}", n.vlan));
                     }
                     if !n.mgmt.is_empty() {
-                        ui.monospace(&n.mgmt);
+                        ui.mono_nz(&n.mgmt);
                     }
                     if !n.platform.is_empty() {
-                        ui.weak(&n.platform);
+                        ui.weak_nz(&n.platform);
                     }
                 });
             }
@@ -236,7 +237,7 @@ impl Panel {
             for d in &s.dhcp {
                 ui.horizontal_wrapped(|ui| {
                     ui.monospace(&d.ip).context_menu(|ui| super::send_menu(ui, &d.ip, nav, Tool::Capture));
-                    ui.weak(&d.mac);
+                    ui.weak_nz(&d.mac);
                     ui.label(format!("шлюз {} · DNS {} · выдал {}", d.router, d.dns, d.offered));
                 });
             }

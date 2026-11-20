@@ -94,7 +94,9 @@ impl Panel {
             let high = r.findings.iter().any(|f| f.severity == Severity::High);
             ui.horizontal_wrapped(|ui| {
                 ui.heading(&r.domain);
-                ui.label(RichText::new(&r.verdict).strong().color(if r.dcs.is_empty() || high { RED } else { GREEN }));
+                if !r.verdict.is_empty() {
+                    ui.label(RichText::new(&r.verdict).strong().color(if r.dcs.is_empty() || high { RED } else { GREEN }));
+                }
                 super::export_buttons(ui, env, "ad", r, ad::render_text);
             });
             ui.weak(format!("область Kerberos {} · DNS: {}", r.realm, r.dns_servers.join(", ")));

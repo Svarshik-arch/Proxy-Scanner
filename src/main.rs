@@ -10,7 +10,7 @@ use proxy_scanner::{app, cli};
 
 use eframe::Renderer;
 
-fn run(renderer: Renderer) -> eframe::Result {
+fn run(renderer: Renderer, backends: Option<eframe::wgpu::Backends>) -> eframe::Result {
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Proxy Scanner — инвентаризация прокси-серверов")
@@ -27,6 +27,9 @@ fn run(renderer: Renderer) -> eframe::Result {
     // и ПК с двумя видеокартами переключает вывод между ними — монитор гаснет и мигает.
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut options.wgpu_options.wgpu_setup {
         c.power_preference = eframe::wgpu::PowerPreference::LowPower;
+        if let Some(b) = backends {
+            c.instance_descriptor.backends = b;
+        }
     }
     eframe::run_native(
         "proxy-scanner",
@@ -47,8 +50,8 @@ fn main() {
     if let Some(code) = cli::dispatch_from_gui_binary() {
         std::process::exit(code);
     }
-    // Порядок графических бэкендов: по умолчанию wgpu (DirectX 12 / Vulkan),
-    // при неудаче — OpenGL. Можно задать явно: `--renderer glow` или `--renderer wgpu`.
+    // Порядок графических бэкендов: по умолчанию wgpu (в Windows — DirectX 12),
+    // при неудаче — OpenGL. Можно задать явно: `--renderer glow|dx12|vulkan|wgpu`.
     let args: Vec<String> = std::env::args().collect();
     let forced = args
         .iter()
@@ -57,15 +60,21 @@ fn main() {
         .map(|s| s.to_ascii_lowercase());
     // Выбор из меню «Вид → Графика» (сохраняется рядом с файлом сессии).
     let forced = forced.or_else(app::saved_renderer);
-    let order: Vec<Renderer> = match forced.as_deref() {
-        Some("glow") | Some("opengl") => vec![Renderer::Glow],
-        Some("wgpu") => vec![Renderer::Wgpu],
-        _ => vec![Renderer::Wgpu, Renderer::Glow],
+    use eframe::wgpu::Backends;
+    // В Windows по умолчанию — DirectX 12: так выводят изображение обычные программы
+    // Windows. Vulkan в окне на NVIDIA по DisplayPort вызывает мигание монитора.
+    let auto = if cfg!(windows) { Some(Backends::DX12) } else { None };
+    let order: Vec<(Renderer, Option<Backends>)> = match forced.as_deref() {
+        Some("glow") | Some("opengl") => vec![(Renderer::Glow, None)],
+        Some("dx12") => vec![(Renderer::Wgpu, Some(Backends::DX12)), (Renderer::Glow, None)],
+        Some("vulkan") => vec![(Renderer::Wgpu, Some(Backends::VULKAN))],
+        Some("wgpu") => vec![(Renderer::Wgpu, None)],
+        _ => vec![(Renderer::Wgpu, auto), (Renderer::Glow, None)],
     };
 
     let mut last_error = String::new();
-    for renderer in order {
-        match run(renderer) {
+    for (renderer, backends) in order {
+        match run(renderer, backends) {
             Ok(()) => return,
             Err(e) => last_error = format!("{renderer:?}: {e}"),
         }

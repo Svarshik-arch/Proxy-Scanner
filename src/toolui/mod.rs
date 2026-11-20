@@ -1144,3 +1144,31 @@ pub fn mono_block(ui: &mut egui::Ui, id: &str, text: &str, max_height: f32) {
         );
     });
 }
+
+/// Подписи, которые пропускаются, если текст пустой.
+///
+/// В строке `horizontal_wrapped` пустая подпись возвращает курсор в начало
+/// строки, и следующие элементы рисуются поверх уже выведенных.
+pub trait UiNz {
+    fn weak_nz(&mut self, text: &str);
+    fn mono_nz(&mut self, text: &str);
+    fn label_nz(&mut self, text: &str);
+}
+
+impl UiNz for egui::Ui {
+    fn weak_nz(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.weak(text);
+        }
+    }
+    fn mono_nz(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.monospace(text);
+        }
+    }
+    fn label_nz(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.label(text);
+        }
+    }
+}

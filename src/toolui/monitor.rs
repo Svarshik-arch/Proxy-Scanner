@@ -1,5 +1,6 @@
 use super::{AMBER, Env, GREEN, RED, Tool};
 use crate::tools::Task;
+use super::UiNz;
 use crate::tools::monitor::{self, Config, Event, Report, Status};
 
 pub struct Panel {
@@ -221,11 +222,11 @@ impl Panel {
                 for ch in r.changes.iter().rev().take(300) {
                     ui.horizontal_wrapped(|ui| {
                         ui.weak(crate::session::format_time(ch.at));
-                        ui.monospace(&ch.line);
+                        ui.mono_nz(&ch.line);
                         ui.colored_label(status_color(ch.from, ui), ch.from.label());
                         ui.label("→");
                         ui.colored_label(status_color(ch.to, ui), ch.to.label());
-                        ui.weak(&ch.detail);
+                        ui.weak_nz(&ch.detail);
                     });
                 }
             });

@@ -1,6 +1,7 @@
 use egui::RichText;
 
 use super::{AMBER, Env, GREEN, RED, Tool};
+use super::UiNz;
 use crate::tools::Task;
 use crate::tools::tlsaudit::{self, Config, Event, Report, Severity, Strength};
 
@@ -179,13 +180,15 @@ impl Panel {
         egui::ScrollArea::vertical().id_salt("tls_detail").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading(format!("{}:{}", t.host, t.port));
-                ui.label(RichText::new(&t.grade).heading().color(grade_color(&t.grade)));
+                if !t.grade.is_empty() {
+                    ui.label(RichText::new(&t.grade).heading().color(grade_color(&t.grade)));
+                }
                 ui.monospace(&t.address);
                 if let Some(s) = &t.sni {
                     ui.weak(format!("SNI {s}"));
                 }
                 if !t.negotiated.is_empty() {
-                    ui.weak(&t.negotiated);
+                    ui.weak_nz(&t.negotiated);
                 }
             });
             for f in &t.findings {
