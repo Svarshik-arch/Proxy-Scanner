@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
 use super::icmp::{self, Probe, Proto, ReplyKind};
@@ -321,7 +321,7 @@ async fn arp_one(ip: Ipv4Addr) -> Option<String> {
 
 async fn tcp_alive(ip: Ipv4Addr, port: u16, timeout: Duration) -> Option<(bool, f64)> {
     let started = Instant::now();
-    match tokio::time::timeout(timeout, TcpStream::connect((ip, port))).await {
+    match tokio::time::timeout(timeout, super::connect_fast(SocketAddr::from((ip, port)))).await {
         Ok(Ok(_)) => Some((true, super::ms_f(started.elapsed()))),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => Some((false, super::ms_f(started.elapsed()))),
         _ => None,

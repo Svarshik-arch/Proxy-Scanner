@@ -545,7 +545,7 @@ async fn smb_signing(ip: IpAddr, timeout: Duration) -> Option<(String, bool)> {
 
 async fn port_check(ip: IpAddr, port: u16, purpose: &str, required: bool, timeout: Duration) -> PortCheck {
     let started = Instant::now();
-    let r = tokio::time::timeout(timeout, TcpStream::connect((ip, port))).await;
+    let r = tokio::time::timeout(timeout, super::connect_fast(SocketAddr::new(ip, port))).await;
     let (open, error) = match r {
         Ok(Ok(_)) => (true, None),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => (false, Some("отказ (RST)".to_string())),

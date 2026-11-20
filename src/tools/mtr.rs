@@ -270,7 +270,7 @@ pub async fn path_mtu(dst: Ipv4Addr, mode: Mode, port: u16, timeout: Duration, c
 
 async fn tcp_ping(addr: SocketAddr, timeout: Duration) -> Result<Option<f64>, String> {
     let started = Instant::now();
-    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+    match tokio::time::timeout(timeout, super::connect_fast(addr)).await {
         Ok(Ok(_)) => Ok(Some(super::ms_f(started.elapsed()))),
         // RST — узел ответил, время тоже показательно.
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(Some(super::ms_f(started.elapsed()))),

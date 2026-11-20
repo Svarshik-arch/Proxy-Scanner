@@ -113,6 +113,40 @@ impl<E> Drop for Task<E> {
     }
 }
 
+/// TCP-подключение, при котором отказ (RST) виден сразу.
+///
+/// Windows по умолчанию повторяет SYN после RST около двух секунд, и закрытый порт
+/// выглядит как «нет ответа». Здесь повторы SYN отключаются (SIO_TCP_INITIAL_RTO);
+/// повторы при потерях делают сами инструменты.
+pub async fn connect_fast(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    let sock = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{SIO_TCP_INITIAL_RTO, TCP_INITIAL_RTO_PARAMETERS, WSAIoctl};
+        let params = TCP_INITIAL_RTO_PARAMETERS {
+            Rtt: u16::MAX,
+            MaxSynRetransmissions: 0xFE,
+        };
+        let mut returned = 0u32;
+        // SAFETY: корректный сокет и структура параметров; ошибка не критична.
+        unsafe {
+            WSAIoctl(
+                sock.as_raw_socket() as usize,
+                SIO_TCP_INITIAL_RTO,
+                (&params as *const TCP_INITIAL_RTO_PARAMETERS).cast(),
+                std::mem::size_of::<TCP_INITIAL_RTO_PARAMETERS>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            );
+        }
+    }
+    sock.connect(addr).await
+}
+
 /// Миллисекунды с дробной частью.
 pub fn ms_f(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -266,6 +300,17 @@ mod tests {
         assert_eq!(printable(b"SSH-2.0-OpenSSH_9.6\r\n", 100), "SSH-2.0-OpenSSH_9.6");
         assert_eq!(printable(b"a\x01b\nc", 100), "a·b⏎ c");
         assert_eq!(printable(b"abcdef", 3), "abc…");
+    }
+
+    /// Отказ в подключении должен быть виден сразу (в Windows — без повторов SYN).
+    #[tokio::test]
+    async fn refused_is_fast() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(5), connect_fast(SocketAddr::from(([127, 0, 0, 1], port)))).await;
+        let e = r.expect("нет ответа").expect_err("порт должен быть закрыт");
+        assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(started.elapsed() < Duration::from_millis(1000), "отказ за {:?}", started.elapsed());
     }
 
     #[tokio::test]

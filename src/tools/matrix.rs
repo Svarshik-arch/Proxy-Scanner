@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use super::Sink;
@@ -173,7 +172,7 @@ pub fn parse(text: &str) -> Result<Vec<Rule>, String> {
 
 async fn probe(addr: SocketAddr, timeout: Duration) -> (State, Option<String>, Option<f64>, String) {
     let started = Instant::now();
-    match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+    match tokio::time::timeout(timeout, super::connect_fast(addr)).await {
         Ok(Ok(mut s)) => {
             let rtt = super::ms_f(started.elapsed());
             let mut buf = [0u8; 256];
@@ -349,6 +348,7 @@ mod tests {
         let (sink, rx) = Sink::new(None);
         let cfg = Config {
             rules: format!("127.0.0.1:{port} open\n127.0.0.1:1 open"),
+            timeout_ms: 6000,
             ..Default::default()
         };
         run(cfg, sink, CancellationToken::new()).await;
