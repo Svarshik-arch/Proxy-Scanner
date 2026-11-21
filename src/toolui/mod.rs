@@ -6,21 +6,28 @@ mod audit;
 mod capture;
 mod certs;
 mod compare;
+mod configs;
 mod discovery;
+mod flows;
+mod devices;
+pub use devices::{Event as DevEvent, run_many};
 mod dns;
 mod host;
 mod http;
+mod ifmon;
 mod ipam;
 mod map;
 mod matrix;
 mod monitor;
 mod mtr;
 mod playbooks;
+mod servers;
 mod services;
 mod shares;
 mod sitecheck;
 mod switches;
 mod threats;
+mod terminal;
 mod tls;
 mod urlcheck;
 mod watch;
@@ -63,10 +70,18 @@ pub enum Tool {
     Playbooks,
     Overview,
     Ipam,
+    Terminal,
+    Commands,
+    Configs,
+    Interfaces,
+    Topology,
+    Servers,
+    Flows,
+    Speed,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 24] = [
+    pub const ALL: [Tool; 32] = [
         Tool::Host,
         Tool::Mtr,
         Tool::Discovery,
@@ -91,6 +106,14 @@ impl Tool {
         Tool::Playbooks,
         Tool::Overview,
         Tool::Ipam,
+        Tool::Terminal,
+        Tool::Commands,
+        Tool::Configs,
+        Tool::Interfaces,
+        Tool::Topology,
+        Tool::Servers,
+        Tool::Flows,
+        Tool::Speed,
     ];
 
     pub fn title(self) -> &'static str {
@@ -119,6 +142,14 @@ impl Tool {
             Tool::Playbooks => "Сценарии",
             Tool::Overview => "Обзор",
             Tool::Ipam => "Адреса",
+            Tool::Terminal => "Терминал",
+            Tool::Commands => "Команды",
+            Tool::Configs => "Конфигурации",
+            Tool::Interfaces => "Интерфейсы",
+            Tool::Topology => "Топология",
+            Tool::Servers => "Серверы",
+            Tool::Flows => "NetFlow",
+            Tool::Speed => "Скорость",
         }
     }
 
@@ -148,6 +179,14 @@ impl Tool {
             Tool::Playbooks => "Последовательность проверок одной кнопкой: приёмка сегмента, домен, аудит",
             Tool::Overview => "Состояние сети одним экраном: тревоги, сбои, угрозы, сертификаты",
             Tool::Ipam => "Учёт адресов: занято и свободно, давно не появлялись, расхождения DNS, конфликты",
+            Tool::Terminal => "SSH, Telnet и COM-порт: список устройств, пароли в хранилище, команды производителя, вывод таблицей",
+            Tool::Commands => "Команда сразу на группу устройств: кто ответил иначе, общая таблица по всем",
+            Tool::Configs => "Резервные копии конфигураций: история, что изменилось, проверка на типовые ошибки",
+            Tool::Interfaces => "SNMP: загрузка портов, ошибки, дуплекс, флапы — и что с этим делать",
+            Tool::Topology => "Схема L2 по LLDP и CDP: кто в какой порт подключён, с обходом соседей",
+            Tool::Servers => "TFTP и HTTP для прошивок и конфигураций, приём Syslog и SNMP-уведомлений",
+            Tool::Flows => "Коллектор NetFlow v5/v9, IPFIX и sFlow: кто, с кем и каким приложением занимает канал",
+            Tool::Speed => "Замер скорости между двумя машинами: TCP в несколько потоков, UDP с потерями и джиттером",
         }
     }
 
@@ -177,6 +216,14 @@ impl Tool {
             Tool::Playbooks => "playbooks",
             Tool::Overview => "overview",
             Tool::Ipam => "ipam",
+            Tool::Terminal => "terminal",
+            Tool::Commands => "commands",
+            Tool::Configs => "configs",
+            Tool::Interfaces => "interfaces",
+            Tool::Topology => "topology",
+            Tool::Servers => "servers",
+            Tool::Flows => "flows",
+            Tool::Speed => "speed",
         }
     }
 }
@@ -364,6 +411,11 @@ pub struct Prefs {
     pub watch: crate::tools::watch::Config,
     pub snmp: crate::tools::snmp::Config,
     pub ipam: crate::tools::ipam::Config,
+    pub interfaces: crate::tools::ifmon::Config,
+    pub topology: crate::tools::ifmon::TopoConfig,
+    pub servers: crate::tools::servers::Config,
+    pub flows: crate::tools::flows::Config,
+    pub speed: crate::tools::speed::Config,
 }
 
 /// Результаты инструментов для файла сессии.
@@ -422,6 +474,14 @@ pub struct Workbench {
     switches: switches::Panel,
     playbooks: playbooks::Panel,
     ipam: ipam::Panel,
+    devices: devices::Panel,
+    commands: devices::Commands,
+    configs: configs::Panel,
+    ifmon: ifmon::Panel,
+    topo: ifmon::Topo,
+    servers: servers::Panel,
+    flows: flows::Panel,
+    speed: flows::Speed,
     notes: std::collections::BTreeMap<String, crate::hostcard::HostNote>,
     /// Открытые карточки узлов.
     cards: Vec<crate::hostcard::Card>,
@@ -481,6 +541,14 @@ impl Workbench {
             switches: switches::Panel::new(prefs.snmp),
             playbooks: playbooks::Panel::default(),
             ipam: ipam::Panel::new(prefs.ipam),
+            devices: Default::default(),
+            commands: Default::default(),
+            configs: Default::default(),
+            ifmon: ifmon::Panel::new(prefs.interfaces),
+            topo: ifmon::Topo::new(prefs.topology),
+            servers: servers::Panel::new(prefs.servers),
+            flows: flows::Panel::new(prefs.flows),
+            speed: flows::Speed::new(prefs.speed),
             notes: Default::default(),
             cards: Vec::new(),
             card_nav: None,
@@ -532,6 +600,11 @@ impl Workbench {
             watch: self.watch.cfg.clone(),
             snmp: self.switches.cfg.clone(),
             ipam: self.ipam.cfg.clone(),
+            interfaces: self.ifmon.cfg.clone(),
+            topology: self.topo.cfg.clone(),
+            servers: self.servers.cfg.clone(),
+            flows: self.flows.cfg.clone(),
+            speed: self.speed.cfg.clone(),
         }
     }
 
@@ -676,6 +749,14 @@ impl Workbench {
         changed |= self.watch.poll();
         changed |= self.switches.poll();
         changed |= self.ipam.poll();
+        changed |= self.devices.poll();
+        changed |= self.commands.poll();
+        changed |= self.configs.poll();
+        changed |= self.ifmon.poll();
+        changed |= self.topo.poll();
+        changed |= self.servers.poll();
+        changed |= self.flows.poll();
+        changed |= self.speed.poll();
         if let Some(t) = &self.update_task {
             let ev = t.drain();
             let fin = t.finished();
@@ -703,6 +784,24 @@ impl Workbench {
             }
         }
         changed
+    }
+
+    /// Узлы с открытыми SSH/Telnet из сканирования и «Узлов»: (адрес, имя, порт).
+    fn remote_hosts(discovery: &discovery::Panel, known: &[crate::devices::Device], scan: &ScanInfo) -> Vec<(String, String, u16)> {
+        let mut v: Vec<(String, String, u16)> = Vec::new();
+        let name_of = |ip: std::net::Ipv4Addr| discovery.report.hosts.iter().find(|h| h.ip == ip).map(|h| h.best_name()).unwrap_or_default();
+        for h in &discovery.report.hosts {
+            if let Some(p) = [22u16, 23].into_iter().find(|p| h.open_ports.contains(p)) {
+                v.push((h.ip.to_string(), h.best_name(), p));
+            }
+        }
+        for f in scan.found.iter().filter(|f| f.port == 22 || f.port == 23) {
+            if !v.iter().any(|x| x.0 == f.ip.to_string()) {
+                v.push((f.ip.to_string(), name_of(f.ip), f.port));
+            }
+        }
+        v.retain(|x| !known.iter().any(|d| d.host == x.0));
+        v
     }
 
     /// Мониторинг зафиксировал сбой (один раз).
@@ -733,6 +832,14 @@ impl Workbench {
             Tool::Switches => self.switches.busy(),
             Tool::Playbooks => self.playbooks.busy(),
             Tool::Ipam => self.ipam.busy(),
+            Tool::Terminal => self.devices.busy(),
+            Tool::Commands => self.commands.busy(),
+            Tool::Configs => self.configs.busy(),
+            Tool::Interfaces => self.ifmon.busy(),
+            Tool::Topology => self.topo.busy(),
+            Tool::Servers => self.servers.busy(),
+            Tool::Flows => self.flows.busy(),
+            Tool::Speed => self.speed.busy(),
         }
     }
 
@@ -808,6 +915,26 @@ impl Workbench {
                 self.watch.report.changes.len()
             }
             Tool::Switches => self.switches.report.switches.iter().map(|s| s.entries.len()).sum(),
+            Tool::Terminal => self.devices.open_sessions(),
+            Tool::Commands => self.commands.done(),
+            Tool::Interfaces => {
+                let p = self.ifmon.problems();
+                return (p > 0).then(|| format!("⚠{p}"));
+            }
+            Tool::Topology => self.topo.count(),
+            Tool::Flows => self.flows.count(),
+            Tool::Speed => return self.speed.best(),
+            Tool::Servers => {
+                let a = self.servers.alarms();
+                if a > 0 {
+                    return Some(format!("⚠{a}"));
+                }
+                self.servers.log.len()
+            }
+            Tool::Configs => {
+                let p = self.configs.problems();
+                return (p > 0).then(|| format!("⚠{p}"));
+            }
             Tool::Playbooks | Tool::Overview | Tool::Ipam => return None,
         };
         (n > 0).then(|| n.to_string())
@@ -895,6 +1022,20 @@ impl Workbench {
                 let known = self.current.as_ref().map(crate::tools::ipam::known_hosts).unwrap_or_default();
                 self.ipam.settings_ui(ui, &mut env, &known)
             }
+            Tool::Terminal => {
+                let found = Self::remote_hosts(&self.discovery, &self.devices.list, &env.scan);
+                self.devices.settings_ui(ui, &mut env, &found)
+            }
+            Tool::Commands => self.commands.settings_ui(ui, &mut env, &self.devices.list),
+            Tool::Configs => self.configs.settings_ui(ui, &mut env, &self.devices.list),
+            Tool::Interfaces => self.ifmon.settings_ui(ui, &mut env, &self.devices.list),
+            Tool::Servers => self.servers.settings_ui(ui, &mut env),
+            Tool::Flows => self.flows.settings_ui(ui, &mut env),
+            Tool::Speed => self.speed.settings_ui(ui, &mut env),
+            Tool::Topology => {
+                let gw: Vec<String> = self.host.report.iter().flat_map(|r| r.interfaces.iter()).flat_map(|i| i.gateways.iter().cloned()).filter(|g| g.parse::<std::net::Ipv4Addr>().is_ok_and(|a| !a.is_unspecified())).collect();
+                self.topo.settings_ui(ui, &mut env, &self.devices.list, &gw)
+            }
         }
         nav
     }
@@ -957,6 +1098,14 @@ impl Workbench {
                 let known = self.current.as_ref().map(crate::tools::ipam::known_hosts).unwrap_or_default();
                 self.ipam.results_ui(ui, &mut env, &known, &self.notes)
             }
+            Tool::Terminal => self.devices.results_ui(ui, &mut env),
+            Tool::Commands => self.commands.results_ui(ui),
+            Tool::Configs => self.configs.results_ui(ui, &mut env, &self.devices.list),
+            Tool::Interfaces => self.ifmon.results_ui(ui),
+            Tool::Topology => self.topo.results_ui(ui),
+            Tool::Servers => self.servers.results_ui(ui),
+            Tool::Flows => self.flows.results_ui(ui),
+            Tool::Speed => self.speed.results_ui(ui),
         }
         nav
     }
@@ -998,6 +1147,12 @@ impl Workbench {
             Tool::Watch => presets::apply(&mut self.watch.cfg, &p.values),
             Tool::Switches => presets::apply(&mut self.switches.cfg, &p.values),
             Tool::Ipam => presets::apply(&mut self.ipam.cfg, &p.values),
+            Tool::Terminal | Tool::Commands | Tool::Configs => Ok(()),
+            Tool::Interfaces => presets::apply(&mut self.ifmon.cfg, &p.values),
+            Tool::Topology => presets::apply(&mut self.topo.cfg, &p.values),
+            Tool::Servers => presets::apply(&mut self.servers.cfg, &p.values),
+            Tool::Flows => presets::apply(&mut self.flows.cfg, &p.values),
+            Tool::Speed => presets::apply(&mut self.speed.cfg, &p.values),
             Tool::UrlCheck => presets::apply(&mut self.urlcheck.cfg, &p.values),
             Tool::Shares => presets::apply(&mut self.shares.cfg, &p.values),
         };
@@ -1349,6 +1504,10 @@ impl Workbench {
             Tool::Watch => self.watch.cfg.targets = host.split(':').next().unwrap_or(host).to_string(),
             Tool::Switches => self.switches.cfg.switches = host.split(':').next().unwrap_or(host).to_string(),
             Tool::Ipam => {}
+            Tool::Terminal | Tool::Commands | Tool::Configs | Tool::Servers | Tool::Flows => {}
+            Tool::Speed => self.speed.cfg.server = host.split(':').next().unwrap_or(host).to_string(),
+            Tool::Interfaces => self.ifmon.cfg.targets = host.split(':').next().unwrap_or(host).to_string(),
+            Tool::Topology => self.topo.cfg.seeds = host.split(':').next().unwrap_or(host).to_string(),
             Tool::Capture => self.capture.cfg.filter = format!("host {}", host.split(':').next().unwrap_or(host)),
             Tool::Shares => self.shares.cfg.targets = host.split(':').next().unwrap_or(host).to_string(),
             Tool::UrlCheck => {

@@ -154,13 +154,14 @@ enum Group {
     Threats,
     Map,
     Scenarios,
+    Devices,
 }
 
 impl Group {
     fn all(mode: Mode) -> &'static [Group] {
         match mode {
-            Mode::Scanner => &[Group::Proxy, Group::Network, Group::Services, Group::Audit, Group::Diagnose],
-            Mode::Control => &[Group::Overview, Group::Watch, Group::Monitor, Group::Threats, Group::Map, Group::Scenarios],
+            Mode::Scanner => &[Group::Proxy, Group::Network, Group::Services, Group::Devices, Group::Audit, Group::Diagnose],
+            Mode::Control => &[Group::Overview, Group::Watch, Group::Monitor, Group::Threats, Group::Map, Group::Devices, Group::Scenarios],
         }
     }
 
@@ -177,6 +178,7 @@ impl Group {
             Group::Threats => "Угрозы",
             Group::Map => "Карта",
             Group::Scenarios => "Сценарии",
+            Group::Devices => "Устройства",
         }
     }
 
@@ -190,9 +192,10 @@ impl Group {
             Group::Overview => Tool::Overview.hint(),
             Group::Watch => "Изменения в сети по расписанию и сравнение с прошлыми проверками",
             Group::Monitor => "Проверки по расписанию и сроки сертификатов",
-            Group::Threats => "Атаки и посторонние устройства в сегменте; захват трафика",
+            Group::Threats => "Атаки и посторонние устройства в сегменте; захват трафика; NetFlow и sFlow",
             Group::Map => "Живая карта сети и коммутаторы",
             Group::Scenarios => Tool::Playbooks.hint(),
+            Group::Devices => "Коммутаторы и маршрутизаторы: терминал SSH/Telnet/COM, команды на много устройств, резервные копии конфигураций",
         }
     }
 
@@ -208,6 +211,7 @@ impl Group {
                 Section::Tool(Tool::Map),
                 Section::Tool(Tool::Switches),
                 Section::Tool(Tool::Ipam),
+                Section::Tool(Tool::Speed),
             ],
             Group::Services => &[
                 Section::Tool(Tool::Dns),
@@ -221,10 +225,11 @@ impl Group {
             Group::Diagnose => &[Section::Tool(Tool::SiteCheck), Section::Tool(Tool::Playbooks)],
             Group::Overview => &[Section::Tool(Tool::Overview)],
             Group::Watch => &[Section::Tool(Tool::Watch), Section::Tool(Tool::Ipam), Section::Tool(Tool::Compare)],
-            Group::Monitor => &[Section::Tool(Tool::Monitor), Section::Tool(Tool::Certs)],
-            Group::Threats => &[Section::Tool(Tool::Threats), Section::Tool(Tool::Capture)],
-            Group::Map => &[Section::Tool(Tool::Map), Section::Tool(Tool::Switches)],
+            Group::Monitor => &[Section::Tool(Tool::Monitor), Section::Tool(Tool::Interfaces), Section::Tool(Tool::Servers), Section::Tool(Tool::Certs)],
+            Group::Threats => &[Section::Tool(Tool::Threats), Section::Tool(Tool::Capture), Section::Tool(Tool::Flows)],
+            Group::Map => &[Section::Tool(Tool::Map), Section::Tool(Tool::Topology), Section::Tool(Tool::Switches)],
             Group::Scenarios => &[Section::Tool(Tool::Playbooks)],
+            Group::Devices => &[Section::Tool(Tool::Terminal), Section::Tool(Tool::Commands), Section::Tool(Tool::Configs), Section::Tool(Tool::Interfaces), Section::Tool(Tool::Topology), Section::Tool(Tool::Servers), Section::Tool(Tool::Flows)],
         }
     }
 

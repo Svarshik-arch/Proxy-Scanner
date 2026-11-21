@@ -113,7 +113,7 @@ struct Facts {
     proxies: Vec<(String, Outcome, String, Option<String>)>,
 }
 
-fn local_ip() -> String {
+pub fn local_ip() -> String {
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| {
             s.connect("192.0.2.1:9")?;

@@ -412,7 +412,7 @@ pub fn archive_dir(session_path: &Path) -> PathBuf {
 }
 
 /// Время для имени файла: `20261118-143005`.
-fn compact_time(unix: u64) -> String {
+pub fn compact_time(unix: u64) -> String {
     format_time(unix)
         .trim_end_matches(" UTC")
         .replace(['-', ':'], "")

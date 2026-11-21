@@ -114,7 +114,7 @@ pub fn parse_oid(s: &str) -> Vec<u32> {
     s.trim_start_matches('.').split('.').filter_map(|x| x.parse().ok()).collect()
 }
 
-fn encode_oid(oid: &[u32]) -> Vec<u8> {
+pub fn encode_oid(oid: &[u32]) -> Vec<u8> {
     let mut out = vec![(oid[0] * 40 + oid.get(1).copied().unwrap_or(0)) as u8];
     for &n in &oid[2.min(oid.len())..] {
         let mut stack = vec![(n & 0x7F) as u8];
@@ -248,11 +248,132 @@ pub fn parse_response(data: &[u8]) -> Option<(i64, i64, VarBinds)> {
     Some((decode_int(id), decode_int(err), out))
 }
 
+fn varbinds(mut vbl: &[u8]) -> Option<VarBinds> {
+    let mut out = Vec::new();
+    while !vbl.is_empty() {
+        let (_, vb, next) = read_tlv(vbl)?;
+        vbl = next;
+        let (_, oid, rest) = read_tlv(vb)?;
+        let (t, val, _) = read_tlv(rest)?;
+        let v = match t {
+            0x02 | 0x41 | 0x42 | 0x43 | 0x46 => Value::Int(decode_int(val)),
+            0x04 => Value::Bytes(val.to_vec()),
+            0x06 => Value::Oid(decode_oid(val)),
+            0x40 if val.len() == 4 => Value::Ip(Ipv4Addr::new(val[0], val[1], val[2], val[3])),
+            0x80..=0x82 => Value::End,
+            _ => Value::Null,
+        };
+        out.push((decode_oid(oid), v));
+    }
+    Some(out)
+}
+
+/// Принятое уведомление SNMP (trap v1/v2c или inform).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trap {
+    pub version: i64,
+    pub community: String,
+    /// OID события (snmpTrapOID или enterprise.0.specific для v1).
+    pub trap_oid: Vec<u32>,
+    /// Адрес агента из v1-trap.
+    pub agent: Option<Ipv4Addr>,
+    pub vars: VarBinds,
+    /// Inform: нужен ответ.
+    pub inform: bool,
+    pub request_id: i64,
+}
+
+const SNMP_TRAP_OID: &str = "1.3.6.1.6.3.1.1.4.1.0";
+
+pub fn parse_trap(data: &[u8]) -> Option<Trap> {
+    let (_, msg, _) = read_tlv(data)?;
+    let (_, ver, rest) = read_tlv(msg)?;
+    let (_, comm, rest) = read_tlv(rest)?;
+    let (tag, pdu, _) = read_tlv(rest)?;
+    let community = String::from_utf8_lossy(comm).into_owned();
+    let version = decode_int(ver);
+    match tag {
+        0xA4 => {
+            let (_, ent, rest) = read_tlv(pdu)?;
+            let (_, agent, rest) = read_tlv(rest)?;
+            let (_, generic, rest) = read_tlv(rest)?;
+            let (_, specific, rest) = read_tlv(rest)?;
+            let (_, _, rest) = read_tlv(rest)?; // timestamp
+            let (_, vbl, _) = read_tlv(rest)?;
+            let g = decode_int(generic);
+            let trap_oid = if g == 6 {
+                let mut o = decode_oid(ent);
+                o.push(0);
+                o.push(decode_int(specific) as u32);
+                o
+            } else {
+                let mut o = parse_oid("1.3.6.1.6.3.1.1.5");
+                o.push(g as u32 + 1);
+                o
+            };
+            Some(Trap {
+                version,
+                community,
+                trap_oid,
+                agent: (agent.len() == 4).then(|| Ipv4Addr::new(agent[0], agent[1], agent[2], agent[3])),
+                vars: varbinds(vbl)?,
+                inform: false,
+                request_id: 0,
+            })
+        }
+        0xA7 | 0xA6 => {
+            let (_, id, rest) = read_tlv(pdu)?;
+            let (_, _, rest) = read_tlv(rest)?;
+            let (_, _, rest) = read_tlv(rest)?;
+            let (_, vbl, _) = read_tlv(rest)?;
+            let vars = varbinds(vbl)?;
+            let key = parse_oid(SNMP_TRAP_OID);
+            let trap_oid = vars.iter().find(|v| v.0 == key).and_then(|v| if let Value::Oid(o) = &v.1 { Some(o.clone()) } else { None }).unwrap_or_default();
+            Some(Trap { version, community, trap_oid, agent: None, vars, inform: tag == 0xA6, request_id: decode_int(id) })
+        }
+        _ => None,
+    }
+}
+
+/// Ответ на inform: тот же PDU с типом Response.
+pub fn inform_response(t: &Trap) -> Vec<u8> {
+    let mut vbl = Vec::new();
+    for (o, _) in &t.vars {
+        let mut vb = encode_oid(o);
+        vb.extend_from_slice(&[0x05, 0x00]);
+        vbl.extend(tlv(0x30, &vb));
+    }
+    let mut pdu = int(t.request_id);
+    pdu.extend(int(0));
+    pdu.extend(int(0));
+    pdu.extend(tlv(0x30, &vbl));
+    let mut msg = int(t.version);
+    msg.extend(tlv(0x04, t.community.as_bytes()));
+    msg.extend(tlv(0xA2, &pdu));
+    tlv(0x30, &msg)
+}
+
+/// Понятное название известных уведомлений.
+pub fn trap_name(oid: &[u32]) -> Option<&'static str> {
+    let s = oid.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(".");
+    Some(match s.as_str() {
+        "1.3.6.1.6.3.1.1.5.1" => "холодный старт (устройство включилось)",
+        "1.3.6.1.6.3.1.1.5.2" => "тёплый старт (перезагрузка агента)",
+        "1.3.6.1.6.3.1.1.5.3" => "линк упал (linkDown)",
+        "1.3.6.1.6.3.1.1.5.4" => "линк поднялся (linkUp)",
+        "1.3.6.1.6.3.1.1.5.5" => "неверный community (кто-то перебирает пароли SNMP)",
+        "1.3.6.1.4.1.9.9.43.2.0.1" => "конфигурация изменена (Cisco)",
+        "1.3.6.1.2.1.17.0.1" => "новый корень STP (newRoot)",
+        "1.3.6.1.2.1.17.0.2" => "смена топологии STP (topologyChange)",
+        _ => return None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Обход
 // ---------------------------------------------------------------------------
 
-struct Client {
+pub(crate) struct Client {
     sock: UdpSocket,
     community: String,
     timeout: Duration,
@@ -260,7 +381,7 @@ struct Client {
 }
 
 impl Client {
-    async fn new(addr: &str, community: &str, timeout: Duration) -> Result<Self, String> {
+    pub(crate) async fn new(addr: &str, community: &str, timeout: Duration) -> Result<Self, String> {
         let target = super::resolve_v4(addr, timeout).await?;
         let sock = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?;
         sock.connect((target, 161)).await.map_err(|e| e.to_string())?;
@@ -297,7 +418,7 @@ impl Client {
         Err("нет ответа (проверьте community и доступ по SNMP)".into())
     }
 
-    async fn get(&mut self, oid: &[u32]) -> Result<Value, String> {
+    pub(crate) async fn get(&mut self, oid: &[u32]) -> Result<Value, String> {
         self.id += 1;
         let id = self.id;
         let r = self.exchange(get(&self.community, id, oid), id).await?;
@@ -305,7 +426,7 @@ impl Client {
     }
 
     /// Обход поддерева: (суффикс OID после корня, значение).
-    async fn walk(&mut self, root: &[u32], limit: usize) -> Result<Vec<(Vec<u32>, Value)>, String> {
+    pub(crate) async fn walk(&mut self, root: &[u32], limit: usize) -> Result<Vec<(Vec<u32>, Value)>, String> {
         let mut out = Vec::new();
         let mut cur = root.to_vec();
         while out.len() < limit {

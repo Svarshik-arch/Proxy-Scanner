@@ -43,6 +43,12 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("calc", "", "калькулятор подсетей: calc 10.0.1.5/22 | calc 10.0.0.0/22 /24 | calc 10.0.0.5-10.0.0.70"),
     ("playbook", "", "сценарий: playbook файл.json|«имя встроенного» [-o отчёт.html]; playbook list"),
     ("scheduled", "", "прогон сценария по расписанию: scheduled [--config proxy-scanner-schedule.json] (история, сравнение, почта)"),
+    ("devices", "", "список устройств из proxy-scanner-devices.json"),
+    ("exec", "", "команды на устройства: exec УСТРОЙСТВА|--all \"show version\" [\"@interfaces\" …] (имя, адрес или группа)"),
+    ("configs", "", "резервные копии конфигураций: configs УСТРОЙСТВА|--all; configs audit файл.cfg"),
+    ("topology", "topology", "схема L2 по LLDP/CDP: topology 10.0.0.1 [--set community=…]"),
+    ("servers", "servers", "TFTP/Syslog/SNMP-трапы/HTTP: servers [--set http=true --set dir=папка] (Ctrl+C — стоп)"),
+    ("speed", "speed", "замер скорости: speed server | speed АДРЕС [--set streams=8 --set udp_mbps=50]"),
     ("update", "", "обновить базы через интернет: производители (IEEE), уязвимости, проверка новой версии"),
     ("listen", "", "слушатель для проверки доступа сюда: listen 443,1433"),
     ("certs", "", "сертификаты из файла сессии: certs сессия.json [-o certs.csv]"),
@@ -113,6 +119,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--json" => o.json = true,
             "-q" | "--quiet" => o.quiet = true,
             "--fields" => o.fields = true,
+            "--all" => o.positional.push("--all".into()),
             "--renderer" => {
                 let _ = it.next();
             }
@@ -343,6 +350,12 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "calc" => cmd_calc(&o),
         "playbook" => cmd_playbook(&o, &store),
         "scheduled" => cmd_scheduled(&o, &store),
+        "devices" => cmd_devices(),
+        "exec" => cmd_exec(&o),
+        "configs" => cmd_configs(&o),
+        "topology" => cmd_topology(&o, &store),
+        "servers" => cmd_servers(&o, &store),
+        "speed" => cmd_speed(&o, &store),
         "update" => cmd_update(&o),
         "listen" => cmd_listen(&o),
         "certs" => cmd_certs(&o),
@@ -970,6 +983,189 @@ fn cmd_scheduled(o: &Opts, store: &Store) -> Result<(), String> {
     })?;
     println!("{result}");
     if result.starts_with("ошибка") { Err(result) } else { Ok(()) }
+}
+
+/// Устройства по именам, адресам или группам; `--all` — все.
+fn pick_devices(o: &Opts, args: &[String]) -> Result<Vec<crate::devices::Device>, String> {
+    let all = crate::devices::load();
+    if all.is_empty() {
+        return Err(format!("устройств нет: добавьте их во вкладке «Терминал» ({})", crate::devices::store_path().display()));
+    }
+    if o.sets.iter().any(|(k, _)| k == "all") || args.iter().any(|a| a == "--all" || a == "all") {
+        return Ok(all);
+    }
+    let names: Vec<String> = args.iter().flat_map(|a| a.split(',')).map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+    let v: Vec<_> = all.into_iter().filter(|d| names.iter().any(|n| d.title().to_lowercase() == *n || d.host == *n || d.group.to_lowercase() == *n)).collect();
+    if v.is_empty() {
+        return Err("ни одно устройство не подошло (имя, адрес или группа; --all — все)".into());
+    }
+    Ok(v)
+}
+
+fn cmd_devices() -> Result<(), String> {
+    for d in crate::devices::load() {
+        println!("{:<24} {:<7} {:<22} {:<14} {}", d.title(), d.proto.label(), d.host, d.vendor.label(), d.group);
+    }
+    Ok(())
+}
+
+fn cmd_exec(o: &Opts) -> Result<(), String> {
+    let (devs, cmds): (Vec<String>, Vec<String>) = {
+        let mut d = Vec::new();
+        let mut c = Vec::new();
+        for (i, p) in o.positional.iter().enumerate() {
+            if i == 0 {
+                d.push(p.clone());
+            } else {
+                c.push(p.clone());
+            }
+        }
+        (d, c)
+    };
+    if cmds.is_empty() {
+        return Err("укажите команды: exec sw1,sw2 \"show version\"".into());
+    }
+    let list = pick_devices(o, &devs)?;
+    let mut results = Vec::new();
+    drive(o, |s, c| crate::toolui::run_many(list, cmds, 8, s, c), |e| results.push(e))?;
+    let mut failed = 0;
+    for crate::toolui::DevEvent::Done(d, r) in results {
+        match r {
+            Ok(s) => {
+                for (c, out) in s.outputs {
+                    println!("===== {d}: {c}\n{out}");
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                println!("===== {d}: ошибка: {e}");
+            }
+        }
+    }
+    if failed > 0 { Err(format!("не удалось на устройствах: {failed}")) } else { Ok(()) }
+}
+
+fn cmd_configs(o: &Opts) -> Result<(), String> {
+    use crate::tools::configs;
+    if o.positional.first().map(|s| s.as_str()) == Some("audit") {
+        let path = o.positional.get(1).ok_or("укажите файл: configs audit sw1.cfg")?;
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let f = configs::audit(&configs::normalize(&text), crate::devices::Vendor::Auto);
+        if f.is_empty() {
+            println!("типовых ошибок не найдено");
+        }
+        for x in f {
+            println!("[{}] {} — {}{}", x.level.label(), x.title, x.advice, x.line.map(|l| format!(" ({l})")).unwrap_or_default());
+        }
+        return Ok(());
+    }
+    let list = pick_devices(o, &o.positional)?;
+    let mut failed = 0;
+    let quiet = o.quiet;
+    drive(o, |s, c| configs::run(list, s, c), |e| match e {
+        configs::Event::Log(m) => eprint_line(quiet, &m),
+        configs::Event::Done(d, Ok((p, ch, f))) => match p {
+            Some(p) => println!("{d}: сохранено {} (+{} −{}), замечаний {f}", p.display(), ch.added, ch.removed),
+            None => println!("{d}: без изменений, замечаний {f}"),
+        },
+        configs::Event::Done(d, Err(e)) => {
+            failed += 1;
+            println!("{d}: ошибка: {e}");
+        }
+    })?;
+    if failed > 0 { Err(format!("не удалось на устройствах: {failed}")) } else { Ok(()) }
+}
+
+fn cmd_topology(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::ifmon;
+    if o.fields {
+        print!("{}", fields::<ifmon::TopoConfig>());
+        return Ok(());
+    }
+    let primary = if o.positional.is_empty() { json!({}) } else { json!({ "seeds": o.positional.join("\n") }) };
+    let cfg: ifmon::TopoConfig = configure("topology", o, store, primary)?;
+    let mut t = ifmon::Topology::default();
+    let quiet = o.quiet;
+    drive(o, |s, c| ifmon::discover(cfg, s, c), |e| match e {
+        ifmon::TopoEvent::Log(m) => eprint_line(quiet, &m),
+        ifmon::TopoEvent::Node(n, l) => {
+            t.nodes.push(n);
+            t.links.extend(l);
+        }
+    })?;
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&t).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    for n in &t.nodes {
+        match &n.error {
+            Some(e) => println!("{}: {e}", n.address),
+            None => println!("{} ({})", n.name, n.address),
+        }
+    }
+    for l in &t.links {
+        println!("  {} {} → {} {} {} [{}]", l.from, l.from_port, l.to, l.to_port, l.to_address.clone().unwrap_or_default(), l.via);
+    }
+    Ok(())
+}
+
+fn cmd_servers(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::servers;
+    if o.fields {
+        print!("{}", fields::<servers::Config>());
+        return Ok(());
+    }
+    let cfg: servers::Config = configure("servers", o, store, json!({}))?;
+    eprintln!("папка: {}. Ctrl+C — стоп.", cfg.dir);
+    drive(o, |s, c| servers::run(cfg, s, c), |e| match e {
+        servers::Event::Status(k, Ok(m)) => eprintln!("{}: {m}", k.label()),
+        servers::Event::Status(k, Err(m)) => eprintln!("{}: ошибка: {m}", k.label()),
+        servers::Event::Entry(e) => println!("{}\t{}\t{}\t{}\t{}", crate::session::format_time(e.at), e.kind.label(), e.from, servers::severity_label(e.severity), e.text),
+    })
+}
+
+fn cmd_speed(o: &Opts, store: &Store) -> Result<(), String> {
+    use crate::tools::speed;
+    if o.fields {
+        print!("{}", fields::<speed::Config>());
+        return Ok(());
+    }
+    let arg = o.positional.first().ok_or("speed server | speed АДРЕС")?;
+    let cfg: speed::Config = configure("speed", o, store, json!({ "server": arg }))?;
+    let quiet = o.quiet;
+    if arg == "server" {
+        eprintln!("сервер замера на {}:{} — Ctrl+C стоп", crate::tools::sitecheck::local_ip(), cfg.port);
+        let port = cfg.port;
+        return drive(o, move |s, c| speed::serve("0.0.0.0".into(), port, s, c), |e| match e {
+            speed::Event::Client(m) | speed::Event::Log(m) => eprint_line(quiet, &m),
+            speed::Event::Error(m) => eprintln!("ошибка: {m}"),
+            _ => {}
+        });
+    }
+    let mut best = 0.0f64;
+    let mut udp = None;
+    let mut err = None;
+    drive(o, |s, c| speed::run(cfg, s, c), |e| match e {
+        speed::Event::Log(m) => eprint_line(quiet, &m),
+        speed::Event::Point(_, t, v) => eprint_line(quiet, &format!("{t:5.1} с  {v:8.1} Мбит/с")),
+        speed::Event::Total(d, v) => {
+            best = best.max(v);
+            println!("{}: {v:.1} Мбит/с", if d == speed::Direction::Up { "отдача" } else { "загрузка" });
+        }
+        speed::Event::Udp(u) => {
+            println!("UDP: отправлено {}, дошло {}, потери {:.2}%, джиттер {:.2} мс", u.sent, u.received, u.lost_pct, u.jitter_ms);
+            udp = Some(u);
+        }
+        speed::Event::Error(m) => err = Some(m),
+        speed::Event::Client(_) => {}
+    })?;
+    if let Some(e) = err {
+        return Err(e);
+    }
+    for (ok, t) in speed::verdict(best, udp.as_ref()) {
+        println!("{} {t}", if ok { "✔" } else { "⚠" });
+    }
+    Ok(())
 }
 
 fn cmd_update(o: &Opts) -> Result<(), String> {
