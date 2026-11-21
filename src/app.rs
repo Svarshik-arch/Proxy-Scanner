@@ -317,6 +317,8 @@ struct ViewPrefs {
     mode_sections: Vec<(Mode, Section)>,
     /// Открытые вкладки проектов (пусто — «Основной»).
     open_projects: Vec<String>,
+    /// Обновлять базы через интернет автоматически (раз в неделю, если он есть).
+    auto_update: bool,
 }
 
 impl Default for ViewPrefs {
@@ -337,6 +339,7 @@ impl Default for ViewPrefs {
             mode: Mode::Scanner,
             mode_sections: Vec::new(),
             open_projects: Vec::new(),
+            auto_update: true,
         }
     }
 }
@@ -553,6 +556,11 @@ impl App {
         }
         // Автоопределение сетевых параметров при старте.
         app.start_detect(&cc.egui_ctx, false);
+        // Обновление баз, если пора и разрешено (молча, если интернета нет).
+        if app.view.auto_update && crate::updates::due() {
+            let handle = app.rt.handle().clone();
+            app.bench.start_update(&handle, &cc.egui_ctx, true);
+        }
         app
     }
 
@@ -1746,6 +1754,10 @@ impl App {
             }
             self.menu_profile(ui);
             self.menu_view(ui);
+            if let Some(b) = crate::updates::newer_build() {
+                ui.hyperlink_to(RichText::new(format!("⬆ сборка {b}")).color(GREEN), crate::updates::RELEASES_PAGE)
+                    .on_hover_text("Доступна новая версия — открыть страницу загрузки");
+            }
             if !narrow {
                 ui.weak("Ctrl+K — переход");
             }
@@ -2066,6 +2078,39 @@ impl App {
                 apply_view(ui.ctx(), &self.view);
             }
             ui.separator();
+            ui.menu_button("Базы данных", |ui| {
+                ui.set_min_width(320.0);
+                let meta = crate::updates::load_meta();
+                let when = |t: u64| if t == 0 { "встроенная".to_string() } else { format!("обновлена {}", session::format_time(t)) };
+                ui.label(format!("Производители сетевых карт: {} записей · {}", crate::tools::oui::entries(), when(meta.oui_at)));
+                let db = crate::tools::cve::db();
+                ui.label(format!("Уязвимости: версия {}, правил {} · {}", db.version, db.rules.len(), when(meta.cve_at)));
+                ui.label(match (crate::updates::current_build(), meta.latest_build) {
+                    (Some(c), Some(l)) if l > c => format!("Программа: сборка {c}, доступна {l}"),
+                    (Some(c), _) => format!("Программа: сборка {c}"),
+                    (None, _) => "Программа: собрана локально".into(),
+                });
+                if meta.checked_at > 0 {
+                    ui.weak(format!("Последняя проверка: {}", session::format_time(meta.checked_at)));
+                }
+                ui.separator();
+                ui.checkbox(&mut self.view.auto_update, "Обновлять автоматически, если есть интернет")
+                    .on_hover_text("Раз в неделю при запуске: реестр IEEE, база уязвимостей проекта, новая версия. Без интернета — молча пропускается. «Контур → Закрытый контур» выключает.");
+                let busy = self.bench.updating();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Обновить сейчас")).clicked() {
+                        let handle = self.rt.handle().clone();
+                        self.bench.start_update(&handle, ui.ctx(), false);
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+                if !self.bench.update_status.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(&self.bench.update_status).small()).wrap());
+                }
+                ui.weak("Обращения: standards-oui.ieee.org, raw.githubusercontent.com, api.github.com — напрямую или через системный прокси.");
+            });
             ui.menu_button("Графика", |ui| {
                 let current = saved_renderer();
                 let mut pick = |ui: &mut egui::Ui, value: Option<&str>, label: &str, hint: &str| {
@@ -2884,6 +2929,11 @@ impl App {
             res = crate::presets::apply(&mut self.settings, v);
         }
         let res = res.and_then(|_| self.bench.apply_common(p));
+        if p.name == "Закрытый контур" {
+            self.view.auto_update = false;
+        } else if p.name == "Открытый контур" {
+            self.view.auto_update = true;
+        }
         self.status = match res {
             Ok(()) => format!("Применён пресет «{}»", p.name),
             Err(e) => format!("Пресет «{}»: {e}", p.name),

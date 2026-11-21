@@ -427,6 +427,9 @@ pub struct Workbench {
     cards: Vec<crate::hostcard::Card>,
     /// Переход, запрошенный из карточки.
     card_nav: Option<Nav>,
+    /// Обновление баз через интернет.
+    update_task: Option<crate::tools::Task<crate::updates::Event>>,
+    pub update_status: String,
     /// Снимок текущей сессии и архив — для сертификатов и сравнения.
     current: Option<crate::session::Session>,
     archive: Vec<(String, std::path::PathBuf)>,
@@ -481,6 +484,8 @@ impl Workbench {
             notes: Default::default(),
             cards: Vec::new(),
             card_nav: None,
+            update_task: None,
+            update_status: String::new(),
             current: None,
             archive: Vec::new(),
             palette: Palette::default(),
@@ -671,6 +676,25 @@ impl Workbench {
         changed |= self.watch.poll();
         changed |= self.switches.poll();
         changed |= self.ipam.poll();
+        if let Some(t) = &self.update_task {
+            let ev = t.drain();
+            let fin = t.finished();
+            changed |= !ev.is_empty() || fin;
+            for e in ev {
+                match e {
+                    crate::updates::Event::Log(l) => self.update_status = l,
+                    crate::updates::Event::Done(d, _) => {
+                        if !d.is_empty() {
+                            self.message = Some(d.clone());
+                        }
+                        self.update_status = d;
+                    }
+                }
+            }
+            if fin {
+                self.update_task = None;
+            }
+        }
         if self.playbooks.poll() {
             changed = true;
             if let Some(r) = self.playbooks.finished.take() {
@@ -1103,6 +1127,19 @@ impl Workbench {
             });
         });
         open
+    }
+
+    /// Обновить базы через интернет (`quiet` — молча, если интернета нет).
+    pub fn start_update(&mut self, rt: &Handle, ctx: &egui::Context, quiet: bool) {
+        if self.update_task.is_some() {
+            return;
+        }
+        self.update_status = "проверка обновлений…".into();
+        self.update_task = Some(crate::tools::Task::spawn(rt, ctx, move |s, c| crate::updates::run(quiet, s, c)));
+    }
+
+    pub fn updating(&self) -> bool {
+        self.update_task.is_some()
     }
 
     /// Открыть карточку узла (по снимку сессии).

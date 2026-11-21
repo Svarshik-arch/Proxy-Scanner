@@ -43,70 +43,99 @@ fn after(text: &str, marker: &str) -> Option<String> {
     (!v.is_empty() && v.chars().next().is_some_and(|c| c.is_ascii_digit())).then_some(v)
 }
 
-struct Rule {
-    product: &'static str,
-    marker: &'static str,
-    /// Уязвимы версии `from <= v < to` (пустой `from` — с начала).
-    from: &'static str,
-    to: &'static str,
-    cve: &'static str,
-    severity: Severity,
-    title: &'static str,
+/// Правило базы: продукт по метке в тексте и уязвимые версии.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rule {
+    pub product: String,
+    pub marker: String,
+    /// `range` — `from <= v < to` (пустой `from` — с начала); `prefix` — версия начинается
+    /// с `from`; `letters` — `from` и `from` + буква до `to` включительно (OpenSSL 1.0.1–1.0.1f).
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    pub cve: String,
+    pub severity: Severity,
+    pub title: String,
+    /// Где исправлено (если не совпадает с `to`).
+    #[serde(default)]
+    pub fixed: String,
+    /// Дополнительное условие: `ajp` — только при открытом AJP.
+    #[serde(default)]
+    pub requires: String,
 }
 
-use Severity::*;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Db {
+    pub version: u32,
+    #[serde(default)]
+    pub updated: String,
+    pub rules: Vec<Rule>,
+}
 
-const RULES: &[Rule] = &[
-    Rule { product: "OpenSSH", marker: "OpenSSH", from: "8.5", to: "9.8", cve: "CVE-2024-6387", severity: High, title: "regreSSHion: удалённое выполнение кода в sshd (glibc)" },
-    Rule { product: "OpenSSH", marker: "OpenSSH", from: "", to: "4.4", cve: "CVE-2006-5051", severity: High, title: "гонка в обработчике сигналов sshd (предшественник regreSSHion)" },
-    Rule { product: "OpenSSH", marker: "OpenSSH", from: "", to: "9.6", cve: "CVE-2023-48795", severity: Medium, title: "Terrapin: обрезка префикса SSH-сессии" },
-    Rule { product: "OpenSSH", marker: "OpenSSH", from: "", to: "7.8", cve: "CVE-2018-15473", severity: Low, title: "перебор имён пользователей" },
-    Rule { product: "Apache httpd", marker: "Apache/", from: "2.4.49", to: "2.4.50", cve: "CVE-2021-41773", severity: High, title: "обход каталогов и выполнение кода (path traversal)" },
-    Rule { product: "Apache httpd", marker: "Apache/", from: "2.4.50", to: "2.4.51", cve: "CVE-2021-42013", severity: High, title: "обход каталогов и выполнение кода (неполное исправление 41773)" },
-    Rule { product: "Apache httpd", marker: "Apache/", from: "2.4.0", to: "2.4.56", cve: "CVE-2023-25690", severity: High, title: "HTTP request smuggling в mod_proxy" },
-    Rule { product: "nginx", marker: "nginx/", from: "0.6.18", to: "1.20.1", cve: "CVE-2021-23017", severity: High, title: "ошибка в DNS-резолвере (resolver), возможно выполнение кода" },
-    Rule { product: "OpenSSL", marker: "OpenSSL/", from: "1.0.1", to: "1.0.1.7", cve: "CVE-2014-0160", severity: High, title: "Heartbleed: утечка памяти сервера, ключей и паролей" },
-    Rule { product: "vsftpd", marker: "vsFTPd", from: "2.3.4", to: "2.3.5", cve: "CVE-2011-2523", severity: High, title: "закладка (backdoor) в vsftpd 2.3.4" },
-    Rule { product: "ProFTPD", marker: "ProFTPD", from: "1.3.5", to: "1.3.5.1", cve: "CVE-2015-3306", severity: High, title: "mod_copy: копирование файлов без входа" },
-    Rule { product: "Exim", marker: "Exim", from: "4.87", to: "4.92", cve: "CVE-2019-10149", severity: High, title: "удалённое выполнение команд (The Return of the WIZard)" },
-    Rule { product: "Samba", marker: "Samba", from: "3.5.0", to: "4.6.4", cve: "CVE-2017-7494", severity: High, title: "SambaCry: загрузка и выполнение библиотеки через общий ресурс" },
-    Rule { product: "Microsoft IIS", marker: "Microsoft-IIS/", from: "6.0", to: "6.1", cve: "CVE-2017-7269", severity: High, title: "переполнение буфера WebDAV в IIS 6.0" },
-    Rule { product: "PHP", marker: "PHP/", from: "8.1.0", to: "8.1.0.1", cve: "закладка 8.1.0-dev", severity: High, title: "закладка в PHP 8.1.0-dev (заголовок User-Agentt)" },
-    Rule { product: "Apache Tomcat", marker: "Apache Tomcat/", from: "9.0.0", to: "9.0.31", cve: "CVE-2020-1938", severity: High, title: "Ghostcat: чтение файлов через AJP (порт 8009)" },
-    Rule { product: "Apache Tomcat", marker: "Apache Tomcat/", from: "8.5.0", to: "8.5.51", cve: "CVE-2020-1938", severity: High, title: "Ghostcat: чтение файлов через AJP (порт 8009)" },
-    Rule { product: "Apache Tomcat", marker: "Apache Tomcat/", from: "7.0.0", to: "7.0.100", cve: "CVE-2020-1938", severity: High, title: "Ghostcat: чтение файлов через AJP (порт 8009)" },
-];
+/// База, встроенная в программу.
+pub const BUILTIN: &str = include_str!("../../data/cve.json");
 
-/// Особый случай: OpenSSL 1.0.1–1.0.1f — буква в конце версии.
-fn openssl_heartbleed(v: &str) -> bool {
-    let Some(rest) = v.strip_prefix("1.0.1") else { return false };
-    match rest.chars().next() {
-        None => true,
-        Some(c) => ('a'..='f').contains(&c),
+static DB: std::sync::RwLock<Option<std::sync::Arc<Db>>> = std::sync::RwLock::new(None);
+
+/// Текущая база: обновлённая (если новее встроенной), иначе встроенная.
+pub fn db() -> std::sync::Arc<Db> {
+    if let Some(d) = DB.read().ok().and_then(|g| g.clone()) {
+        return d;
+    }
+    let builtin: Db = serde_json::from_str(BUILTIN).expect("встроенная база уязвимостей");
+    let updated = std::fs::read_to_string(crate::updates::data_dir().join("cve.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Db>(&t).ok())
+        .filter(|d| d.version > builtin.version && !d.rules.is_empty());
+    let d = std::sync::Arc::new(updated.unwrap_or(builtin));
+    if let Ok(mut g) = DB.write() {
+        *g = Some(d.clone());
+    }
+    d
+}
+
+/// Перечитать базу (после обновления).
+pub fn reload() {
+    if let Ok(mut g) = DB.write() {
+        *g = None;
+    }
+    let _ = db();
+}
+
+fn rule_hit(r: &Rule, v: &str) -> bool {
+    match r.kind.as_str() {
+        "prefix" => v.starts_with(&r.from),
+        "letters" => {
+            let Some(rest) = v.strip_prefix(&r.from) else { return false };
+            let last = r.to.chars().next().unwrap_or('a');
+            match rest.chars().next() {
+                None => true,
+                Some(c) => c.is_ascii_lowercase() && c <= last && !rest[1..].starts_with(|x: char| x.is_ascii_alphanumeric()),
+            }
+        }
+        _ => {
+            let n = parse_version(v);
+            (r.from.is_empty() || !ver_lt(&n, &parse_version(&r.from))) && ver_lt(&n, &parse_version(&r.to))
+        }
     }
 }
 
 pub fn check_text(text: &str) -> Vec<Vuln> {
+    let db = db();
     let mut out: Vec<Vuln> = Vec::new();
-    for r in RULES {
-        let Some(v) = after(text, r.marker) else { continue };
-        let hit = if r.cve == "CVE-2014-0160" {
-            openssl_heartbleed(&v)
-        } else if r.product == "PHP" {
-            v.starts_with("8.1.0-dev")
-        } else {
-            let n = parse_version(&v);
-            (r.from.is_empty() || !ver_lt(&n, &parse_version(r.from))) && ver_lt(&n, &parse_version(r.to))
-        };
-        if hit && !out.iter().any(|x| x.cve == r.cve) {
+    for r in &db.rules {
+        let Some(v) = after(text, &r.marker) else { continue };
+        if rule_hit(r, &v) && !out.iter().any(|x| x.cve == r.cve) {
             out.push(Vuln {
-                cve: r.cve.into(),
-                product: r.product.into(),
+                cve: r.cve.clone(),
+                product: r.product.clone(),
                 version: v,
                 severity: r.severity,
-                title: r.title.into(),
-                // «1.3.5.1» — служебная граница для «только 1.3.5»: показываем «новее 1.3.5».
-                fixed: if r.to.matches('.').count() >= 3 { format!("новее {}", r.from) } else { r.to.into() },
+                title: r.title.clone(),
+                fixed: if r.fixed.is_empty() { r.to.clone() } else { r.fixed.clone() },
             });
         }
     }
@@ -117,8 +146,12 @@ pub fn check_text(text: &str) -> Vec<Vuln> {
 pub fn check(s: &Service) -> Vec<Vuln> {
     let text = format!("{} {} {}", s.version, s.banner, s.details.join(" "));
     let mut v = check_text(&text);
-    // Ghostcat опасен только при открытом AJP.
-    v.retain(|x| x.cve != "CVE-2020-1938" || s.port == 8009 || text.contains("AJP"));
+    // Правила с условием «ajp» (Ghostcat) — только при открытом AJP.
+    let db = db();
+    v.retain(|x| {
+        let needs_ajp = db.rules.iter().any(|r| r.cve == x.cve && r.requires == "ajp");
+        !needs_ajp || s.port == 8009 || text.contains("AJP")
+    });
     v
 }
 

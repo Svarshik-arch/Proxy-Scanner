@@ -124,7 +124,7 @@ fn local_ip() -> String {
 }
 
 /// Прокси, который система выбрала бы для адреса: (описание источника, `узел:порт` или пусто — напрямую).
-async fn system_proxy_for(url: &str, timeout: Duration) -> Result<Option<(String, String)>, String> {
+pub async fn system_proxy_for(url: &str, timeout: Duration) -> Result<Option<(String, String)>, String> {
     let info = tokio::task::spawn_blocking(crate::pac::system_info).await.map_err(|e| e.to_string())?;
     for s in &info.settings {
         if let Some(pac_url) = &s.pac_url {

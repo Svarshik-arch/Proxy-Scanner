@@ -43,6 +43,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("calc", "", "калькулятор подсетей: calc 10.0.1.5/22 | calc 10.0.0.0/22 /24 | calc 10.0.0.5-10.0.0.70"),
     ("playbook", "", "сценарий: playbook файл.json|«имя встроенного» [-o отчёт.html]; playbook list"),
     ("scheduled", "", "прогон сценария по расписанию: scheduled [--config proxy-scanner-schedule.json] (история, сравнение, почта)"),
+    ("update", "", "обновить базы через интернет: производители (IEEE), уязвимости, проверка новой версии"),
     ("listen", "", "слушатель для проверки доступа сюда: listen 443,1433"),
     ("certs", "", "сертификаты из файла сессии: certs сессия.json [-o certs.csv]"),
     ("compare", "", "сравнение сессий: compare было.json стало.json"),
@@ -342,6 +343,7 @@ pub fn run_args(args: Vec<String>) -> i32 {
         "calc" => cmd_calc(&o),
         "playbook" => cmd_playbook(&o, &store),
         "scheduled" => cmd_scheduled(&o, &store),
+        "update" => cmd_update(&o),
         "listen" => cmd_listen(&o),
         "certs" => cmd_certs(&o),
         "compare" => cmd_compare(&o),
@@ -968,6 +970,17 @@ fn cmd_scheduled(o: &Opts, store: &Store) -> Result<(), String> {
     })?;
     println!("{result}");
     if result.starts_with("ошибка") { Err(result) } else { Ok(()) }
+}
+
+fn cmd_update(o: &Opts) -> Result<(), String> {
+    let quiet = o.quiet;
+    let mut result = String::new();
+    drive(&Opts::default(), |s, c| crate::updates::run(false, s, c), |e| match e {
+        crate::updates::Event::Log(m) => eprint_line(quiet, &m),
+        crate::updates::Event::Done(m, _) => result = m,
+    })?;
+    println!("{result}");
+    Ok(())
 }
 
 fn cmd_listen(o: &Opts) -> Result<(), String> {

@@ -26,4 +26,5 @@ pub mod subnet;
 pub mod targets;
 pub mod toolui;
 pub mod tools;
+pub mod updates;
 pub mod util;
